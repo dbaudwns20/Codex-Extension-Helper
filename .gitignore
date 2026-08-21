@@ -1,0 +1,7 @@
+.worktrees/
+.superpowers/
+node_modules/
+out/
+coverage/
+*.vsix
+.DS_Store
