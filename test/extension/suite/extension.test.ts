@@ -1,0 +1,60 @@
+import assert from 'node:assert/strict';
+import * as vscode from 'vscode';
+
+interface TestDiagnostics {
+  readonly comparisonCount: number;
+  readonly renderedComparisonCount: number;
+}
+
+interface TestExtensionApi {
+  readonly testDiagnostics: TestDiagnostics;
+}
+
+async function waitFor(
+  description: string,
+  predicate: () => boolean,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  assert.fail(`Timed out waiting for ${description}`);
+}
+
+export async function runExtensionSmokeTest(): Promise<void> {
+  if (typeof vscode.window.createWebviewTextEditorInset !== 'function') {
+    console.log('[SKIP] VS Code host does not expose window.createWebviewTextEditorInset; a manual Insiders launch remains the definitive inset check.');
+    return;
+  }
+
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  assert.ok(workspaceFolder, 'The Extension Host must open the temporary workspace');
+  const fileUri = vscode.Uri.joinPath(workspaceFolder.uri, 'smoke.ts');
+  const document = await vscode.workspace.openTextDocument(fileUri);
+  const editor = await vscode.window.showTextDocument(document);
+  const extension = vscode.extensions.getExtension<TestExtensionApi>('local.codex-inline-changes');
+  assert.ok(extension, 'The development extension must be installed');
+  const api = await extension.activate();
+  assert.ok(api?.testDiagnostics, 'Test diagnostics must be exported in the Extension Host test');
+
+  await vscode.workspace.fs.writeFile(fileUri, new TextEncoder().encode('const value = 2;\n'));
+  await waitFor('the external comparison to be stored and rendered', () => (
+    api.testDiagnostics.comparisonCount === 1
+    && api.testDiagnostics.renderedComparisonCount === 1
+  ));
+
+  const edited = await editor.edit((builder) => {
+    builder.insert(new vscode.Position(document.lineCount, 0), '// saved\n');
+  });
+  assert.equal(edited, true, 'The smoke document edit must apply before save');
+  assert.equal(await document.save(), true, 'The smoke document must save');
+  await waitFor('save to clear the comparison', () => (
+    api.testDiagnostics.comparisonCount === 0
+    && api.testDiagnostics.renderedComparisonCount === 0
+  ));
+}

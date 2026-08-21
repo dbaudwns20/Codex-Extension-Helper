@@ -1,0 +1,163 @@
+import { PerKeyDebouncer, RecentSaveRegistry } from './changePolicy';
+import { isEligibleFile, type ExtensionSettings } from './eligibility';
+
+export interface ExternalChangeUri {
+  readonly scheme: string;
+  readonly path: string;
+  toString(): string;
+}
+
+export interface ExternalChangeDetectorOptions {
+  readonly readFile: (uri: ExternalChangeUri) => PromiseLike<Uint8Array>;
+  readonly settings: () => ExtensionSettings;
+  readonly relativePath: (uri: ExternalChangeUri) => string;
+  readonly onComparison: (key: string, text: string) => void | PromiseLike<void>;
+  readonly onDelete: (key: string) => void;
+  readonly onError: (error: unknown) => void;
+  readonly recentSaves?: RecentSaveRegistry;
+  readonly debouncer?: PerKeyDebouncer<string>;
+  readonly now?: () => number;
+}
+
+export function normalizeUriKey(uri: ExternalChangeUri): string {
+  return uri.toString();
+}
+
+export class ExternalChangeDetector {
+  private readonly recentSaves: RecentSaveRegistry;
+  private readonly debouncer: PerKeyDebouncer<string>;
+  private readonly revisions = new Map<string, number>();
+  private readonly now: () => number;
+  private disposed = false;
+
+  constructor(private readonly options: ExternalChangeDetectorOptions) {
+    this.recentSaves = options.recentSaves ?? new RecentSaveRegistry();
+    this.debouncer = options.debouncer ?? new PerKeyDebouncer<string>();
+    this.now = options.now ?? Date.now;
+  }
+
+  markRecentSave(uri: ExternalChangeUri): void {
+    if (!this.disposed) {
+      this.recentSaves.mark(normalizeUriKey(uri), this.now());
+    }
+  }
+
+  handleCreate(uri: ExternalChangeUri): void {
+    this.schedule(uri);
+  }
+
+  handleChange(uri: ExternalChangeUri): void {
+    this.schedule(uri);
+  }
+
+  handleDelete(uri: ExternalChangeUri): void {
+    if (this.disposed) {
+      return;
+    }
+
+    const key = normalizeUriKey(uri);
+    this.nextRevision(key);
+    this.debouncer.cancel(key);
+
+    try {
+      this.options.onDelete(key);
+    } catch (error) {
+      this.report(error);
+    }
+  }
+
+  dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+
+    this.disposed = true;
+    this.debouncer.dispose();
+    this.revisions.clear();
+  }
+
+  private schedule(uri: ExternalChangeUri): void {
+    if (this.disposed) {
+      return;
+    }
+
+    const key = normalizeUriKey(uri);
+    if (this.recentSaves.consume(key, this.now())) {
+      return;
+    }
+
+    try {
+      const revision = this.nextRevision(key);
+      const delayMs = this.options.settings().debounceMs;
+      this.debouncer.schedule(key, delayMs, () => {
+        void this.process(uri, key, revision);
+      });
+    } catch (error) {
+      this.report(error);
+    }
+  }
+
+  private async process(
+    uri: ExternalChangeUri,
+    key: string,
+    revision: number,
+  ): Promise<void> {
+    try {
+      const settings = this.options.settings();
+      const relativePath = this.options.relativePath(uri);
+      if (!isEligibleFile({
+        scheme: uri.scheme,
+        relativePath,
+        text: '',
+        sizeBytes: 0,
+      }, settings)) {
+        return;
+      }
+
+      const bytes = await this.options.readFile(uri);
+      if (!this.isCurrent(key, revision) || bytes.byteLength > settings.maxFileSizeBytes) {
+        return;
+      }
+
+      let text: string;
+      try {
+        text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      } catch {
+        return;
+      }
+
+      if (!isEligibleFile({
+        scheme: uri.scheme,
+        relativePath,
+        text,
+        sizeBytes: bytes.byteLength,
+      }, settings) || !this.isCurrent(key, revision)) {
+        return;
+      }
+
+      await this.options.onComparison(key, text);
+    } catch (error) {
+      if (this.isCurrent(key, revision)) {
+        this.report(error);
+      }
+    }
+  }
+
+  private isCurrent(key: string, revision: number): boolean {
+    return !this.disposed && this.revisions.get(key) === revision;
+  }
+
+  private nextRevision(key: string): number {
+    const revision = (this.revisions.get(key) ?? 0) + 1;
+    this.revisions.set(key, revision);
+    return revision;
+  }
+
+  private report(error: unknown): void {
+    try {
+      this.options.onError(error);
+    } catch {
+      // Errors from logging must not escape into VS Code's event loop.
+    }
+  }
+}
