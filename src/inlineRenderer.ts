@@ -12,6 +12,7 @@ export interface InsetPlacement {
 interface InlineRendererApi {
   readonly window: {
     readonly visibleTextEditors: readonly vscode.TextEditor[];
+    readonly tabGroups: Pick<vscode.TabGroups, 'all'>;
     createTextEditorDecorationType(
       options: vscode.DecorationRenderOptions,
     ): vscode.TextEditorDecorationType;
@@ -27,10 +28,20 @@ interface InlineRendererApi {
   readonly ThemeColor: typeof vscode.ThemeColor;
   readonly DecorationRangeBehavior: typeof vscode.DecorationRangeBehavior;
   readonly OverviewRulerLane: typeof vscode.OverviewRulerLane;
+  readonly TabInputText: typeof vscode.TabInputText;
 }
 
 interface ViewResources {
-  readonly insets: readonly vscode.WebviewEditorInset[];
+  readonly insets: vscode.WebviewEditorInset[];
+}
+
+export interface InlineRendererSessionState {
+  renderingDisabled: boolean;
+  warningShown: boolean;
+}
+
+export function createInlineRendererSessionState(): InlineRendererSessionState {
+  return { renderingDisabled: false, warningShown: false };
 }
 
 export function escapeHtml(value: string): string {
@@ -93,14 +104,13 @@ export function insetPlacementForHunk(
 export class InlineRenderer implements ComparisonView, vscode.Disposable {
   private readonly decorationType: vscode.TextEditorDecorationType;
   private readonly resources = new Map<string, Map<vscode.TextEditor, ViewResources>>();
-  private renderingDisabled = false;
-  private warningShown = false;
   private disposed = false;
 
   constructor(
     private readonly api: InlineRendererApi,
     private readonly output: Pick<vscode.OutputChannel, 'appendLine'>,
     private readonly uriKey: (uri: vscode.Uri) => string = (uri) => uri.toString(),
+    private readonly sessionState: InlineRendererSessionState = createInlineRendererSessionState(),
   ) {
     this.decorationType = api.window.createTextEditorDecorationType({
       isWholeLine: true,
@@ -109,10 +119,14 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
       overviewRulerColor: new api.ThemeColor('editorOverviewRuler.addedForeground'),
       overviewRulerLane: api.OverviewRulerLane.Full,
     });
+
+    if (typeof api.window.createWebviewTextEditorInset !== 'function') {
+      this.disableRendering(new Error('window.createWebviewTextEditorInset is unavailable'));
+    }
   }
 
   async render(key: string, hunks: readonly ChangeHunk[]): Promise<void> {
-    if (this.disposed || this.renderingDisabled) {
+    if (this.disposed || this.sessionState.renderingDisabled) {
       return;
     }
 
@@ -123,13 +137,18 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
 
     this.clear(key);
     const editors = this.api.window.visibleTextEditors.filter(
-      (editor) => this.uriKey(editor.document.uri) === key,
+      (editor) => this.uriKey(editor.document.uri) === key && this.isNormalTextEditor(editor),
     );
+    if (editors.length === 0) {
+      return;
+    }
+
     const views = new Map<vscode.TextEditor, ViewResources>();
     this.resources.set(key, views);
 
     for (const editor of editors) {
       const insets: vscode.WebviewEditorInset[] = [];
+      views.set(editor, { insets });
 
       try {
         editor.setDecorations(this.decorationType, this.greenRanges(hunks));
@@ -149,20 +168,10 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
           insets.push(inset);
           inset.webview.html = buildDeletedLinesHtml(hunk.originalLines, hunk.originalStart);
         }
-
-        views.set(editor, { insets });
       } catch (error) {
-        for (const inset of insets) {
-          inset.dispose();
-        }
-        editor.setDecorations(this.decorationType, []);
         this.disableRendering(error);
         return;
       }
-    }
-
-    if (views.size === 0) {
-      this.resources.delete(key);
     }
   }
 
@@ -176,13 +185,21 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
       return;
     }
 
-    for (const [editor, resources] of views) {
-      editor.setDecorations(this.decorationType, []);
-      for (const inset of resources.insets) {
-        inset.dispose();
+    try {
+      for (const [editor, resources] of views) {
+        this.cleanup(
+          'clear editor decorations',
+          () => editor.setDecorations(this.decorationType, []),
+        );
+        for (const inset of resources.insets) {
+          this.cleanup('dispose editor inset', () => inset.dispose());
+        }
+      }
+    } finally {
+      if (this.resources.get(key) === views) {
+        this.resources.delete(key);
       }
     }
-    this.resources.delete(key);
   }
 
   clearAll(): void {
@@ -198,7 +215,20 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
 
     this.disposed = true;
     this.clearAll();
-    this.decorationType.dispose();
+    this.cleanup('dispose decoration type', () => this.decorationType.dispose());
+  }
+
+  private isNormalTextEditor(editor: vscode.TextEditor): boolean {
+    if (editor.viewColumn === undefined || typeof this.api.TabInputText !== 'function') {
+      return false;
+    }
+
+    const group = this.api.window.tabGroups.all.find(
+      (candidate) => candidate.viewColumn === editor.viewColumn,
+    );
+    const input = group?.activeTab?.input;
+    return input instanceof this.api.TabInputText
+      && this.uriKey(input.uri) === this.uriKey(editor.document.uri);
   }
 
   private greenRanges(hunks: readonly ChangeHunk[]): vscode.Range[] {
@@ -220,18 +250,40 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
   }
 
   private disableRendering(error: unknown): void {
-    if (this.renderingDisabled) {
+    if (this.sessionState.renderingDisabled) {
       return;
     }
 
-    this.renderingDisabled = true;
-    const detail = error instanceof Error ? error.stack ?? error.message : String(error);
-    this.output.appendLine(`[InlineRenderer] ${detail}`);
+    this.sessionState.renderingDisabled = true;
+    this.log('InlineRenderer', error);
     this.clearAll();
 
-    if (!this.warningShown) {
-      this.warningShown = true;
-      void this.api.window.showWarningMessage(INSET_WARNING);
+    if (!this.sessionState.warningShown) {
+      this.sessionState.warningShown = true;
+      try {
+        void this.api.window.showWarningMessage(INSET_WARNING);
+      } catch (warningError) {
+        this.log('InlineRendererWarning', warningError);
+      }
+    }
+  }
+
+  private cleanup(operation: string, cleanup: () => void): void {
+    try {
+      cleanup();
+    } catch (error) {
+      this.log('InlineRendererCleanup', new Error(
+        `${operation}: ${error instanceof Error ? error.message : String(error)}`,
+      ));
+    }
+  }
+
+  private log(scope: string, error: unknown): void {
+    const detail = error instanceof Error ? error.stack ?? error.message : String(error);
+    try {
+      this.output.appendLine(`[${scope}] ${detail}`);
+    } catch {
+      // Output failures must never mask a renderer or cleanup failure.
     }
   }
 }

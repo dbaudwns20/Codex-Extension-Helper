@@ -14,7 +14,11 @@ import {
   ExternalChangeDetector,
   normalizeUriKey,
 } from './externalChangeDetector';
-import { InlineRenderer } from './inlineRenderer';
+import {
+  createInlineRendererSessionState,
+  InlineRenderer,
+  type InlineRendererSessionState,
+} from './inlineRenderer';
 import { SnapshotStore } from './snapshotStore';
 
 const CONFIGURATION_SECTION = 'codexInlineChanges';
@@ -69,10 +73,16 @@ class ExtensionRuntime implements vscode.Disposable {
   constructor(
     private settingsValue: ExtensionSettings,
     private readonly output: vscode.OutputChannel,
+    rendererSessionState: InlineRendererSessionState,
   ) {
     const construction = constructWithRollback((ownership) => {
       const snapshots = new SnapshotStore();
-      const renderer = ownership.use(new InlineRenderer(vscode, output, normalizeUriKey));
+      const renderer = ownership.use(new InlineRenderer(
+        vscode,
+        output,
+        normalizeUriKey,
+        rendererSessionState,
+      ));
       const view = new DiagnosticView(renderer);
       const coordinator = ownership.use(new ComparisonCoordinator(
         new LineDiffEngine(),
@@ -440,6 +450,7 @@ class ExtensionRuntime implements vscode.Disposable {
 
 class ExtensionController implements vscode.Disposable {
   private readonly subscriptions: vscode.Disposable[] = [];
+  private readonly rendererSessionState = createInlineRendererSessionState();
   private runtime: ExtensionRuntime | undefined;
   private settings = normalizeSettings({ enabled: false });
   private disposed = false;
@@ -501,7 +512,7 @@ class ExtensionController implements vscode.Disposable {
       if (this.runtime === undefined || enabledChanged || excludeChanged) {
         this.runtime?.dispose();
         this.runtime = undefined;
-        this.runtime = new ExtensionRuntime(next, this.output);
+        this.runtime = new ExtensionRuntime(next, this.output, this.rendererSessionState);
       } else {
         this.runtime.updateSettings(next);
       }
