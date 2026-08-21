@@ -3,6 +3,11 @@ import { PerKeyDebouncer } from './changePolicy';
 import { ComparisonCoordinator } from './coordinator';
 import { DiagnosticView } from './diagnosticView';
 import { LineDiffEngine } from './diffEngine';
+import {
+  DocumentChangeFence,
+  shouldInvalidateDocumentChange,
+  type LiveDocumentSnapshot,
+} from './documentChangeFence';
 import { constructWithRollback, type DisposableStore } from './disposableStore';
 import { isEligibleFile, normalizeSettings, type ExtensionSettings } from './eligibility';
 import {
@@ -57,6 +62,7 @@ class ExtensionRuntime implements vscode.Disposable {
   private readonly ownership: DisposableStore;
   private readonly trackedUris = new Map<string, vscode.Uri>();
   private readonly comparisonKeys = new Set<string>();
+  private readonly documentFence = new DocumentChangeFence();
   private visibleKeys = new Set<string>();
   private disposed = false;
 
@@ -78,8 +84,7 @@ class ExtensionRuntime implements vscode.Disposable {
         settings: () => this.settingsValue,
         relativePath: (uri) => this.relativePath(uri as vscode.Uri),
         onComparison: async (key, text) => {
-          await this.coordinator.externalChange(key, text);
-          this.syncComparison(key);
+          await this.applyExternalComparison(key, text);
         },
         onDelete: (key) => this.deleteKey(key, false),
         onError: (error) => this.log('ExternalChangeDetector', error),
@@ -147,6 +152,7 @@ class ExtensionRuntime implements vscode.Disposable {
     this.trackedUris.clear();
     this.comparisonKeys.clear();
     this.visibleKeys.clear();
+    this.documentFence.clear();
   }
 
   private handleWatcherEvent(uri: vscode.Uri, kind: 'create' | 'change'): void {
@@ -184,13 +190,20 @@ class ExtensionRuntime implements vscode.Disposable {
   }
 
   private handleDocumentChange(event: vscode.TextDocumentChangeEvent): void {
-    if (this.disposed || event.contentChanges.length === 0) {
+    if (
+      this.disposed
+      || !shouldInvalidateDocumentChange(event.contentChanges.length, event.document.isDirty)
+    ) {
       return;
     }
 
     const key = normalizeUriKey(event.document.uri);
+    this.documentFence.invalidate(key);
+    this.detector.invalidate(key);
+    this.coordinator.invalidate(key);
+    this.documentDebouncer.cancel(key);
     const state = this.snapshots.get(key);
-    if (state === undefined || (state.hunks.length === 0 && !state.pending)) {
+    if (state === undefined || !state.comparisonActive) {
       return;
     }
     if (!this.isEligible(event.document.uri, event.document.getText())) {
@@ -200,7 +213,12 @@ class ExtensionRuntime implements vscode.Disposable {
 
     this.documentDebouncer.schedule(key, this.settingsValue.debounceMs, () => {
       void this.run('DocumentEdit', async () => {
-        await this.coordinator.documentEdit(key, event.document.getText());
+        const text = event.document.getText();
+        const isCurrent = this.createDocumentGuard(key, text);
+        if (isCurrent === undefined) {
+          return;
+        }
+        await this.coordinator.documentEdit(key, text, isCurrent);
         this.syncComparison(key);
       });
     });
@@ -208,6 +226,10 @@ class ExtensionRuntime implements vscode.Disposable {
 
   private handleWillSave(event: vscode.TextDocumentWillSaveEvent): void {
     if (!this.disposed && this.isEligible(event.document.uri, event.document.getText())) {
+      const key = normalizeUriKey(event.document.uri);
+      this.documentFence.invalidate(key);
+      this.documentDebouncer.cancel(key);
+      this.coordinator.invalidate(key);
       this.detector.markRecentSave(event.document.uri);
     }
   }
@@ -218,6 +240,8 @@ class ExtensionRuntime implements vscode.Disposable {
     }
 
     const key = normalizeUriKey(document.uri);
+    this.documentFence.invalidate(key);
+    this.detector.invalidate(key);
     this.documentDebouncer.cancel(key);
     const text = document.getText();
     if (!this.isEligible(document.uri, text)) {
@@ -272,7 +296,10 @@ class ExtensionRuntime implements vscode.Disposable {
     this.visibleKeys = nextVisible;
 
     for (const key of nextVisible) {
-      void this.run('VisibleEditor', () => this.coordinator.show(key));
+      void this.run('VisibleEditor', () => this.coordinator.show(
+        key,
+        (expectedText) => this.liveDocumentMatches(key, expectedText),
+      ));
     }
   }
 
@@ -292,6 +319,7 @@ class ExtensionRuntime implements vscode.Disposable {
   }
 
   private deleteKey(key: string, invalidateDetector = true): void {
+    this.documentFence.invalidate(key);
     if (invalidateDetector) {
       this.detector.invalidate(key);
     }
@@ -308,6 +336,55 @@ class ExtensionRuntime implements vscode.Disposable {
     } else {
       this.comparisonKeys.delete(key);
     }
+  }
+
+  private async applyExternalComparison(key: string, text: string): Promise<void> {
+    const isCurrent = this.createDocumentGuard(key, text);
+    if (isCurrent === undefined) {
+      return;
+    }
+
+    await this.coordinator.externalChange(key, text, isCurrent);
+    this.syncComparison(key);
+  }
+
+  private createDocumentGuard(
+    key: string,
+    expectedText: string,
+  ): (() => boolean) | undefined {
+    const document = this.liveDocument(key);
+    const snapshot = document === undefined ? undefined : this.documentSnapshot(document);
+    const token = this.documentFence.capture(key, expectedText, snapshot);
+    if (!this.documentFence.isCurrent(token, snapshot)) {
+      return undefined;
+    }
+
+    return () => {
+      const current = this.liveDocument(key);
+      return this.documentFence.isCurrent(
+        token,
+        current === undefined ? undefined : this.documentSnapshot(current),
+      );
+    };
+  }
+
+  private liveDocument(key: string): vscode.TextDocument | undefined {
+    return vscode.workspace.textDocuments.find(
+      (document) => normalizeUriKey(document.uri) === key,
+    );
+  }
+
+  private liveDocumentMatches(key: string, expectedText: string): boolean {
+    const document = this.liveDocument(key);
+    return document === undefined || document.getText() === expectedText;
+  }
+
+  private documentSnapshot(document: vscode.TextDocument): LiveDocumentSnapshot {
+    return {
+      version: document.version,
+      text: document.getText(),
+      isDirty: document.isDirty,
+    };
   }
 
   private preflightEligible(uri: vscode.Uri): boolean {

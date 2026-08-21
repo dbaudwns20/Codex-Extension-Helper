@@ -18,6 +18,7 @@ describe('SnapshotStore', () => {
       currentText: 'after',
       hunks: [],
       sourceRevision: 4,
+      comparisonActive: true,
       pending: true,
     };
 
@@ -42,6 +43,7 @@ describe('SnapshotStore', () => {
         modifiedLines: ['after'],
       }],
       sourceRevision: 4,
+      comparisonActive: true,
       pending: true,
     });
 
@@ -51,6 +53,7 @@ describe('SnapshotStore', () => {
       baselineText: 'saved',
       currentText: 'saved',
       hunks: [],
+      comparisonActive: false,
       pending: false,
     });
   });

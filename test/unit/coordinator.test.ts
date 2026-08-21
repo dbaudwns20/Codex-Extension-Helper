@@ -152,6 +152,7 @@ describe('ComparisonCoordinator', () => {
       currentText: 'changed',
       hunks: newerHunks,
       sourceRevision: store.get(key)!.sourceRevision,
+      comparisonActive: true,
       pending: true,
     });
 
@@ -164,6 +165,27 @@ describe('ComparisonCoordinator', () => {
       pending: false,
     });
     expect(view.clear).toHaveBeenCalledWith(key);
+  });
+
+  it('rejects a deferred diff after save accepts a newer baseline', async () => {
+    const { coordinator, engine, store, view } = setup();
+    const result = deferred<readonly ChangeHunk[]>();
+    coordinator.seed(key, 'baseline');
+    view.visible.add(key);
+    engine.queue(result.promise);
+
+    const run = coordinator.externalChange(key, 'old-result');
+    coordinator.save(key, 'saved');
+    result.resolve(olderHunks);
+    await run;
+
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'saved',
+      currentText: 'saved',
+      hunks: [],
+      pending: false,
+    });
+    expect(view.renders).toEqual([]);
   });
 
   it('deletes state, cancels keyed work, and clears its view', () => {
@@ -183,6 +205,108 @@ describe('ComparisonCoordinator', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('rejects a deferred diff after delete removes the URI state', async () => {
+    const { coordinator, engine, store, view } = setup();
+    const result = deferred<readonly ChangeHunk[]>();
+    coordinator.seed(key, 'baseline');
+    view.visible.add(key);
+    engine.queue(result.promise);
+
+    const run = coordinator.externalChange(key, 'old-result');
+    coordinator.delete(key);
+    result.resolve(olderHunks);
+    await run;
+
+    expect(store.get(key)).toBeUndefined();
+    expect(view.renders).toEqual([]);
+  });
+
+  it('does not activate a comparison session for identical external content', async () => {
+    const { coordinator, engine, store, view } = setup();
+    coordinator.seed(key, 'baseline');
+    view.visible.add(key);
+    engine.queue([], newerHunks);
+
+    await coordinator.externalChange(key, 'baseline');
+    await coordinator.documentEdit(key, 'new-result');
+
+    expect(store.get(key)).toMatchObject({
+      comparisonActive: false,
+      hunks: [],
+      pending: false,
+    });
+    expect(engine.calls).toEqual([{ original: 'baseline', modified: 'baseline' }]);
+    expect(view.renders).toEqual([]);
+  });
+
+  it('keeps an active session when a user temporarily returns to the baseline', async () => {
+    const { coordinator, engine, store, view } = setup();
+    coordinator.seed(key, 'baseline');
+    view.visible.add(key);
+    engine.queue(olderHunks, [], newerHunks);
+
+    await coordinator.externalChange(key, 'old-result');
+    await coordinator.documentEdit(key, 'baseline');
+
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'baseline',
+      currentText: 'baseline',
+      comparisonActive: true,
+      hunks: [],
+      pending: false,
+    });
+
+    await coordinator.documentEdit(key, 'new-result');
+
+    expect(engine.calls).toEqual([
+      { original: 'baseline', modified: 'old-result' },
+      { original: 'baseline', modified: 'baseline' },
+      { original: 'baseline', modified: 'new-result' },
+    ]);
+    expect(view.renders.at(-1)).toEqual({ key, hunks: newerHunks });
+  });
+
+  it('checks a live-document guard before applying a deferred comparison', async () => {
+    const { coordinator, engine, store, view } = setup();
+    const result = deferred<readonly ChangeHunk[]>();
+    let liveDocumentIsCurrent = true;
+    coordinator.seed(key, 'baseline');
+    view.visible.add(key);
+    engine.queue(result.promise);
+
+    const run = coordinator.externalChange(
+      key,
+      'old-result',
+      () => liveDocumentIsCurrent,
+    );
+    liveDocumentIsCurrent = false;
+    result.resolve(olderHunks);
+    await run;
+
+    expect(store.get(key)?.hunks).toEqual([]);
+    expect(view.renders).toEqual([]);
+  });
+
+  it('invalidates an in-flight diff synchronously before debounced recomputation', async () => {
+    const { coordinator, engine, store, view } = setup();
+    const result = deferred<readonly ChangeHunk[]>();
+    coordinator.seed(key, 'baseline');
+    view.visible.add(key);
+    engine.queue(result.promise);
+
+    const run = coordinator.externalChange(key, 'old-result');
+    const invalidate = (coordinator as ComparisonCoordinator & {
+      invalidate?: (invalidatedKey: string) => void;
+    }).invalidate;
+    expect(invalidate).toBeTypeOf('function');
+    invalidate?.call(coordinator, key);
+    result.resolve(olderHunks);
+    await run;
+
+    expect(store.get(key)?.hunks).toEqual([]);
+    expect(view.renders).toEqual([]);
   });
 
   it('lets a newer revision win', async () => {

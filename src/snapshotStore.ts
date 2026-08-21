@@ -5,6 +5,7 @@ export interface FileComparisonState {
   currentText: string;
   hunks: readonly ChangeHunk[];
   sourceRevision: number;
+  comparisonActive: boolean;
   pending: boolean;
 }
 
@@ -42,6 +43,7 @@ export class SnapshotStore {
       currentText: text,
       hunks: [],
       sourceRevision,
+      comparisonActive: false,
       pending: false,
     };
   }

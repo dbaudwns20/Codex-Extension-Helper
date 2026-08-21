@@ -38,7 +38,9 @@ export class ExternalChangeDetector {
 
   markRecentSave(uri: ExternalChangeUri): void {
     if (!this.disposed) {
-      this.recentSaves.mark(normalizeUriKey(uri), this.now());
+      const key = normalizeUriKey(uri);
+      this.invalidate(key);
+      this.recentSaves.mark(key, this.now());
     }
   }
 

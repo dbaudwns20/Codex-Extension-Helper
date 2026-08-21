@@ -9,6 +9,10 @@ interface CoordinatorDiffEngine {
   ): readonly ChangeHunk[] | Promise<readonly ChangeHunk[]>;
 }
 
+export type ComparisonApplicability = () => boolean;
+
+const ALWAYS_CURRENT: ComparisonApplicability = () => true;
+
 export interface ComparisonView {
   render(key: string, hunks: readonly ChangeHunk[]): Promise<void>;
   clear(key: string): void;
@@ -37,12 +41,17 @@ export class ComparisonCoordinator {
       currentText: text,
       hunks: [],
       sourceRevision: this.nextRevision(key),
+      comparisonActive: false,
       pending: false,
     });
   }
 
-  async externalChange(key: string, text: string): Promise<void> {
-    if (this.disposed) {
+  async externalChange(
+    key: string,
+    text: string,
+    isCurrent: ComparisonApplicability = ALWAYS_CURRENT,
+  ): Promise<void> {
+    if (this.disposed || !isCurrent()) {
       return;
     }
 
@@ -51,15 +60,33 @@ export class ComparisonCoordinator {
       return;
     }
 
-    await this.compare(key, text);
+    await this.compare(key, text, isCurrent);
   }
 
-  async documentEdit(key: string, text: string): Promise<void> {
-    if (this.disposed || this.snapshots.get(key) === undefined) {
+  async documentEdit(
+    key: string,
+    text: string,
+    isCurrent: ComparisonApplicability = ALWAYS_CURRENT,
+  ): Promise<void> {
+    const state = this.snapshots.get(key);
+    if (this.disposed || state === undefined || !state.comparisonActive || !isCurrent()) {
       return;
     }
 
-    await this.compare(key, text);
+    await this.compare(key, text, isCurrent);
+  }
+
+  invalidate(key: string): void {
+    if (this.disposed) {
+      return;
+    }
+
+    this.debouncer.cancel(key);
+    const state = this.snapshots.get(key);
+    const sourceRevision = this.nextRevision(key);
+    if (state !== undefined) {
+      this.snapshots.setComparison(key, { ...state, sourceRevision });
+    }
   }
 
   save(key: string, text: string): void {
@@ -73,6 +100,7 @@ export class ComparisonCoordinator {
       currentText: text,
       hunks: [],
       sourceRevision: this.nextRevision(key),
+      comparisonActive: false,
       pending: false,
     });
     this.view.clear(key);
@@ -89,7 +117,10 @@ export class ComparisonCoordinator {
     this.view.clear(key);
   }
 
-  async show(key: string): Promise<void> {
+  async show(
+    key: string,
+    isCurrent: (expectedText: string) => boolean = () => true,
+  ): Promise<void> {
     if (this.disposed) {
       return;
     }
@@ -100,6 +131,9 @@ export class ComparisonCoordinator {
     }
 
     const { currentText, hunks, sourceRevision } = state;
+    if (!isCurrent(currentText)) {
+      return;
+    }
     await this.view.render(key, hunks);
 
     const current = this.snapshots.get(key);
@@ -108,6 +142,7 @@ export class ComparisonCoordinator {
       || current?.sourceRevision !== sourceRevision
       || current.currentText !== currentText
       || current.hunks !== hunks
+      || !isCurrent(currentText)
     ) {
       return;
     }
@@ -127,9 +162,13 @@ export class ComparisonCoordinator {
     this.view.clearAll();
   }
 
-  private async compare(key: string, text: string): Promise<void> {
+  private async compare(
+    key: string,
+    text: string,
+    isCurrent: ComparisonApplicability,
+  ): Promise<void> {
     const state = this.snapshots.get(key);
-    if (state === undefined) {
+    if (state === undefined || !isCurrent()) {
       return;
     }
 
@@ -138,7 +177,6 @@ export class ComparisonCoordinator {
       ...state,
       currentText: text,
       sourceRevision,
-      pending: true,
     });
 
     const hunks = await this.diffEngine.compute(state.baselineText, text);
@@ -147,11 +185,23 @@ export class ComparisonCoordinator {
       this.disposed
       || current?.sourceRevision !== sourceRevision
       || current.currentText !== text
+      || !isCurrent()
     ) {
       return;
     }
 
-    this.snapshots.setComparison(key, { ...current, hunks, pending: true });
+    const comparisonActive = current.comparisonActive || hunks.length > 0;
+    this.snapshots.setComparison(key, {
+      ...current,
+      hunks,
+      comparisonActive,
+      pending: hunks.length > 0,
+    });
+    if (hunks.length === 0) {
+      this.view.clear(key);
+      return;
+    }
+
     await this.view.render(key, hunks);
   }
 

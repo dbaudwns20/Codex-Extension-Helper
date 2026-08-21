@@ -121,6 +121,24 @@ describe('ExternalChangeDetector', () => {
     expect(onComparison).toHaveBeenCalledOnce();
   });
 
+  it('invalidates an already-running read when an editor save is marked', async () => {
+    vi.useFakeTimers();
+    const file = uri('saved-during-read.ts');
+    const pendingRead = deferred<Uint8Array>();
+    const readFile = vi.fn(() => pendingRead.promise);
+    const { instance, onComparison } = detector({ readFile });
+
+    instance.handleChange(file);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(readFile).toHaveBeenCalledOnce();
+
+    instance.markRecentSave(file);
+    pendingRead.resolve(encoder.encode('stale after save'));
+    await settleAsyncWork();
+
+    expect(onComparison).not.toHaveBeenCalled();
+  });
+
   it('skips excluded and non-file URIs without reading them', async () => {
     vi.useFakeTimers();
     const excluded = uri('node_modules/package/index.js');
@@ -215,6 +233,25 @@ describe('ExternalChangeDetector', () => {
     expect(readFile).not.toHaveBeenCalled();
     expect(store.get(file.toString())).toBeUndefined();
     expect(view.clear).toHaveBeenCalledWith(file.toString());
+  });
+
+  it('rejects a read that resolves after a delete event', async () => {
+    vi.useFakeTimers();
+    const file = uri('deleted-during-read.ts');
+    const pendingRead = deferred<Uint8Array>();
+    const readFile = vi.fn(() => pendingRead.promise);
+    const { instance, onComparison, onDelete } = detector({ readFile });
+
+    instance.handleChange(file);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(readFile).toHaveBeenCalledOnce();
+
+    instance.handleDelete(file);
+    pendingRead.resolve(encoder.encode('stale after delete'));
+    await settleAsyncWork();
+
+    expect(onDelete).toHaveBeenCalledWith(file.toString());
+    expect(onComparison).not.toHaveBeenCalled();
   });
 
   it('invalidates an already-running read when runtime state is logically removed', async () => {
