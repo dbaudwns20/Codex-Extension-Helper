@@ -56,14 +56,22 @@ export class ExternalChangeDetector {
     }
 
     const key = normalizeUriKey(uri);
-    this.nextRevision(key);
-    this.debouncer.cancel(key);
+    this.invalidate(key);
 
     try {
       this.options.onDelete(key);
     } catch (error) {
       this.report(error);
     }
+  }
+
+  invalidate(key: string): void {
+    if (this.disposed) {
+      return;
+    }
+
+    this.nextRevision(key);
+    this.debouncer.cancel(key);
   }
 
   dispose(): void {
@@ -103,19 +111,30 @@ export class ExternalChangeDetector {
     revision: number,
   ): Promise<void> {
     try {
-      const settings = this.options.settings();
-      const relativePath = this.options.relativePath(uri);
+      const initialSettings = this.options.settings();
+      const initialRelativePath = this.options.relativePath(uri);
       if (!isEligibleFile({
         scheme: uri.scheme,
-        relativePath,
+        relativePath: initialRelativePath,
         text: '',
         sizeBytes: 0,
-      }, settings)) {
+      }, initialSettings)) {
         return;
       }
 
       const bytes = await this.options.readFile(uri);
-      if (!this.isCurrent(key, revision) || bytes.byteLength > settings.maxFileSizeBytes) {
+      if (!this.isCurrent(key, revision)) {
+        return;
+      }
+
+      const currentSettings = this.options.settings();
+      const currentRelativePath = this.options.relativePath(uri);
+      if (!isEligibleFile({
+        scheme: uri.scheme,
+        relativePath: currentRelativePath,
+        text: '',
+        sizeBytes: 0,
+      }, currentSettings) || bytes.byteLength > currentSettings.maxFileSizeBytes) {
         return;
       }
 
@@ -128,10 +147,10 @@ export class ExternalChangeDetector {
 
       if (!isEligibleFile({
         scheme: uri.scheme,
-        relativePath,
+        relativePath: currentRelativePath,
         text,
         sizeBytes: bytes.byteLength,
-      }, settings) || !this.isCurrent(key, revision)) {
+      }, currentSettings) || !this.isCurrent(key, revision)) {
         return;
       }
 

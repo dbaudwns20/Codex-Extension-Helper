@@ -20,6 +20,13 @@ function hunk(overrides: Partial<ChangeHunk> = {}): ChangeHunk {
   };
 }
 
+function renderedStatus(renderer: InlineRenderer, key: string): boolean | undefined {
+  const candidate = renderer as InlineRenderer & {
+    hasRendered?: (renderedKey: string) => boolean;
+  };
+  return candidate.hasRendered?.(key);
+}
+
 describe('inline renderer helpers', () => {
   it('escapes every HTML-significant character', () => {
     expect(escapeHtml(`&<>"'`)).toBe('&amp;&lt;&gt;&quot;&#39;');
@@ -82,6 +89,40 @@ describe('inline renderer helpers', () => {
     }), 3)).toEqual({ anchorLine: 2, height: 2 });
   });
 
+  it('reports rendering only after editor resources are successfully installed', async () => {
+    const key = 'file:///test.ts';
+    const editor = {
+      document: {
+        lineCount: 1,
+        uri: { toString: () => key },
+      },
+      setDecorations: vi.fn(),
+    };
+    const api = {
+      window: {
+        visibleTextEditors: [editor],
+        createTextEditorDecorationType: () => ({ dispose: vi.fn() }),
+        createWebviewTextEditorInset: () => ({
+          dispose: vi.fn(),
+          webview: { html: '' },
+        }),
+        showWarningMessage: vi.fn().mockResolvedValue(undefined),
+      },
+      Range: class {},
+      ThemeColor: class {},
+      DecorationRangeBehavior: { ClosedClosed: 0 },
+      OverviewRulerLane: { Full: 7 },
+    };
+    const renderer = new InlineRenderer(api as never, { appendLine: vi.fn() });
+
+    expect(renderedStatus(renderer, key)).toBe(false);
+    await renderer.render(key, [hunk()]);
+    expect(renderedStatus(renderer, key)).toBe(true);
+
+    renderer.clear(key);
+    expect(renderedStatus(renderer, key)).toBe(false);
+  });
+
   it('disposes a newly created inset when assigning its HTML fails', async () => {
     const insetDispose = vi.fn();
     const warning = vi.fn().mockResolvedValue(undefined);
@@ -117,6 +158,7 @@ describe('inline renderer helpers', () => {
     await renderer.render('file:///test.ts', [hunk()]);
     await renderer.render('file:///test.ts', [hunk()]);
 
+    expect(renderedStatus(renderer, 'file:///test.ts')).toBe(false);
     expect(insetDispose).toHaveBeenCalledOnce();
     expect(warning).toHaveBeenCalledOnce();
     expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(htmlFailure.message));

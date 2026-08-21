@@ -1,7 +1,9 @@
 import * as vscode from 'vscode';
 import { PerKeyDebouncer } from './changePolicy';
-import { ComparisonCoordinator, type ComparisonView } from './coordinator';
+import { ComparisonCoordinator } from './coordinator';
+import { DiagnosticView } from './diagnosticView';
 import { LineDiffEngine } from './diffEngine';
+import { constructWithRollback, type DisposableStore } from './disposableStore';
 import { isEligibleFile, normalizeSettings, type ExtensionSettings } from './eligibility';
 import {
   ExternalChangeDetector,
@@ -9,7 +11,6 @@ import {
 } from './externalChangeDetector';
 import { InlineRenderer } from './inlineRenderer';
 import { SnapshotStore } from './snapshotStore';
-import type { ChangeHunk } from './types';
 
 const CONFIGURATION_SECTION = 'codexInlineChanges';
 const OUTPUT_CHANNEL_NAME = 'Codex Inline Changes';
@@ -46,46 +47,14 @@ function readSettings(): ExtensionSettings {
   });
 }
 
-class DiagnosticView implements ComparisonView {
-  private readonly renderedKeys = new Set<string>();
-
-  constructor(
-    private readonly delegate: InlineRenderer,
-    private readonly visible: (key: string) => boolean,
-  ) {}
-
-  get renderedComparisonCount(): number {
-    return this.renderedKeys.size;
-  }
-
-  async render(key: string, hunks: readonly ChangeHunk[]): Promise<void> {
-    await this.delegate.render(key, hunks);
-    if (hunks.length > 0 && this.visible(key)) {
-      this.renderedKeys.add(key);
-    } else {
-      this.renderedKeys.delete(key);
-    }
-  }
-
-  clear(key: string): void {
-    this.renderedKeys.delete(key);
-    this.delegate.clear(key);
-  }
-
-  clearAll(): void {
-    this.renderedKeys.clear();
-    this.delegate.clearAll();
-  }
-}
-
 class ExtensionRuntime implements vscode.Disposable {
-  private readonly snapshots = new SnapshotStore();
+  private readonly snapshots: SnapshotStore;
   private readonly renderer: InlineRenderer;
   private readonly view: DiagnosticView;
   private readonly coordinator: ComparisonCoordinator;
   private readonly detector: ExternalChangeDetector;
-  private readonly documentDebouncer = new PerKeyDebouncer<string>();
-  private readonly subscriptions: vscode.Disposable[] = [];
+  private readonly documentDebouncer: PerKeyDebouncer<string>;
+  private readonly ownership: DisposableStore;
   private readonly trackedUris = new Map<string, vscode.Uri>();
   private readonly comparisonKeys = new Set<string>();
   private visibleKeys = new Set<string>();
@@ -95,44 +64,59 @@ class ExtensionRuntime implements vscode.Disposable {
     private settingsValue: ExtensionSettings,
     private readonly output: vscode.OutputChannel,
   ) {
-    this.renderer = new InlineRenderer(vscode, output, normalizeUriKey);
-    this.view = new DiagnosticView(this.renderer, (key) => this.visibleKeys.has(key));
-    this.coordinator = new ComparisonCoordinator(
-      new LineDiffEngine(),
-      this.snapshots,
-      this.view,
-    );
-    this.detector = new ExternalChangeDetector({
-      readFile: (uri) => vscode.workspace.fs.readFile(uri as vscode.Uri),
-      settings: () => this.settingsValue,
-      relativePath: (uri) => this.relativePath(uri as vscode.Uri),
-      onComparison: async (key, text) => {
-        await this.coordinator.externalChange(key, text);
-        this.syncComparison(key);
-      },
-      onDelete: (key) => this.deleteKey(key),
-      onError: (error) => this.log('ExternalChangeDetector', error),
-    });
+    const construction = constructWithRollback((ownership) => {
+      const snapshots = new SnapshotStore();
+      const renderer = ownership.use(new InlineRenderer(vscode, output, normalizeUriKey));
+      const view = new DiagnosticView(renderer);
+      const coordinator = ownership.use(new ComparisonCoordinator(
+        new LineDiffEngine(),
+        snapshots,
+        view,
+      ));
+      const detector = ownership.use(new ExternalChangeDetector({
+        readFile: (uri) => vscode.workspace.fs.readFile(uri as vscode.Uri),
+        settings: () => this.settingsValue,
+        relativePath: (uri) => this.relativePath(uri as vscode.Uri),
+        onComparison: async (key, text) => {
+          await this.coordinator.externalChange(key, text);
+          this.syncComparison(key);
+        },
+        onDelete: (key) => this.deleteKey(key, false),
+        onError: (error) => this.log('ExternalChangeDetector', error),
+      }));
+      const documentDebouncer = ownership.use(new PerKeyDebouncer<string>());
+      const watcher = ownership.use(vscode.workspace.createFileSystemWatcher('**/*'));
+      ownership.use(watcher.onDidCreate((uri) => this.guard('FileCreate', () => this.handleWatcherEvent(uri, 'create'))));
+      ownership.use(watcher.onDidChange((uri) => this.guard('FileChange', () => this.handleWatcherEvent(uri, 'change'))));
+      ownership.use(watcher.onDidDelete((uri) => this.guard('FileDelete', () => this.handleWatcherDelete(uri))));
+      ownership.use(vscode.workspace.onDidOpenTextDocument((document) => this.guard('DocumentOpen', () => this.seedDocument(document))));
+      ownership.use(vscode.workspace.onDidChangeTextDocument((event) => this.guard('DocumentChange', () => this.handleDocumentChange(event))));
+      ownership.use(vscode.workspace.onWillSaveTextDocument((event) => this.guard('DocumentWillSave', () => this.handleWillSave(event))));
+      ownership.use(vscode.workspace.onDidSaveTextDocument((document) => this.guard('DocumentSave', () => this.handleDidSave(document))));
+      ownership.use(vscode.workspace.onDidCloseTextDocument((document) => this.guard('DocumentClose', () => this.handleDocumentClose(document))));
+      ownership.use(vscode.window.onDidChangeVisibleTextEditors((editors) => this.guard('VisibleEditors', () => this.handleVisibleEditors(editors))));
+      ownership.use(vscode.workspace.onDidChangeWorkspaceFolders((event) => this.guard('WorkspaceFolders', () => this.handleWorkspaceFolders(event))));
 
-    const watcher = vscode.workspace.createFileSystemWatcher('**/*');
-    this.subscriptions.push(
-      watcher,
-      watcher.onDidCreate((uri) => this.guard('FileCreate', () => this.handleWatcherEvent(uri, 'create'))),
-      watcher.onDidChange((uri) => this.guard('FileChange', () => this.handleWatcherEvent(uri, 'change'))),
-      watcher.onDidDelete((uri) => this.guard('FileDelete', () => this.handleWatcherDelete(uri))),
-      vscode.workspace.onDidOpenTextDocument((document) => this.guard('DocumentOpen', () => this.seedDocument(document))),
-      vscode.workspace.onDidChangeTextDocument((event) => this.guard('DocumentChange', () => this.handleDocumentChange(event))),
-      vscode.workspace.onWillSaveTextDocument((event) => this.guard('DocumentWillSave', () => this.handleWillSave(event))),
-      vscode.workspace.onDidSaveTextDocument((document) => this.guard('DocumentSave', () => this.handleDidSave(document))),
-      vscode.workspace.onDidCloseTextDocument((document) => this.guard('DocumentClose', () => this.handleDocumentClose(document))),
-      vscode.window.onDidChangeVisibleTextEditors((editors) => this.guard('VisibleEditors', () => this.handleVisibleEditors(editors))),
-      vscode.workspace.onDidChangeWorkspaceFolders((event) => this.guard('WorkspaceFolders', () => this.handleWorkspaceFolders(event))),
-    );
+      return { snapshots, renderer, view, coordinator, detector, documentDebouncer };
+    }, (error) => output.appendLine(`[ConstructionRollback] ${errorDetail(error)}`));
 
-    for (const document of vscode.workspace.textDocuments) {
-      this.guard('InitialDocument', () => this.seedDocument(document));
+    this.ownership = construction.resources;
+    this.snapshots = construction.value.snapshots;
+    this.renderer = construction.value.renderer;
+    this.view = construction.value.view;
+    this.coordinator = construction.value.coordinator;
+    this.detector = construction.value.detector;
+    this.documentDebouncer = construction.value.documentDebouncer;
+
+    try {
+      for (const document of vscode.workspace.textDocuments) {
+        this.guard('InitialDocument', () => this.seedDocument(document));
+      }
+      this.guard('InitialEditors', () => this.handleVisibleEditors(vscode.window.visibleTextEditors));
+    } catch (error) {
+      this.ownership.dispose();
+      throw error;
     }
-    this.guard('InitialEditors', () => this.handleVisibleEditors(vscode.window.visibleTextEditors));
   }
 
   get comparisonCount(): number {
@@ -159,17 +143,7 @@ class ExtensionRuntime implements vscode.Disposable {
     }
 
     this.disposed = true;
-    for (const subscription of this.subscriptions.splice(0).reverse()) {
-      try {
-        subscription.dispose();
-      } catch (error) {
-        this.log('Dispose', error);
-      }
-    }
-    this.guard('DisposeDetector', () => this.detector.dispose());
-    this.guard('DisposeDocumentDebouncer', () => this.documentDebouncer.dispose());
-    this.guard('DisposeCoordinator', () => this.coordinator.dispose());
-    this.guard('DisposeRenderer', () => this.renderer.dispose());
+    this.ownership.dispose();
     this.trackedUris.clear();
     this.comparisonKeys.clear();
     this.visibleKeys.clear();
@@ -317,7 +291,10 @@ class ExtensionRuntime implements vscode.Disposable {
     }
   }
 
-  private deleteKey(key: string): void {
+  private deleteKey(key: string, invalidateDetector = true): void {
+    if (invalidateDetector) {
+      this.detector.invalidate(key);
+    }
     this.documentDebouncer.cancel(key);
     this.coordinator.delete(key);
     this.trackedUris.delete(key);

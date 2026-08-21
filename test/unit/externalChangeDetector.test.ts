@@ -9,6 +9,25 @@ import { SnapshotStore } from '../../src/snapshotStore';
 
 const encoder = new TextEncoder();
 
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
+async function settleAsyncWork(): Promise<void> {
+  for (let turn = 0; turn < 5; turn += 1) {
+    await Promise.resolve();
+  }
+}
+
 function uri(relativePath: string, scheme = 'file'): ExternalChangeUri {
   return {
     scheme,
@@ -196,6 +215,53 @@ describe('ExternalChangeDetector', () => {
     expect(readFile).not.toHaveBeenCalled();
     expect(store.get(file.toString())).toBeUndefined();
     expect(view.clear).toHaveBeenCalledWith(file.toString());
+  });
+
+  it('invalidates an already-running read when runtime state is logically removed', async () => {
+    vi.useFakeTimers();
+    const file = uri('removed-workspace.ts');
+    const pendingRead = deferred<Uint8Array>();
+    const readFile = vi.fn(() => pendingRead.promise);
+    const { instance, onComparison } = detector({ readFile });
+
+    instance.handleChange(file);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(readFile).toHaveBeenCalledOnce();
+
+    const invalidate = (instance as ExternalChangeDetector & {
+      invalidate?: (key: string) => void;
+    }).invalidate;
+    expect(typeof invalidate).toBe('function');
+    if (invalidate === undefined) {
+      return;
+    }
+    invalidate.call(instance, file.toString());
+    pendingRead.resolve(encoder.encode('stale content'));
+    await settleAsyncWork();
+
+    expect(onComparison).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a reduced byte limit', settings({ maxFileSizeBytes: 1 })],
+    ['a new exclusion', settings({ exclude: ['**/during-read.ts'] })],
+  ])('re-evaluates %s after an asynchronous read', async (_description, changedSettings) => {
+    vi.useFakeTimers();
+    const file = uri('during-read.ts');
+    const pendingRead = deferred<Uint8Array>();
+    let currentSettings = baseSettings();
+    const { instance, onComparison } = detector({
+      readFile: vi.fn(() => pendingRead.promise),
+      settings: () => currentSettings,
+    });
+
+    instance.handleChange(file);
+    await vi.advanceTimersByTimeAsync(100);
+    currentSettings = changedSettings;
+    pendingRead.resolve(encoder.encode('changed'));
+    await settleAsyncWork();
+
+    expect(onComparison).not.toHaveBeenCalled();
   });
 
   it('reports read failures without throwing from the timer callback', async () => {

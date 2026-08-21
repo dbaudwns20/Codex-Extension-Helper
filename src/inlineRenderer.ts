@@ -166,6 +166,10 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
     }
   }
 
+  hasRendered(key: string): boolean {
+    return (this.resources.get(key)?.size ?? 0) > 0;
+  }
+
   clear(key: string): void {
     const views = this.resources.get(key);
     if (views === undefined) {
