@@ -43,6 +43,25 @@ async function waitUntil(
   throw new Error(`${description}: timed out`);
 }
 
+async function waitForExit(
+  child: ChildProcess,
+  timeoutMs: number,
+): Promise<{ exited: boolean; code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { exited: true, code: child.exitCode, signal: child.signalCode };
+  }
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      resolve({ exited: false, code: null, signal: null });
+    }, timeoutMs);
+    child.once('exit', (code, signal) => {
+      clearTimeout(timeout);
+      resolve({ exited: true, code, signal });
+    });
+  });
+}
+
 async function waitFor(
   description: string,
   predicate: () => Promise<boolean> | boolean,
@@ -104,6 +123,106 @@ async function loadIsolatedRuntime(entryPath: string): Promise<ReturnType<typeof
 }
 
 describe('watch workflow', () => {
+  it('exits promptly and preserves the error when the type-checker spawn fails', async () => {
+    const temporaryPath = await mkdtemp(path.join(tmpdir(), 'codex-inline-watch-spawn-'));
+    const scriptsPath = path.join(temporaryPath, 'scripts');
+    const esbuildPath = path.join(temporaryPath, 'node_modules', 'esbuild');
+    const preloadPath = path.join(temporaryPath, 'fail-typescript-spawn.cjs');
+    const missingExecutable = path.join(temporaryPath, 'missing-typescript-executable');
+    await mkdir(scriptsPath, { recursive: true });
+    await mkdir(esbuildPath, { recursive: true });
+    await copyFile(
+      path.join(projectPath, 'scripts', 'watch-extension.mjs'),
+      path.join(scriptsPath, 'watch-extension.mjs'),
+    );
+    await copyFile(
+      path.join(projectPath, 'scripts', 'esbuild-options.mjs'),
+      path.join(scriptsPath, 'esbuild-options.mjs'),
+    );
+    await writeFile(
+      path.join(esbuildPath, 'package.json'),
+      JSON.stringify({ name: 'esbuild', type: 'module', exports: './index.mjs' }),
+      'utf8',
+    );
+    await writeFile(
+      path.join(esbuildPath, 'index.mjs'),
+      [
+        'export async function context() {',
+        '  return {',
+        '    watch: () => new Promise(() => undefined),',
+        '    dispose: async () => undefined,',
+        '  };',
+        '}',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      preloadPath,
+      [
+        "const childProcess = require('node:child_process');",
+        "const { EventEmitter } = require('node:events');",
+        "const { syncBuiltinESMExports } = require('node:module');",
+        'childProcess.spawn = () => {',
+        '  class FailedChild extends EventEmitter {',
+        '    once(event, listener) {',
+        "      if (event === 'error' && this.spawnErrorHandler === undefined) {",
+        '        this.spawnErrorHandler = listener;',
+        '        return this;',
+        '      }',
+        '      return super.once(event, listener);',
+        '    }',
+        '  }',
+        '  const failedChild = new FailedChild();',
+        '  failedChild.exitCode = null;',
+        '  failedChild.signalCode = null;',
+        '  failedChild.kill = () => false;',
+        '  process.nextTick(() => {',
+        `    const error = Object.assign(new Error('spawn ${missingExecutable} ENOENT'), { code: 'ENOENT', path: ${JSON.stringify(missingExecutable)} });`,
+        '    failedChild.spawnErrorHandler(error);',
+        "    failedChild.emit('close', -2, null);",
+        '  });',
+        '  return failedChild;',
+        '};',
+        'syncBuiltinESMExports();',
+      ].join('\n'),
+      'utf8',
+    );
+
+    let output = '';
+    const startedAt = Date.now();
+    const watcher = spawn(
+      process.execPath,
+      ['--require', preloadPath, path.join(scriptsPath, 'watch-extension.mjs')],
+      {
+        cwd: temporaryPath,
+        detached: process.platform !== 'win32',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+    watcher.stdout?.on('data', (chunk: Buffer) => { output += chunk.toString(); });
+    watcher.stderr?.on('data', (chunk: Buffer) => { output += chunk.toString(); });
+
+    try {
+      await waitUntil('TypeScript spawn error to be reported', () => output.includes('ENOENT'));
+      const result = await waitForExit(watcher, 2_500);
+
+      expect(result.exited, output).toBe(true);
+      expect(Date.now() - startedAt).toBeLessThan(750);
+      expect(result.code).not.toBe(0);
+      expect(output).toContain(missingExecutable);
+      await waitUntil('failed watcher process group to disappear', () => (
+        watcher.pid === undefined || !processGroupExists(watcher.pid)
+      ));
+    } finally {
+      if (watcher.pid !== undefined && processGroupExists(watcher.pid)) {
+        process.kill(-watcher.pid, 'SIGTERM');
+      } else if (watcher.exitCode === null) {
+        watcher.kill('SIGTERM');
+      }
+      await rm(temporaryPath, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it('terminates the acquired type-checker when esbuild context setup fails', async () => {
     const temporaryPath = await mkdtemp(path.join(tmpdir(), 'codex-inline-watch-setup-'));
     const scriptsPath = path.join(temporaryPath, 'scripts');

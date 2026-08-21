@@ -1,5 +1,4 @@
 import { spawn } from 'node:child_process';
-import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { context } from 'esbuild';
 import { extensionBuildOptions } from './esbuild-options.mjs';
@@ -8,22 +7,29 @@ const typeScriptPath = fileURLToPath(
   new URL('../node_modules/typescript/bin/tsc', import.meta.url),
 );
 let typeCheck;
+let typeCheckClosed;
+let typeCheckSpawnFailed = false;
 let buildContext;
 let stopping = false;
 
 async function cleanup() {
-  if (typeCheck?.exitCode === null) {
-    const typeCheckExit = once(typeCheck, 'exit').then(() => true, () => true);
+  if (
+    typeCheck !== undefined
+    && typeCheckClosed !== undefined
+    && !typeCheckSpawnFailed
+    && typeCheck.exitCode === null
+    && typeCheck.signalCode === null
+  ) {
     typeCheck.kill('SIGTERM');
-    const exited = await Promise.race([
-      typeCheckExit,
+    const closed = await Promise.race([
+      typeCheckClosed.then(() => true),
       new Promise((resolve) => setTimeout(() => resolve(false), 1_000)),
     ]);
-    if (!exited && typeCheck.exitCode === null) {
+    if (!closed && typeCheck.exitCode === null && typeCheck.signalCode === null) {
       typeCheck.kill('SIGKILL');
-      await typeCheckExit;
     }
   }
+  await typeCheckClosed;
 
   if (buildContext !== undefined) {
     await buildContext.dispose();
@@ -54,7 +60,9 @@ try {
     cwd: process.cwd(),
     stdio: 'inherit',
   });
+  typeCheckClosed = new Promise((resolve) => typeCheck.once('close', resolve));
   typeCheck.once('error', (error) => {
+    typeCheckSpawnFailed = true;
     console.error(error);
     void stop(1);
   });
