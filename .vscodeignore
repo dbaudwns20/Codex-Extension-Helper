@@ -1,0 +1,12 @@
+**/*.map
+src/**
+test/**
+out/test/**
+coverage/**
+.worktrees/**
+.superpowers/**
+docs/superpowers/**
+.vscode/**
+.vscode-test/**
+tsconfig.json
+vitest.config.ts

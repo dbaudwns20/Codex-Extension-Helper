@@ -1,0 +1,79 @@
+{
+  "name": "codex-inline-changes",
+  "displayName": "Codex Inline Changes",
+  "description": "Show external file changes inline in VS Code Insiders editors.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.134.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/src/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "enabledApiProposals": [
+    "editorInsets"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Codex Inline Changes",
+      "properties": {
+        "codexInlineChanges.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable inline rendering of external file changes."
+        },
+        "codexInlineChanges.debounceMs": {
+          "type": "number",
+          "default": 300,
+          "minimum": 0,
+          "description": "Milliseconds to wait before comparing an external file change."
+        },
+        "codexInlineChanges.maxFileSizeKb": {
+          "type": "number",
+          "default": 1024,
+          "minimum": 1,
+          "description": "Maximum file size in KiB eligible for inline change rendering."
+        },
+        "codexInlineChanges.exclude": {
+          "type": "array",
+          "default": [
+            "**/.git/**",
+            "**/node_modules/**",
+            "**/dist/**",
+            "**/build/**"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Glob patterns for files excluded from inline change rendering."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "vitest",
+    "test:unit": "vitest run test/unit",
+    "test:extension": "npm run compile && node ./out/test/extension/runTest.js",
+    "check": "npm run compile && npm run test:unit",
+    "package": "npm run check && vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "diff": "^8.0.2",
+    "minimatch": "^10.0.3"
+  },
+  "devDependencies": {
+    "@types/diff": "^7.0.0",
+    "@types/node": "^24.3.0",
+    "@types/vscode": "^1.105.0",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.6.2",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
