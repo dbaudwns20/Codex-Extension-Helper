@@ -37,7 +37,7 @@ export async function runExtensionSmokeTest(): Promise<void> {
   const fileUri = vscode.Uri.joinPath(workspaceFolder.uri, 'smoke.ts');
   const document = await vscode.workspace.openTextDocument(fileUri);
   const editor = await vscode.window.showTextDocument(document);
-  const extension = vscode.extensions.getExtension<TestExtensionApi>('local.codex-inline-changes');
+  const extension = vscode.extensions.getExtension<TestExtensionApi>('local.codex-extension-helper');
   assert.ok(extension, 'The development extension must be installed');
   const api = await extension.activate();
   assert.ok(api?.testDiagnostics, 'Test diagnostics must be exported in the Extension Host test');
@@ -66,7 +66,7 @@ export async function runExtensionSmokeTest(): Promise<void> {
     'The policy fixture must start above the initial one-KiB limit',
   );
 
-  await vscode.workspace.getConfiguration('codexInlineChanges').update(
+  await vscode.workspace.getConfiguration('codexExtensionHelper').update(
     'maxFileSizeKb',
     2,
     vscode.ConfigurationTarget.Workspace,

@@ -1,6 +1,6 @@
-# Codex Inline Changes
+# Codex Extension Helper
 
-Codex Inline Changes is a personal VS Code Insiders extension that shows qualifying external file writes directly in the normal editable editor. Despite the name, VS Code does not identify the process that changed a file, so the extension shows changes made by Codex **and by every other external writer** that meets the same eligibility rules.
+Codex Extension Helper is a personal VS Code Insiders extension that shows qualifying external file writes directly in the normal editable editor. VS Code does not identify the process that changed a file, so the extension shows changes made by Codex **and by every other external writer** that meets the same eligibility rules.
 
 ## What appears in the editor
 
@@ -15,7 +15,7 @@ The red blocks are visual history only. They are never inserted into the documen
 ## Requirements
 
 - VS Code Insiders is required. Stable VS Code is not supported.
-- The extension uses the proposed `editorInsets` API and must be launched with proposed API access enabled for the full extension identifier `local.codex-inline-changes`.
+- The extension uses the proposed `editorInsets` API and must be launched with proposed API access enabled for the full extension identifier `local.codex-extension-helper`.
 - Marketplace publication is not supported because proposed APIs are unstable and restricted. The generated VSIX is for personal installation.
 
 ## Build, package, and install
@@ -25,13 +25,13 @@ From the repository root:
 ```bash
 npm ci
 npm run package
-code-insiders --install-extension ./codex-inline-changes-0.0.1.vsix --force
+code-insiders --install-extension ./codex-extension-helper-0.0.1.vsix --force
 ```
 
 Launch the installed extension against a workspace with the proposal enabled:
 
 ```bash
-code-insiders --enable-proposed-api=local.codex-inline-changes /absolute/path/to/workspace
+code-insiders --enable-proposed-api=local.codex-extension-helper /absolute/path/to/workspace
 ```
 
 The proposed API flag is required each time the relevant Insiders process starts unless you have configured the equivalent Insiders runtime setting yourself. If the `code-insiders` shell command is unavailable on macOS, install it from VS Code Insiders with **Shell Command: Install 'code-insiders' command in PATH**.
@@ -49,7 +49,7 @@ Then run the **Run Extension (Insiders)** launch configuration. It opens `test-f
 
 ```bash
 code-insiders --extensionDevelopmentPath="$PWD" \
-  --enable-proposed-api=local.codex-inline-changes \
+  --enable-proposed-api=local.codex-extension-helper \
   "$PWD/test-fixtures/workspace"
 ```
 
@@ -59,10 +59,10 @@ The default build task is **npm: watch**, which runs `npm run watch`. TypeScript
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `codexInlineChanges.enabled` | `true` | Enables detection and inline rendering. Turning it off clears active and pending comparison state. |
-| `codexInlineChanges.debounceMs` | `300` | Wait time in milliseconds before reading and comparing an external write (50–5000). |
-| `codexInlineChanges.maxFileSizeKb` | `1024` | Maximum eligible file size in KiB. |
-| `codexInlineChanges.exclude` | `**/.git/**`, `**/node_modules/**`, `**/dist/**`, `**/build/**` | Glob patterns excluded from tracking. |
+| `codexExtensionHelper.enabled` | `true` | Enables detection and inline rendering. Turning it off clears active and pending comparison state. |
+| `codexExtensionHelper.debounceMs` | `300` | Wait time in milliseconds before reading and comparing an external write (50–5000). |
+| `codexExtensionHelper.maxFileSizeKb` | `1024` | Maximum eligible file size in KiB. |
+| `codexExtensionHelper.exclude` | `**/.git/**`, `**/node_modules/**`, `**/dist/**`, `**/build/**` | Glob patterns excluded from tracking. |
 
 Only `file` documents with decodable, non-binary content, a valid pre-change snapshot, an eligible size, and a non-excluded path are compared. A file must have a usable baseline before its external write; the extension does not invent a comparison for a file it has never observed.
 
@@ -76,6 +76,6 @@ Only `file` documents with decodable, non-binary content, a valid pre-change sna
 
 ## Troubleshooting
 
-Open **View → Output**, then choose **Codex Inline Changes** from the channel picker. File-read, eligibility, diff, and rendering failures are reported there and never cause the extension to modify the affected document.
+Open **View → Output**, then choose **Codex Extension Helper** from the channel picker. File-read, eligibility, diff, and rendering failures are reported there and never cause the extension to modify the affected document.
 
-If no UI appears, confirm that you are running VS Code Insiders, the process was started with `--enable-proposed-api=local.codex-inline-changes`, the setting is enabled, and the file had an observed baseline before the external write. Without proposed API support, the extension shows one actionable warning and disables rendering without changing files.
+If no UI appears, confirm that you are running VS Code Insiders, the process was started with `--enable-proposed-api=local.codex-extension-helper`, the setting is enabled, and the file had an observed baseline before the external write. Without proposed API support, the extension shows one actionable warning and disables rendering without changing files.

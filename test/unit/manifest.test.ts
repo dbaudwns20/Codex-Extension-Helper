@@ -10,14 +10,14 @@ describe('extension manifest', () => {
 
   it('declares the documented defaults', () => {
     const properties = manifest.contributes.configuration.properties;
-    expect(properties['codexInlineChanges.enabled'].default).toBe(true);
-    expect(properties['codexInlineChanges.debounceMs'].default).toBe(300);
-    expect(properties['codexInlineChanges.maxFileSizeKb'].default).toBe(1024);
+    expect(properties['codexExtensionHelper.enabled'].default).toBe(true);
+    expect(properties['codexExtensionHelper.debounceMs'].default).toBe(300);
+    expect(properties['codexExtensionHelper.maxFileSizeKb'].default).toBe(1024);
   });
 
   it('publishes the same debounce range enforced by runtime normalization', () => {
     const debounce = manifest.contributes.configuration.properties[
-      'codexInlineChanges.debounceMs'
+      'codexExtensionHelper.debounceMs'
     ] as { minimum?: number; maximum?: number };
 
     expect(debounce.minimum).toBe(50);

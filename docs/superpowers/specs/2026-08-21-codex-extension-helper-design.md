@@ -1,4 +1,4 @@
-# Codex Inline Changes VS Code Extension Design
+# Codex Extension Helper VS Code Extension Design
 
 ## Purpose
 
@@ -85,10 +85,10 @@ Coordinates detector, snapshot, diff, and renderer events. It serializes updates
 
 ```jsonc
 {
-  "codexInlineChanges.enabled": true,
-  "codexInlineChanges.debounceMs": 300,
-  "codexInlineChanges.maxFileSizeKb": 1024,
-  "codexInlineChanges.exclude": [
+  "codexExtensionHelper.enabled": true,
+  "codexExtensionHelper.debounceMs": 300,
+  "codexExtensionHelper.maxFileSizeKb": 1024,
+  "codexExtensionHelper.exclude": [
     "**/.git/**",
     "**/node_modules/**",
     "**/dist/**",

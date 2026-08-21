@@ -21,8 +21,8 @@ import {
 } from './inlineRenderer';
 import { SnapshotStore } from './snapshotStore';
 
-const CONFIGURATION_SECTION = 'codexInlineChanges';
-const OUTPUT_CHANNEL_NAME = 'Codex Inline Changes';
+const CONFIGURATION_SECTION = 'codexExtensionHelper';
+const OUTPUT_CHANNEL_NAME = 'Codex Extension Helper';
 
 interface TestDiagnostics {
   readonly comparisonCount: number;
@@ -587,7 +587,7 @@ export function activate(context: vscode.ExtensionContext): TestExtensionApi | u
   context.subscriptions.push(controller);
   controller.start();
 
-  return process.env.CODEX_INLINE_CHANGES_TEST === '1' ? { testDiagnostics } : undefined;
+  return process.env.CODEX_EXTENSION_HELPER_TEST === '1' ? { testDiagnostics } : undefined;
 }
 
 export function deactivate(): void {

@@ -1,4 +1,4 @@
-# Codex Inline Changes Implementation Plan
+# Codex Extension Helper Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript, VS Code Insiders 1.134+, proposed `editorInsets` API, `diff`, `minimatch`, Vitest, `@vscode/test-electron`, and `@vscode/vsce`.
 
-**Spec:** `docs/superpowers/specs/2026-08-21-codex-inline-changes-design.md`
+**Spec:** `docs/superpowers/specs/2026-08-21-codex-extension-helper-design.md`
 
 ## Global Constraints
 
@@ -52,9 +52,9 @@ describe('extension manifest', () => {
 
   it('declares the documented defaults', () => {
     const properties = manifest.contributes.configuration.properties;
-    expect(properties['codexInlineChanges.enabled'].default).toBe(true);
-    expect(properties['codexInlineChanges.debounceMs'].default).toBe(300);
-    expect(properties['codexInlineChanges.maxFileSizeKb'].default).toBe(1024);
+    expect(properties['codexExtensionHelper.enabled'].default).toBe(true);
+    expect(properties['codexExtensionHelper.debounceMs'].default).toBe(300);
+    expect(properties['codexExtensionHelper.maxFileSizeKb'].default).toBe(1024);
   });
 });
 ```
@@ -67,7 +67,7 @@ Expected: FAIL because `package.json`, Vitest, and TypeScript configuration do n
 
 - [ ] **Step 3: Add the manifest and toolchain**
 
-Create `package.json` with extension id `codex-inline-changes`, publisher `local`, `main: ./out/extension.js`, `activationEvents: ["onStartupFinished"]`, and `enabledApiProposals: ["editorInsets"]`. Add these scripts:
+Create `package.json` with extension id `codex-extension-helper`, publisher `local`, `main: ./out/extension.js`, `activationEvents: ["onStartupFinished"]`, and `enabledApiProposals: ["editorInsets"]`. Add these scripts:
 
 ```json
 {
@@ -89,10 +89,10 @@ Add configuration contributions for:
 
 ```json
 {
-  "codexInlineChanges.enabled": true,
-  "codexInlineChanges.debounceMs": 300,
-  "codexInlineChanges.maxFileSizeKb": 1024,
-  "codexInlineChanges.exclude": [
+  "codexExtensionHelper.enabled": true,
+  "codexExtensionHelper.debounceMs": 300,
+  "codexExtensionHelper.maxFileSizeKb": 1024,
+  "codexExtensionHelper.exclude": [
     "**/.git/**",
     "**/node_modules/**",
     "**/dist/**",
@@ -466,7 +466,7 @@ Create a `workspace.createFileSystemWatcher('**/*')` adapter. For create/change 
 
 In `activate`:
 
-1. Create `OutputChannel('Codex Inline Changes')`.
+1. Create `OutputChannel('Codex Extension Helper')`.
 2. Read and validate configuration.
 3. Build `LineDiffEngine`, `SnapshotStore`, `InlineRenderer`, `ComparisonCoordinator`, and `ExternalChangeDetector`.
 4. Seed snapshots for currently open file documents.
@@ -517,7 +517,7 @@ Configure an extension-host launch that uses `${workspaceFolder}` as the extensi
 
 ```json
 [
-  "--enable-proposed-api=local.codex-inline-changes",
+  "--enable-proposed-api=local.codex-extension-helper",
   "${workspaceFolder}/test-fixtures/workspace"
 ]
 ```
@@ -531,12 +531,12 @@ README must explain:
 - this extension displays all qualifying external writes, not Codex identity;
 - VS Code Insiders is required;
 - install commands for the generated VSIX;
-- the `--enable-proposed-api=local.codex-inline-changes` launch requirement;
+- the `--enable-proposed-api=local.codex-extension-helper` launch requirement;
 - red blocks are read-only history, green lines are current editable content;
 - saving clears the comparison;
 - settings and defaults;
 - no Accept/Reject, persistence across restarts, stable VS Code, or Marketplace support;
-- troubleshooting through the `Codex Inline Changes` output channel.
+- troubleshooting through the `Codex Extension Helper` output channel.
 
 - [ ] **Step 3: Run automated verification**
 
@@ -552,7 +552,7 @@ Expected: PASS or the single documented incompatible-host skip.
 
 Run: `npm run package`
 
-Expected: a `codex-inline-changes-<version>.vsix` file is created.
+Expected: a `codex-extension-helper-<version>.vsix` file is created.
 
 Run: `npx vsce ls`
 

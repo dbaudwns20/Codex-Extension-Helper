@@ -8,7 +8,7 @@
       "runtimeExecutable": "${execPath}",
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
-        "--enable-proposed-api=local.codex-inline-changes",
+        "--enable-proposed-api=local.codex-extension-helper",
         "${workspaceFolder}/test-fixtures/workspace"
       ],
       "outFiles": [

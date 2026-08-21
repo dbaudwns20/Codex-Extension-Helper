@@ -2,7 +2,7 @@ import type * as vscode from 'vscode';
 import type { ComparisonView } from './coordinator';
 import type { ChangeHunk } from './types';
 
-const INSET_WARNING = 'Codex Inline Changes could not render deleted lines. Use VS Code Insiders with the editorInsets proposed API enabled, then reload the window.';
+const INSET_WARNING = 'Codex Extension Helper could not render deleted lines. Use VS Code Insiders with the editorInsets proposed API enabled, then reload the window.';
 
 export interface InsetPlacement {
   anchorLine: number;

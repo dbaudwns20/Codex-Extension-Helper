@@ -32,8 +32,8 @@ async function main(): Promise<void> {
     await writeFile(
       path.join(workspacePath, '.vscode', 'settings.json'),
       JSON.stringify({
-        'codexInlineChanges.debounceMs': 50,
-        'codexInlineChanges.maxFileSizeKb': 1,
+        'codexExtensionHelper.debounceMs': 50,
+        'codexExtensionHelper.maxFileSizeKb': 1,
       }),
       'utf8',
     );
@@ -47,11 +47,11 @@ async function main(): Promise<void> {
       vscodeExecutablePath: await insidersExecutable(),
       extensionDevelopmentPath,
       extensionTestsPath,
-      extensionTestsEnv: { CODEX_INLINE_CHANGES_TEST: '1' },
+      extensionTestsEnv: { CODEX_EXTENSION_HELPER_TEST: '1' },
       launchArgs: [
         workspacePath,
         '--disable-extensions',
-        '--enable-proposed-api=local.codex-inline-changes',
+        '--enable-proposed-api=local.codex-extension-helper',
         `--user-data-dir=${userDataPath}`,
         `--extensions-dir=${extensionsPath}`,
       ],
