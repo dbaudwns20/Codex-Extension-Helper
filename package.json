@@ -3,6 +3,8 @@
   "displayName": "Codex Inline Changes",
   "description": "Show external file changes inline in VS Code Insiders editors.",
   "version": "0.0.1",
+  "private": true,
+  "license": "UNLICENSED",
   "publisher": "local",
   "engines": {
     "vscode": "^1.134.0"
@@ -55,7 +57,7 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p .",
+    "compile": "tsc -p . && node ./scripts/build-extension.mjs",
     "watch": "tsc -watch -p .",
     "test": "vitest",
     "test:unit": "vitest run test/unit",
@@ -73,6 +75,7 @@
     "@types/vscode": "^1.105.0",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.6.2",
+    "esbuild": "^0.21.5",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   }

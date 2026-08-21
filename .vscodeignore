@@ -1,12 +1,17 @@
 **/*.map
 src/**
 test/**
+test-fixtures/**
+scripts/**
+node_modules/**
 out/test/**
+out/package.json
 coverage/**
 .worktrees/**
 .superpowers/**
 docs/superpowers/**
 .vscode/**
 .vscode-test/**
+.gitignore
 tsconfig.json
 vitest.config.ts
