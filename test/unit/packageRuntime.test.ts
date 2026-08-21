@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -11,7 +11,8 @@ describe('packaged runtime', () => {
     try {
       const runtimePath = path.join(temporaryPath, 'out', 'src');
       const vscodeStubPath = path.join(temporaryPath, 'node_modules', 'vscode');
-      await cp(path.resolve('out/src'), runtimePath, { recursive: true });
+      await mkdir(runtimePath, { recursive: true });
+      await copyFile(path.resolve('out/src/extension.js'), path.join(runtimePath, 'extension.js'));
       await mkdir(vscodeStubPath, { recursive: true });
       await writeFile(
         path.join(vscodeStubPath, 'package.json'),
@@ -30,5 +31,24 @@ describe('packaged runtime', () => {
     } finally {
       await rm(temporaryPath, { recursive: true, force: true });
     }
+  });
+
+  it('lists the bundled entry as the only packaged runtime JavaScript', () => {
+    const executable = path.resolve(
+      'node_modules',
+      '.bin',
+      process.platform === 'win32' ? 'vsce.cmd' : 'vsce',
+    );
+    const result = spawnSync(executable, ['ls', '--no-dependencies'], {
+      cwd: path.resolve('.'),
+      encoding: 'utf8',
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(
+      result.stdout
+        .split(/\r?\n/u)
+        .filter((entry) => entry.startsWith('out/src/') && entry.endsWith('.js')),
+    ).toEqual(['out/src/extension.js']);
   });
 });

@@ -4,6 +4,8 @@ test/**
 test-fixtures/**
 scripts/**
 node_modules/**
+out/src/**
+!out/src/extension.js
 out/test/**
 out/package.json
 coverage/**

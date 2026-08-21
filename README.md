@@ -53,7 +53,7 @@ code-insiders --extensionDevelopmentPath="$PWD" \
   "$PWD/test-fixtures/workspace"
 ```
 
-The default build task is **npm: watch**, which runs `npm run watch`.
+The default build task is **npm: watch**, which runs `npm run watch`. TypeScript continuously type-checks in no-emit mode while esbuild exclusively rebuilds the bundled `out/src/extension.js` runtime entry.
 
 ## Settings
 

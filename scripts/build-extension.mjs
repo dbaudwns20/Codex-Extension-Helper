@@ -1,12 +1,4 @@
 import { build } from 'esbuild';
+import { extensionBuildOptions } from './esbuild-options.mjs';
 
-await build({
-  entryPoints: ['src/extension.ts'],
-  outfile: 'out/src/extension.js',
-  bundle: true,
-  platform: 'node',
-  format: 'cjs',
-  target: 'node20',
-  external: ['vscode'],
-  sourcemap: false,
-});
+await build(extensionBuildOptions);

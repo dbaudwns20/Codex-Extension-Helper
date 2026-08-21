@@ -58,7 +58,7 @@
   },
   "scripts": {
     "compile": "tsc -p . && node ./scripts/build-extension.mjs",
-    "watch": "tsc -watch -p .",
+    "watch": "node ./scripts/watch-extension.mjs",
     "test": "vitest",
     "test:unit": "vitest run test/unit",
     "test:extension": "npm run compile && node ./out/test/extension/runTest.js",
