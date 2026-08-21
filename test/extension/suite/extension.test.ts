@@ -57,4 +57,42 @@ export async function runExtensionSmokeTest(): Promise<void> {
     api.testDiagnostics.comparisonCount === 0
     && api.testDiagnostics.renderedComparisonCount === 0
   ));
+
+  const policyUri = vscode.Uri.joinPath(workspaceFolder.uri, 'policy.ts');
+  const policyDocument = await vscode.workspace.openTextDocument(policyUri);
+  const policyEditor = await vscode.window.showTextDocument(policyDocument);
+  assert.ok(
+    Buffer.byteLength(policyDocument.getText(), 'utf8') > 1024,
+    'The policy fixture must start above the initial one-KiB limit',
+  );
+
+  await vscode.workspace.getConfiguration('codexInlineChanges').update(
+    'maxFileSizeKb',
+    2,
+    vscode.ConfigurationTarget.Workspace,
+  );
+  const externallyChangedPolicyText = policyDocument.getText().replace(/x";\n$/u, 'y";\n');
+  assert.notEqual(
+    externallyChangedPolicyText,
+    policyDocument.getText(),
+    'The policy fixture replacement must change one byte',
+  );
+  await vscode.workspace.fs.writeFile(
+    policyUri,
+    new TextEncoder().encode(externallyChangedPolicyText),
+  );
+  await waitFor('the newly eligible open document to compare on its next external write', () => (
+    api.testDiagnostics.comparisonCount === 1
+    && api.testDiagnostics.renderedComparisonCount === 1
+  ));
+
+  const policyEdited = await policyEditor.edit((builder) => {
+    builder.insert(new vscode.Position(policyDocument.lineCount, 0), '// saved\n');
+  });
+  assert.equal(policyEdited, true, 'The policy document edit must apply before save');
+  assert.equal(await policyDocument.save(), true, 'The policy document must save');
+  await waitFor('the policy document save to clear the comparison', () => (
+    api.testDiagnostics.comparisonCount === 0
+    && api.testDiagnostics.renderedComparisonCount === 0
+  ));
 }

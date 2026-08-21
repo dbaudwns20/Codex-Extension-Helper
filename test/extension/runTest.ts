@@ -28,7 +28,21 @@ async function main(): Promise<void> {
 
   try {
     await mkdir(workspacePath);
+    await mkdir(path.join(workspacePath, '.vscode'));
+    await writeFile(
+      path.join(workspacePath, '.vscode', 'settings.json'),
+      JSON.stringify({
+        'codexInlineChanges.debounceMs': 50,
+        'codexInlineChanges.maxFileSizeKb': 1,
+      }),
+      'utf8',
+    );
     await writeFile(path.join(workspacePath, 'smoke.ts'), 'const value = 1;\n', 'utf8');
+    await writeFile(
+      path.join(workspacePath, 'policy.ts'),
+      `export const payload = "${'x'.repeat(1_400)}";\n`,
+      'utf8',
+    );
     await runTests({
       vscodeExecutablePath: await insidersExecutable(),
       extensionDevelopmentPath,

@@ -31,7 +31,8 @@
         "codexInlineChanges.debounceMs": {
           "type": "number",
           "default": 300,
-          "minimum": 0,
+          "minimum": 50,
+          "maximum": 5000,
           "description": "Milliseconds to wait before comparing an external file change."
         },
         "codexInlineChanges.maxFileSizeKb": {

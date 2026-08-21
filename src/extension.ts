@@ -33,6 +33,10 @@ interface TestExtensionApi {
   readonly testDiagnostics: TestDiagnostics;
 }
 
+interface ExternalComparisonCandidate {
+  readonly text: string;
+}
+
 function errorDetail(error: unknown): string {
   return error instanceof Error ? error.stack ?? error.message : String(error);
 }
@@ -67,6 +71,7 @@ class ExtensionRuntime implements vscode.Disposable {
   private readonly trackedUris = new Map<string, vscode.Uri>();
   private readonly comparisonKeys = new Set<string>();
   private readonly documentFence = new DocumentChangeFence();
+  private readonly externalCandidates = new Map<string, ExternalComparisonCandidate>();
   private visibleKeys = new Set<string>();
   private disposed = false;
 
@@ -150,6 +155,9 @@ class ExtensionRuntime implements vscode.Disposable {
         this.deleteKey(key);
       }
     }
+    for (const document of vscode.workspace.textDocuments) {
+      this.seedDocument(document);
+    }
   }
 
   dispose(): void {
@@ -162,6 +170,7 @@ class ExtensionRuntime implements vscode.Disposable {
     this.trackedUris.clear();
     this.comparisonKeys.clear();
     this.visibleKeys.clear();
+    this.externalCandidates.clear();
     this.documentFence.clear();
   }
 
@@ -171,6 +180,7 @@ class ExtensionRuntime implements vscode.Disposable {
     }
 
     const key = normalizeUriKey(uri);
+    this.externalCandidates.delete(key);
     this.trackedUris.set(key, uri);
     if (kind === 'create') {
       this.detector.handleCreate(uri);
@@ -200,14 +210,23 @@ class ExtensionRuntime implements vscode.Disposable {
   }
 
   private handleDocumentChange(event: vscode.TextDocumentChangeEvent): void {
-    if (
-      this.disposed
-      || !shouldInvalidateDocumentChange(event.contentChanges.length, event.document.isDirty)
-    ) {
+    if (this.disposed || event.contentChanges.length === 0) {
       return;
     }
 
     const key = normalizeUriKey(event.document.uri);
+    if (!shouldInvalidateDocumentChange(event.contentChanges.length, event.document.isDirty)) {
+      const candidate = this.externalCandidates.get(key);
+      if (candidate !== undefined && candidate.text === event.document.getText()) {
+        void this.run(
+          'ExternalDocumentRefresh',
+          () => this.tryApplyExternalComparison(key, candidate),
+        );
+      }
+      return;
+    }
+
+    this.externalCandidates.delete(key);
     this.documentFence.invalidate(key);
     this.detector.invalidate(key);
     this.coordinator.invalidate(key);
@@ -237,6 +256,7 @@ class ExtensionRuntime implements vscode.Disposable {
   private handleWillSave(event: vscode.TextDocumentWillSaveEvent): void {
     if (!this.disposed && this.isEligible(event.document.uri, event.document.getText())) {
       const key = normalizeUriKey(event.document.uri);
+      this.externalCandidates.delete(key);
       this.documentFence.invalidate(key);
       this.documentDebouncer.cancel(key);
       this.coordinator.invalidate(key);
@@ -250,6 +270,7 @@ class ExtensionRuntime implements vscode.Disposable {
     }
 
     const key = normalizeUriKey(document.uri);
+    this.externalCandidates.delete(key);
     this.documentFence.invalidate(key);
     this.detector.invalidate(key);
     this.documentDebouncer.cancel(key);
@@ -329,6 +350,7 @@ class ExtensionRuntime implements vscode.Disposable {
   }
 
   private deleteKey(key: string, invalidateDetector = true): void {
+    this.externalCandidates.delete(key);
     this.documentFence.invalidate(key);
     if (invalidateDetector) {
       this.detector.invalidate(key);
@@ -349,12 +371,36 @@ class ExtensionRuntime implements vscode.Disposable {
   }
 
   private async applyExternalComparison(key: string, text: string): Promise<void> {
-    const isCurrent = this.createDocumentGuard(key, text);
+    const candidate = { text };
+    this.externalCandidates.set(key, candidate);
+    await this.tryApplyExternalComparison(key, candidate);
+  }
+
+  private async tryApplyExternalComparison(
+    key: string,
+    candidate: ExternalComparisonCandidate,
+  ): Promise<void> {
+    if (this.disposed || this.externalCandidates.get(key) !== candidate) {
+      return;
+    }
+
+    const document = this.liveDocument(key);
+    if (document !== undefined && document.getText() !== candidate.text) {
+      if (document.isDirty && this.externalCandidates.get(key) === candidate) {
+        this.externalCandidates.delete(key);
+      }
+      return;
+    }
+
+    const isCurrent = this.createDocumentGuard(key, candidate.text);
     if (isCurrent === undefined) {
       return;
     }
 
-    await this.coordinator.externalChange(key, text, isCurrent);
+    await this.coordinator.externalChange(key, candidate.text, isCurrent);
+    if (this.externalCandidates.get(key) === candidate) {
+      this.externalCandidates.delete(key);
+    }
     this.syncComparison(key);
   }
 

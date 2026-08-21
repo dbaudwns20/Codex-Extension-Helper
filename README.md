@@ -60,7 +60,7 @@ The default build task is **npm: watch**, which runs `npm run watch`. TypeScript
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `codexInlineChanges.enabled` | `true` | Enables detection and inline rendering. Turning it off clears active and pending comparison state. |
-| `codexInlineChanges.debounceMs` | `300` | Wait time in milliseconds before reading and comparing an external write. |
+| `codexInlineChanges.debounceMs` | `300` | Wait time in milliseconds before reading and comparing an external write (50–5000). |
 | `codexInlineChanges.maxFileSizeKb` | `1024` | Maximum eligible file size in KiB. |
 | `codexInlineChanges.exclude` | `**/.git/**`, `**/node_modules/**`, `**/dist/**`, `**/build/**` | Glob patterns excluded from tracking. |
 
