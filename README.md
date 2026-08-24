@@ -45,6 +45,31 @@ mv codex-extension-helper-0.0.1.vsix codex-extension-helper-0.0.1-stable.vsix
 code --install-extension ./codex-extension-helper-0.0.1-stable.vsix --force
 ```
 
+## Codex Explorer drop chips
+
+The optional patch below adds Explorer file and folder drops to the Codex
+composer. Apply it after installing or whenever Codex has updated:
+
+```bash
+npm run patch:codex-drop
+# Reload VS Code, then drop Explorer files or folders onto the Codex composer.
+
+npm run unpatch:codex-drop
+# Reload VS Code again after restoring.
+```
+
+Each dropped file or folder becomes one chip; directories are not expanded.
+In automatic mode, the patch command chooses the numerically newest installed
+`openai.chatgpt-*` version first and fails closed if that installation's bundle
+layout is unsupported; it does not fall back to an older installation. To
+intentionally target an older side-by-side installation, run
+`node scripts/patch-codex-drop.mjs --extension-dir <extension-path>` (and use
+the same `--extension-dir` option with the restore script). After a Codex
+update, rerun `npm run patch:codex-drop` and reload VS Code. To restore the
+original installation, run `npm run unpatch:codex-drop` and reload VS Code
+again. If the installed bundle has an unknown layout, the command fails without
+modifying the installation.
+
 ## Develop in VS Code Stable
 
 Open this repository in VS Code Stable, create the fixture workspace once, and start the watcher:

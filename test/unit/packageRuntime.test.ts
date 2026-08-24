@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { diffChars } from 'diff';
@@ -444,6 +444,19 @@ describe('packaged runtime', () => {
       await rm(temporaryPath, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it('documents the Codex Explorer drop patch workflow', async () => {
+    const readme = await readFile(path.resolve('README.md'), 'utf8');
+
+    expect(readme).toContain('npm run patch:codex-drop');
+    expect(readme).toContain('npm run unpatch:codex-drop');
+    expect(readme).toContain('openai.chatgpt-*');
+    expect(readme).toContain('Reload VS Code');
+    expect(readme).toContain('numerically newest installed');
+    expect(readme).toContain('fails closed');
+    expect(readme).toContain('--extension-dir');
+    expect(readme).toContain('older side-by-side installation');
+  });
 });
 
 describe('stable review runtime boundaries', () => {
