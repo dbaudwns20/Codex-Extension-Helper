@@ -82,6 +82,20 @@ describe('Codex drop installation discovery', () => {
     await expect(resolveCodexTarget({ roots: [extensionsRoot] })).rejects.toThrow('No compatible Codex bundle found');
   });
 
+  it('fails automatic patching when the newest installation has no compatible bundle', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { applyCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    const extensionsRoot = await makeTemporaryDirectory();
+    const olderExtensionDir = await makeInstallation(extensionsRoot, '26.818.10000');
+    const olderBundlePath = path.join(olderExtensionDir, 'webview/assets/app-initial-current.js');
+    const olderSource = await readFile(olderBundlePath, 'utf8');
+    const newerExtensionDir = await makeInstallation(extensionsRoot, '26.818.61809');
+    await writeFile(path.join(newerExtensionDir, 'webview/assets/app-initial-current.js'), 'unsupported newer bundle');
+
+    await expect(applyCodexDropPatch({ roots: [extensionsRoot] })).rejects.toThrow('No compatible Codex bundle found');
+    expect(await readFile(olderBundlePath, 'utf8')).toBe(olderSource);
+  });
+
   it('fails closed when multiple bundles contain the composer anchor', async () => {
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { resolveCodexTarget } = await import('../../scripts/lib/codex-drop-installation.mjs');

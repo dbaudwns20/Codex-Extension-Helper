@@ -84,11 +84,10 @@ export async function resolveCodexTarget(options = {}) {
   if (installations.length === 0) throw new Error('No compatible Codex installation found');
 
   const ordered = [...installations].sort((left, right) => VERSION_COMPARATOR.compare(right.extensionVersion, left.extensionVersion));
-  for (const installation of ordered) {
-    const bundlePaths = await compatibleBundlePaths(installation.extensionDir);
-    if (bundlePaths.length === 1) return { ...installation, bundlePath: bundlePaths[0] };
-    if (bundlePaths.length > 1) throw new Error('Expected exactly one compatible Codex bundle');
-  }
+  const installation = ordered[0];
+  const bundlePaths = await compatibleBundlePaths(installation.extensionDir);
+  if (bundlePaths.length === 1) return { ...installation, bundlePath: bundlePaths[0] };
+  if (bundlePaths.length > 1) throw new Error('Expected exactly one compatible Codex bundle');
   throw new Error('No compatible Codex bundle found');
 }
 
@@ -167,24 +166,23 @@ async function findRestoreTarget(options) {
   const installations = await discoverCodexInstallations(options);
   if (installations.length === 0) throw new Error('No compatible Codex installation found');
   const ordered = [...installations].sort((left, right) => VERSION_COMPARATOR.compare(right.extensionVersion, left.extensionVersion));
-  for (const installation of ordered) {
-    const assetsDir = path.join(installation.extensionDir, 'webview', 'assets');
-    let entries;
-    try {
-      entries = await readdir(assetsDir, { withFileTypes: true });
-    } catch (error) {
-      if (error?.code === 'ENOENT') continue;
-      throw error;
-    }
-    const candidates = [];
-    for (const entry of entries) {
-      if (!entry.isFile() || !/^app-initial-.*\.js$/u.test(entry.name)) continue;
-      const bundlePath = path.join(assetsDir, entry.name);
-      if (await fileExists(patchPaths(bundlePath).metadataPath)) candidates.push(bundlePath);
-    }
-    if (candidates.length === 1) return { ...installation, bundlePath: candidates[0] };
-    if (candidates.length > 1) throw new Error('Expected exactly one Codex bundle with patch metadata');
+  const installation = ordered[0];
+  const assetsDir = path.join(installation.extensionDir, 'webview', 'assets');
+  let entries;
+  try {
+    entries = await readdir(assetsDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT') throw new Error('No Codex drop patch metadata found');
+    throw error;
   }
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !/^app-initial-.*\.js$/u.test(entry.name)) continue;
+    const bundlePath = path.join(assetsDir, entry.name);
+    if (await fileExists(patchPaths(bundlePath).metadataPath)) candidates.push(bundlePath);
+  }
+  if (candidates.length === 1) return { ...installation, bundlePath: candidates[0] };
+  if (candidates.length > 1) throw new Error('Expected exactly one Codex bundle with patch metadata');
   throw new Error('No Codex drop patch metadata found');
 }
 
