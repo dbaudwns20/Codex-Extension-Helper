@@ -132,11 +132,11 @@ export class DeletedLinesCodeLensProvider implements vscode.CodeLensProvider, vs
     if (lines.length > 1) {
       return `− ${lines.length} deleted lines`;
     }
-    const content = lines[0].length === 0 ? '(blank line)' : lines[0];
+    const content = lines[0];
     const preview = content.length <= PREVIEW_LIMIT
       ? content
       : `${content.slice(0, PREVIEW_LIMIT - 1)}…`;
-    return `− ${preview}`;
+    return preview.length === 0 ? '−' : `− ${preview}`;
   }
 
   private tooltip(lines: readonly string[]): string {

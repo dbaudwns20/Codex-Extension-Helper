@@ -194,7 +194,7 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
       range: new this.api.Range(row.line, 0, row.line, 0),
       renderOptions: {
         after: {
-          contentText: `\u2212 ${row.text || '(blank line)'}`,
+          contentText: row.text.length === 0 ? '' : `\u2212 ${row.text}`,
           color: new this.api.ThemeColor('editor.foreground'),
           textDecoration: 'none; white-space: pre;',
         },
@@ -218,7 +218,9 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
         ? editor.document.lineAt(anchorLine).range.end.character
         : 0;
       const attachment: vscode.ThemableDecorationAttachmentRenderOptions = {
-        contentText: hunk.originalLines.map((line) => `\u2212 ${line || '(blank line)'}`).join('\n'),
+        contentText: hunk.originalLines.map((line) => (
+          line.length === 0 ? '' : `\u2212 ${line}`
+        )).join('\n'),
         color: new this.api.ThemeColor('editor.foreground'),
         backgroundColor: new this.api.ThemeColor('diffEditor.removedTextBackground'),
         textDecoration: 'none; display: block; width: 100%; box-sizing: border-box; white-space: pre;',
