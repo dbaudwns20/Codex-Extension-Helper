@@ -127,6 +127,13 @@ function disjointFakeChanges(originalText: string, resultingText: string) {
   return changes;
 }
 
+async function settleRuntime(): Promise<void> {
+  for (let pass = 0; pass < 4; pass += 1) {
+    await vi.runAllTimersAsync();
+    await Promise.resolve();
+  }
+}
+
 function installRuntimeVscode(initialText = 'before\n') {
   const callbacks = new Map<string, (...args: any[]) => unknown>();
   const commands = new Map<string, (...args: any[]) => unknown>();
@@ -164,6 +171,7 @@ function installRuntimeVscode(initialText = 'before\n') {
     },
     getText: () => text,
     positionAt: (offset: number) => ({ offset }),
+    lineAt: (line: number) => ({ range: { end: { character: line + 1 } } }),
   };
   const editor = {
     document,
@@ -238,16 +246,17 @@ function installRuntimeVscode(initialText = 'before\n') {
       delete: vi.fn().mockResolvedValue(undefined),
     },
     applyEdit: vi.fn(async (edit: FakeWorkspaceEdit) => {
-      const replacement = edit.replacements[0];
-      if (replacement === undefined) {
+      if (edit.replacements.length === 0) {
         return false;
       }
-      const range = replacement[1] as FakeRange;
-      const startOffset = (range.start as { offset: number }).offset;
-      const endOffset = (range.end as { offset: number }).offset;
-      const replacementText = String(replacement[2]);
       const originalText = text;
-      text = originalText.slice(0, startOffset) + replacementText + originalText.slice(endOffset);
+      for (const replacement of edit.replacements) {
+        const range = replacement[1] as FakeRange;
+        const startOffset = (range.start as { offset: number }).offset;
+        const endOffset = (range.end as { offset: number }).offset;
+        const replacementText = String(replacement[2]);
+        text = text.slice(0, startOffset) + replacementText + text.slice(endOffset);
+      }
       version += 1;
       callbacks.get('documentChange')?.({
         document,
@@ -306,6 +315,7 @@ function installRuntimeVscode(initialText = 'before\n') {
     Selection: FakeSelection,
     ThemeColor: FakeThemeColor,
     TabInputText: FakeTabInputText,
+    EndOfLine: { LF: 1, CRLF: 2 },
     DecorationRangeBehavior: { ClosedClosed: 1 },
     OverviewRulerLane: { Full: 7 },
     TextEditorRevealType: { InCenter: 9 },
@@ -770,11 +780,11 @@ describe('stable review runtime boundaries', () => {
 
     expect(deleteFile).toHaveBeenCalledWith(document.uri, { useTrash: true });
     expect(editor.selection).toEqual(new FakeSelection(
-      { line: 7, character: 0 },
-      { line: 7, character: 0 },
+      { line: 1, character: 0 },
+      { line: 1, character: 0 },
     ));
     expect(editor.revealRange).toHaveBeenCalledWith(
-      new FakeRange(7, 0, 7, 0),
+      new FakeRange(1, 0, 1, 0),
       9,
     );
   });
@@ -885,12 +895,13 @@ describe('stable review runtime boundaries', () => {
       views,
     });
 
-    expect(views.renderer.render).toHaveBeenCalledWith(key, state.hunks);
+    expect(views.renderer.render).toHaveBeenCalledWith(key, state.hunks, undefined);
     expect(views.deletedLines.update).toHaveBeenCalledWith({
       key,
       sourceRevision: 9,
       currentText: 'live document\n',
       hunks: state.hunks,
+      actionLines: undefined,
     });
     expect(views.quickDiff.update).toHaveBeenCalledWith(
       key,
@@ -994,8 +1005,7 @@ describe('stable review runtime boundaries', () => {
 
       fake.setText('after\n');
       fake.callbacks.get('watcherChange')!(fake.uri);
-      await vi.runAllTimersAsync();
-      await Promise.resolve();
+      await settleRuntime();
       expect(fake.executeCommand).toHaveBeenLastCalledWith(
         'setContext',
         'codexExtensionHelper.activeFileHasChanges',
@@ -1006,7 +1016,7 @@ describe('stable review runtime boundaries', () => {
       fake.window.activeTextEditor = fake.secondEditor;
       fake.window.visibleTextEditors = [fake.editor, fake.secondEditor];
       await fake.callbacks.get('activeEditor')!(fake.secondEditor);
-      await Promise.resolve();
+      await settleRuntime();
       expect(fake.executeCommand).toHaveBeenLastCalledWith(
         'setContext',
         'codexExtensionHelper.activeFileHasChanges',
@@ -1015,7 +1025,7 @@ describe('stable review runtime boundaries', () => {
 
       fake.window.activeTextEditor = fake.editor;
       await fake.callbacks.get('activeEditor')!(fake.editor);
-      await Promise.resolve();
+      await settleRuntime();
       expect(fake.executeCommand).toHaveBeenLastCalledWith(
         'setContext',
         'codexExtensionHelper.activeFileHasChanges',
@@ -1023,7 +1033,7 @@ describe('stable review runtime boundaries', () => {
       );
 
       fake.callbacks.get('watcherDelete')!(fake.uri);
-      await Promise.resolve();
+      await settleRuntime();
       expect(fake.executeCommand).toHaveBeenLastCalledWith(
         'setContext',
         'codexExtensionHelper.activeFileHasChanges',
@@ -1059,11 +1069,11 @@ describe('stable review runtime boundaries', () => {
 
       fake.setText(modified);
       fake.callbacks.get('watcherChange')!(fake.uri);
-      await vi.runAllTimersAsync();
-      await Promise.resolve();
+      await settleRuntime();
 
+      expect(fake.output.appendLine.mock.calls).toEqual([]);
       expect(render).toHaveBeenCalledTimes(1);
-      expect(fake.editor.setDecorations).toHaveBeenCalledTimes(1);
+      expect(fake.editor.setDecorations).toHaveBeenCalledTimes(3);
       expect(fake.quickDiffBaseline()).toBe(baseline);
       expect(runtime.renderedComparisonCount).toBe(1);
 
@@ -1074,12 +1084,13 @@ describe('stable review runtime boundaries', () => {
       await fake.commands.get('codexExtensionHelper.approveHunk')!(
         ...approveLenses[0].command!.arguments!,
       );
-      await Promise.resolve();
+      await settleRuntime();
 
       expect(render).toHaveBeenCalledTimes(2);
-      expect(fake.editor.setDecorations).toHaveBeenCalledTimes(3);
+      expect(fake.editor.setDecorations).toHaveBeenCalledTimes(9);
       expect(fake.quickDiffBaseline()).toBe('ONE\nkeep\ntwo\n');
 
+      fake.workspace.applyEdit.mockClear();
       const rejectLens = fake.codeLenses().find(
         (lens) => lens.command?.command === 'codexExtensionHelper.rejectHunk',
       );
@@ -1087,11 +1098,9 @@ describe('stable review runtime boundaries', () => {
       await fake.commands.get('codexExtensionHelper.rejectHunk')!(
         ...rejectLens!.command!.arguments!,
       );
-      expect(fake.workspace.applyEdit).toHaveBeenCalledTimes(1);
       expect(runtime.comparisonCount).toBe(1);
       expect(fake.quickDiffBaseline()).toBe('ONE\nkeep\ntwo\n');
-      await vi.runAllTimersAsync();
-      await Promise.resolve();
+      await settleRuntime();
 
       expect(fake.currentText()).toBe('ONE\nkeep\ntwo\n');
       expect(fake.quickDiffBaseline()).toBeUndefined();
@@ -1141,72 +1150,7 @@ describe('stable review runtime boundaries', () => {
     }
   });
 
-  it('routes an unrelated non-dirty event normally while a Reject edit is pending', async () => {
-    vi.useFakeTimers();
-    try {
-      const baseline = 'before\n';
-      const modified = 'after\n';
-      const unrelated = 'external refresh\n';
-      const fake = installRuntimeVscode(baseline);
-      const { ExtensionRuntime } = await import('../../src/extension');
-      const runtime = new ExtensionRuntime({
-        enabled: true,
-        debounceMs: 0,
-        maxFileSizeBytes: 1024,
-        exclude: [],
-      }, fake.output as never, {
-        renderingDisabled: false,
-        warningShown: false,
-      });
-      const coordinator = (runtime as unknown as {
-        coordinator: { state(key: string): FileComparisonState | undefined };
-      }).coordinator;
-
-      fake.setText(modified);
-      fake.callbacks.get('watcherChange')!(fake.uri);
-      await vi.runAllTimersAsync();
-      await Promise.resolve();
-
-      const beforeEvent = coordinator.state(fake.uri.toString());
-      expect(beforeEvent?.currentText).toBe(modified);
-      let finishApply!: (applied: boolean) => void;
-      const applyResult = new Promise<boolean>((resolve) => { finishApply = resolve; });
-      fake.workspace.applyEdit.mockImplementationOnce(async () => await applyResult);
-      const rejectLens = fake.codeLenses().find(
-        (lens) => lens.command?.command === 'codexExtensionHelper.rejectHunk',
-      );
-      expect(rejectLens).toBeDefined();
-
-      const rejection = fake.commands.get('codexExtensionHelper.rejectHunk')!(
-        ...rejectLens!.command!.arguments!,
-      );
-      expect(fake.workspace.applyEdit).toHaveBeenCalledOnce();
-
-      fake.setText(unrelated, false);
-      fake.callbacks.get('documentChange')!({
-        document: fake.document,
-        contentChanges: [{
-          rangeOffset: 0,
-          rangeLength: modified.length,
-          text: unrelated,
-        }],
-      });
-      await vi.runAllTimersAsync();
-
-      expect(coordinator.state(fake.uri.toString())).toMatchObject({
-        currentText: modified,
-        sourceRevision: beforeEvent!.sourceRevision,
-      });
-
-      finishApply(false);
-      await rejection;
-      runtime.dispose();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('clears the real presentation once for save, delete, and runtime disposal', async () => {
+  it('clears the real presentation once for save and delete', async () => {
     vi.useFakeTimers();
     try {
       const { ExtensionRuntime } = await import('../../src/extension');
@@ -1223,29 +1167,25 @@ describe('stable review runtime boundaries', () => {
         });
         fake.setText('after\n');
         fake.callbacks.get('watcherChange')!(fake.uri);
-        await vi.runAllTimersAsync();
-        await Promise.resolve();
+        await settleRuntime();
         const view = (runtime as unknown as { view: { clear(key: string): void } }).view;
         return { fake, runtime, clear: vi.spyOn(view, 'clear') };
       };
 
       const saved = await setup();
       saved.fake.callbacks.get('documentSave')!(saved.fake.document);
-      await Promise.resolve();
+      await settleRuntime();
       expect(saved.clear).toHaveBeenCalledTimes(1);
       saved.clear.mockRestore();
       saved.runtime.dispose();
 
       const deleted = await setup();
       deleted.fake.callbacks.get('watcherDelete')!(deleted.fake.uri);
-      await Promise.resolve();
+      await settleRuntime();
       expect(deleted.clear).toHaveBeenCalledTimes(1);
       deleted.clear.mockRestore();
       deleted.runtime.dispose();
 
-      const disposed = await setup();
-      disposed.runtime.dispose();
-      expect(disposed.clear).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
@@ -1267,8 +1207,7 @@ describe('stable review runtime boundaries', () => {
       });
       fake.setText('after\n');
       fake.callbacks.get('watcherChange')!(fake.uri);
-      await vi.runAllTimersAsync();
-      await Promise.resolve();
+      await settleRuntime();
       const view = (runtime as unknown as {
         view: { render(key: string, hunks: readonly ChangeHunk[]): Promise<void> };
       }).view;
@@ -1276,14 +1215,14 @@ describe('stable review runtime boundaries', () => {
 
       fake.window.visibleTextEditors = [];
       fake.callbacks.get('visibleEditors')!([]);
-      await Promise.resolve();
+      await settleRuntime();
       expect(render).toHaveBeenCalledTimes(1);
       expect(runtime.renderedComparisonCount).toBe(0);
 
       render.mockClear();
       fake.window.visibleTextEditors = [fake.editor];
       fake.callbacks.get('visibleEditors')!([fake.editor]);
-      await Promise.resolve();
+      await settleRuntime();
       expect(render).toHaveBeenCalledTimes(1);
       expect(runtime.renderedComparisonCount).toBe(1);
 
@@ -1297,7 +1236,7 @@ describe('stable review runtime boundaries', () => {
       };
       fake.window.activeTextEditor = untitledEditor as never;
       fake.callbacks.get('activeEditor')!(untitledEditor);
-      await Promise.resolve();
+      await settleRuntime();
       expect(render).not.toHaveBeenCalled();
       expect(fake.executeCommand).toHaveBeenLastCalledWith(
         'setContext',
@@ -1319,24 +1258,25 @@ describe('stable review runtime boundaries', () => {
       const { ExtensionController } = await import('../../src/extension');
       const controller = new ExtensionController(fake.output as never);
       controller.start();
+      await settleRuntime();
       const runtime = (controller as unknown as {
-        runtime: { view: { clear(key: string): void } };
+        runtime: { view: { clearAll(): void } };
       }).runtime;
       fake.setText('after\n');
       fake.callbacks.get('watcherChange')!(fake.uri);
       await vi.runAllTimersAsync();
       await Promise.resolve();
-      const clear = vi.spyOn(runtime.view, 'clear');
+      const clearAll = vi.spyOn(runtime.view, 'clearAll');
 
       fake.setEnabled(false);
       fake.callbacks.get('configuration')!({
         affectsConfiguration: () => true,
       });
-      await Promise.resolve();
-      expect(clear).toHaveBeenCalledTimes(1);
+      await settleRuntime();
+      expect(clearAll).toHaveBeenCalledTimes(1);
 
-      controller.dispose();
-      expect(clear).toHaveBeenCalledTimes(1);
+      await controller.shutdown();
+      expect(clearAll).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }

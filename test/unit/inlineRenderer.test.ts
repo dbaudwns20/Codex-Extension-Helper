@@ -35,6 +35,14 @@ function fakeUri(value: string): FakeUri {
   return { toString: () => value };
 }
 
+function fakeDocument(key: string, lineCount = 1) {
+  return {
+    lineCount,
+    uri: fakeUri(key),
+    lineAt: (line: number) => ({ range: { end: { character: line + 1 } } }),
+  };
+}
+
 function tabGroup(viewColumn: number, input: unknown) {
   return {
     viewColumn,
@@ -130,10 +138,7 @@ describe('inline renderer helpers', () => {
     const key = 'file:///test.ts';
     const editor = {
       viewColumn: 1,
-      document: {
-        lineCount: 1,
-        uri: { toString: () => key },
-      },
+      document: fakeDocument(key),
       setDecorations: vi.fn(),
     };
     const api = {
@@ -162,10 +167,7 @@ describe('inline renderer helpers', () => {
     const decorationFailure = new Error('decoration install failed');
     const editor = {
       viewColumn: 1,
-      document: {
-        lineCount: 1,
-        uri: { toString: () => 'file:///test.ts' },
-      },
+      document: fakeDocument('file:///test.ts'),
       setDecorations: vi.fn()
         .mockImplementationOnce(() => { throw decorationFailure; })
         .mockImplementationOnce(() => undefined),
@@ -194,7 +196,7 @@ describe('inline renderer helpers', () => {
     })]);
 
     expect(renderedStatus(renderer, 'file:///test.ts')).toBe(false);
-    expect(editor.setDecorations).toHaveBeenCalledTimes(2);
+    expect(editor.setDecorations).toHaveBeenCalledTimes(4);
     expect(output.appendLine).toHaveBeenCalledWith(
       expect.stringContaining(decorationFailure.message),
     );
@@ -205,12 +207,12 @@ describe('inline renderer helpers', () => {
     const decorationType = { dispose: vi.fn() };
     const normalEditor = {
       viewColumn: 1,
-      document: { lineCount: 1, uri: fakeUri(key) },
+      document: fakeDocument(key),
       setDecorations: vi.fn(),
     };
     const diffEditor = {
       viewColumn: 2,
-      document: { lineCount: 1, uri: fakeUri(key) },
+      document: fakeDocument(key),
       setDecorations: vi.fn(),
     };
     const api = {
@@ -239,7 +241,7 @@ describe('inline renderer helpers', () => {
       modifiedLines: ['new', 'lines'],
     })]);
 
-    expect(normalEditor.setDecorations).toHaveBeenCalledOnce();
+    expect(normalEditor.setDecorations).toHaveBeenCalledTimes(3);
     expect(normalEditor.setDecorations).toHaveBeenCalledWith(
       decorationType,
       [new FakeRange(2, 0, 3, 0)],
@@ -251,7 +253,7 @@ describe('inline renderer helpers', () => {
     const key = 'file:///custom.ts';
     const editor = {
       viewColumn: 1,
-      document: { lineCount: 1, uri: fakeUri(key) },
+      document: fakeDocument(key),
       setDecorations: vi.fn(),
     };
     const api = {
@@ -279,7 +281,7 @@ describe('inline renderer helpers', () => {
     const decorationType = { dispose: vi.fn() };
     const editor = {
       viewColumn: 1,
-      document: { lineCount: 1, uri: fakeUri(key) },
+      document: fakeDocument(key),
       setDecorations: vi.fn(),
     };
     const api = {
@@ -304,11 +306,17 @@ describe('inline renderer helpers', () => {
     await renderer.render(key, [changed]);
     await renderer.render(key, [changed]);
 
-    expect(editor.setDecorations.mock.calls).toEqual([
-      [decorationType, [new FakeRange(0, 0, 0, 0)]],
-      [decorationType, []],
-      [decorationType, [new FakeRange(0, 0, 0, 0)]],
-    ]);
+    expect(editor.setDecorations).toHaveBeenCalledTimes(9);
+    expect(editor.setDecorations).toHaveBeenNthCalledWith(
+      1,
+      decorationType,
+      [new FakeRange(0, 0, 0, 0)],
+    );
+    expect(editor.setDecorations).toHaveBeenNthCalledWith(
+      7,
+      decorationType,
+      [new FakeRange(0, 0, 0, 0)],
+    );
   });
 
   it('continues clearing later editors when one decoration cleanup throws', async () => {
@@ -316,14 +324,16 @@ describe('inline renderer helpers', () => {
     const decorationFailure = new Error('decoration cleanup failed');
     const firstEditor = {
       viewColumn: 1,
-      document: { lineCount: 1, uri: fakeUri(key) },
+      document: fakeDocument(key),
       setDecorations: vi.fn()
+        .mockImplementationOnce(() => undefined)
+        .mockImplementationOnce(() => undefined)
         .mockImplementationOnce(() => undefined)
         .mockImplementationOnce(() => { throw decorationFailure; }),
     };
     const secondEditor = {
       viewColumn: 2,
-      document: { lineCount: 1, uri: fakeUri(key) },
+      document: fakeDocument(key),
       setDecorations: vi.fn(),
     };
     const api = {
@@ -351,8 +361,8 @@ describe('inline renderer helpers', () => {
     })]);
     expect(() => renderer.clear(key)).not.toThrow();
 
-    expect(firstEditor.setDecorations).toHaveBeenCalledTimes(2);
-    expect(secondEditor.setDecorations).toHaveBeenCalledTimes(2);
+    expect(firstEditor.setDecorations).toHaveBeenCalledTimes(6);
+    expect(secondEditor.setDecorations).toHaveBeenCalledTimes(6);
     expect(secondEditor.setDecorations).toHaveBeenLastCalledWith(expect.anything(), []);
     expect(renderedStatus(renderer, key)).toBe(false);
     expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(decorationFailure.message));
@@ -364,14 +374,16 @@ describe('inline renderer helpers', () => {
     const cleanupFailure = new Error('earlier decoration cleanup failed');
     const firstEditor = {
       viewColumn: 1,
-      document: { lineCount: 1, uri: fakeUri(key) },
+      document: fakeDocument(key),
       setDecorations: vi.fn()
+        .mockImplementationOnce(() => undefined)
+        .mockImplementationOnce(() => undefined)
         .mockImplementationOnce(() => undefined)
         .mockImplementationOnce(() => { throw cleanupFailure; }),
     };
     const secondEditor = {
       viewColumn: 2,
-      document: { lineCount: 1, uri: fakeUri(key) },
+      document: fakeDocument(key),
       setDecorations: vi.fn()
         .mockImplementationOnce(() => { throw primaryFailure; })
         .mockImplementationOnce(() => undefined),
@@ -402,8 +414,8 @@ describe('inline renderer helpers', () => {
       modifiedLines: ['new'],
     })])).resolves.toBeUndefined();
 
-    expect(firstEditor.setDecorations).toHaveBeenCalledTimes(2);
-    expect(secondEditor.setDecorations).toHaveBeenCalledTimes(2);
+    expect(firstEditor.setDecorations).toHaveBeenCalledTimes(6);
+    expect(secondEditor.setDecorations).toHaveBeenCalledTimes(4);
     expect(renderedStatus(renderer, key)).toBe(false);
     expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(primaryFailure.message));
     expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(cleanupFailure.message));
@@ -415,7 +427,7 @@ describe('inline renderer helpers', () => {
     const cleanupFailure = new Error('decoration clear failed');
     const editor = {
       viewColumn: 1,
-      document: { lineCount: 1, uri: fakeUri(key) },
+      document: fakeDocument(key),
       setDecorations: vi.fn()
         .mockImplementationOnce(() => { throw primaryFailure; })
         .mockImplementationOnce(() => { throw cleanupFailure; }),
@@ -437,7 +449,7 @@ describe('inline renderer helpers', () => {
 
     await expect(renderer.render(key, [hunk()])).resolves.toBeUndefined();
 
-    expect(editor.setDecorations).toHaveBeenCalledTimes(2);
+    expect(editor.setDecorations).toHaveBeenCalledTimes(4);
     expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(primaryFailure.message));
     expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(cleanupFailure.message));
   });
@@ -448,7 +460,7 @@ describe('inline renderer helpers', () => {
     const decorationType = { dispose: vi.fn(() => { throw decorationFailure; }) };
     const editor = {
       viewColumn: 1,
-      document: { lineCount: 1, uri: fakeUri(key) },
+      document: fakeDocument(key),
       setDecorations: vi.fn(),
     };
     const api = {
@@ -475,9 +487,9 @@ describe('inline renderer helpers', () => {
     renderer.dispose();
     await renderer.render(key, [hunk()]);
 
-    expect(editor.setDecorations).toHaveBeenCalledTimes(2);
+    expect(editor.setDecorations).toHaveBeenCalledTimes(6);
     expect(editor.setDecorations).toHaveBeenLastCalledWith(decorationType, []);
-    expect(decorationType.dispose).toHaveBeenCalledOnce();
+    expect(decorationType.dispose).toHaveBeenCalledTimes(3);
     expect(renderedStatus(renderer, key)).toBe(false);
     expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(decorationFailure.message));
   });

@@ -72,6 +72,7 @@ function provide(provider: DeletedLinesCodeLensProvider, lineCount = 5): Lens[] 
   return provider.provideCodeLenses({
     uri: { toString: () => key },
     lineCount,
+    lineAt: (line: number) => ({ range: { end: { character: line + 3 } } }),
   } as never) as unknown as Lens[];
 }
 
@@ -100,33 +101,26 @@ describe('DeletedLinesCodeLensProvider', () => {
     expect(lenses[0].command?.arguments?.[0]).toBe(lenses[1].command?.arguments?.[0]);
   });
 
-  it('places a deleted summary before approve and reject at the same anchor', () => {
+  it('places approve and reject at the configured spacer action line', () => {
     const { provider } = createProvider();
     provider.update(state({ hunks: [hunk({
       kind: 'modification',
       modifiedStart: 2,
       originalLines: ['const value = 1;'],
       modifiedLines: ['const value = 2;'],
-    })] }));
+    })], actionLines: [3] }));
 
     const lenses = provide(provider);
 
     expect(lenses.map((lens) => lens.command?.command)).toEqual([
-      'codexExtensionHelper.openDiff',
       'codexExtensionHelper.approveHunk',
       'codexExtensionHelper.rejectHunk',
     ]);
     expect(lenses.map((lens) => lens.range)).toEqual([
-      new FakeRange(2, 0, 2, 0),
-      new FakeRange(2, 0, 2, 0),
-      new FakeRange(2, 0, 2, 0),
+      new FakeRange(3, 6, 3, 6),
+      new FakeRange(3, 6, 3, 6),
     ]);
-    expect(lenses[0].command).toEqual({
-      title: '− const value = 1;',
-      command: 'codexExtensionHelper.openDiff',
-      tooltip: 'Deleted 1 line\n\nconst value = 1;',
-    });
-    expect(lenses[1].command?.arguments).toEqual([{
+    expect(lenses[0].command?.arguments).toEqual([{
       key,
       sourceRevision: 7,
       hunkIndex: 0,
@@ -146,47 +140,18 @@ describe('DeletedLinesCodeLensProvider', () => {
     expect(lenses.map((lens) => lens.command?.command)).toEqual([
       'codexExtensionHelper.approveHunk',
       'codexExtensionHelper.rejectHunk',
-      'codexExtensionHelper.openDiff',
       'codexExtensionHelper.approveHunk',
       'codexExtensionHelper.rejectHunk',
     ]);
     expect(lenses[0].command?.arguments).toEqual([expect.objectContaining({ hunkIndex: 0 })]);
     expect(lenses[1].command?.arguments).toEqual(lenses[0].command?.arguments);
-    expect(lenses[3].command?.arguments).toEqual([expect.objectContaining({
+    expect(lenses[2].command?.arguments).toEqual([expect.objectContaining({
       key,
       sourceRevision: 7,
       hunkIndex: 1,
       expectedText: 'new\nother\n',
     })]);
-    expect(lenses[4].command?.arguments).toEqual(lenses[3].command?.arguments);
-  });
-
-  it('retains preview truncation and labels a deleted blank line', () => {
-    const { provider } = createProvider();
-    const longLine = 'x'.repeat(121);
-    provider.update(state({ hunks: [
-      hunk({ originalLines: [longLine] }),
-      hunk({ modifiedStart: 1, originalLines: [''] }),
-    ] }));
-
-    const lenses = provide(provider, 5);
-
-    expect(lenses[0].command?.title).toBe(`− ${'x'.repeat(119)}…`);
-    expect(lenses[3].command?.title).toBe('− (blank line)');
-  });
-
-  it('summarizes multiline deletion without changing the full-diff action', () => {
-    const { provider } = createProvider();
-    provider.update(state({ hunks: [hunk({ originalLines: ['first', 'second'] })] }));
-
-    const [summary] = provide(provider);
-
-    expect(summary.command).toEqual({
-      title: '− 2 deleted lines',
-      command: 'codexExtensionHelper.openDiff',
-      tooltip: 'Deleted 2 lines\n\nfirst\nsecond',
-    });
-    expect(summary.command?.arguments).toBeUndefined();
+    expect(lenses[3].command?.arguments).toEqual(lenses[2].command?.arguments);
   });
 
   it('keeps legacy updates summary-only and does not show legacy additions', () => {
@@ -211,18 +176,18 @@ describe('DeletedLinesCodeLensProvider', () => {
     const { provider } = createProvider();
     provider.update(state({ hunks: [hunk({ modifiedStart: -4, originalLines: ['old'] })] }));
 
-    const [summary] = provide(provider, 5);
+    const [approve] = provide(provider, 5);
 
-    expect(summary.range).toEqual(new FakeRange(0, 0, 0, 0));
+    expect(approve.range).toEqual(new FakeRange(0, 3, 0, 3));
   });
 
   it('clamps past-end modified starts to the final document line', () => {
     const { provider } = createProvider();
     provider.update(state({ hunks: [hunk({ modifiedStart: 99, originalLines: ['old'] })] }));
 
-    const [summary] = provide(provider, 5);
+    const [approve] = provide(provider, 5);
 
-    expect(summary.range).toEqual(new FakeRange(4, 0, 4, 0));
+    expect(approve.range).toEqual(new FakeRange(4, 7, 4, 7));
   });
 
   it('clears lenses and disposes its resources', () => {

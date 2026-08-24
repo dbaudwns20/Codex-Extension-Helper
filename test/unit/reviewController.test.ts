@@ -555,6 +555,7 @@ describe('ReviewController mutation serialization', () => {
       host.deleteResult = firstDelete.promise;
 
       const rejection = controller.rejectAll();
+      await Promise.resolve();
       expect(host.deleteCalls).toHaveLength(1);
       const approvalRun = approval === 'hunk'
         ? controller.approveHunk(reference(key, state))
@@ -604,6 +605,7 @@ describe('ReviewController mutation serialization', () => {
     host.deleteResult = firstDelete.promise;
 
     const first = controller.rejectAll(fakeUri(key));
+    await Promise.resolve();
     expect(host.deleteCalls).toHaveLength(1);
     host.document = liveDocument(otherKey, otherState.currentText);
     await controller.approveAll(fakeUri(otherKey));
@@ -738,6 +740,7 @@ describe('ReviewController in-flight disposal', () => {
     host.replacementResult = result.promise;
 
     const rejection = controller.rejectHunk(reference(key, state));
+    await Promise.resolve();
     expect(host.replacementCalls).toHaveLength(1);
     controller.dispose();
     result.reject(failure);
@@ -755,6 +758,7 @@ describe('ReviewController in-flight disposal', () => {
     host.replacementResult = result.promise;
 
     const rejection = controller.rejectHunk(reference(key, state));
+    await Promise.resolve();
     expect(host.replacementCalls).toHaveLength(1);
     controller.dispose();
     result.resolve(true);
@@ -775,6 +779,7 @@ describe('ReviewController in-flight disposal', () => {
     host.deleteResult = result.promise;
 
     const rejection = controller.rejectAll();
+    await Promise.resolve();
     expect(host.deleteCalls).toHaveLength(1);
     controller.dispose();
     result.resolve();
