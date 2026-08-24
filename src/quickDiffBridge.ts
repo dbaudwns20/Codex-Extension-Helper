@@ -30,7 +30,7 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
     return this.contents.get(uri.toString()) ?? '';
   }
 
-  show(key: string, resource: vscode.Uri, baselineText: string): void {
+  update(key: string, resource: vscode.Uri, baselineText: string): void {
     const existing = this.entries.get(key);
     const baseline = existing?.baseline ?? this.createBaselineUri(resource, key);
     const changed = existing?.text !== baselineText;

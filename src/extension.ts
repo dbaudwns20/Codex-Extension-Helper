@@ -1,7 +1,11 @@
 import * as vscode from 'vscode';
+import { ActiveReviewContext } from './activeReviewContext';
 import { PerKeyDebouncer } from './changePolicy';
 import { ComparisonCoordinator } from './coordinator';
-import { DeletedLinesCodeLensProvider } from './deletedLinesCodeLensProvider';
+import {
+  DeletedLinesCodeLensProvider,
+  type ReviewCodeLensState,
+} from './deletedLinesCodeLensProvider';
 import { DiagnosticView } from './diagnosticView';
 import { LineDiffEngine } from './diffEngine';
 import {
@@ -22,7 +26,13 @@ import {
   type InlineRendererSessionState,
 } from './inlineRenderer';
 import { QuickDiffBridge } from './quickDiffBridge';
+import {
+  ReviewController,
+  type LiveReviewDocument,
+  type ReviewHost,
+} from './reviewController';
 import { SnapshotStore } from './snapshotStore';
+import type { FileComparisonState, HunkReference } from './types';
 
 const CONFIGURATION_SECTION = 'codexExtensionHelper';
 const OUTPUT_CHANNEL_NAME = 'Codex Extension Helper';
@@ -41,8 +51,236 @@ interface ExternalComparisonCandidate {
   readonly kind: ExternalChangeKind;
 }
 
+interface StableReviewHostApi {
+  readonly window: Pick<typeof vscode.window, 'activeTextEditor' | 'showErrorMessage'>;
+  readonly workspace: Pick<typeof vscode.workspace, 'applyEdit'> & {
+    readonly fs: Pick<typeof vscode.workspace.fs, 'delete'>;
+  };
+  readonly WorkspaceEdit: typeof vscode.WorkspaceEdit;
+  readonly Range: typeof vscode.Range;
+  readonly Selection: typeof vscode.Selection;
+  readonly TextEditorRevealType: typeof vscode.TextEditorRevealType;
+}
+
+type ReviewCommandController = Pick<
+  ReviewController,
+  'approveHunk' | 'rejectHunk' | 'previousChange' | 'nextChange' | 'approveAll' | 'rejectAll'
+>;
+
+type RegisterCommand = (
+  command: string,
+  callback: (...args: any[]) => unknown,
+) => vscode.Disposable;
+
+interface SynchronizedReviewViews {
+  readonly renderer: {
+    render(key: string, hunks: FileComparisonState['hunks']): Promise<void>;
+    clear(key: string): void;
+  };
+  readonly deletedLines: {
+    update(state: ReviewCodeLensState): void;
+    clear(key: string): void;
+  };
+  readonly quickDiff: {
+    update(key: string, resource: vscode.Uri, baselineText: string): void;
+    clear(key: string, acceptedText?: string): void;
+  };
+  readonly activeContext: Pick<ActiveReviewContext, 'update'>;
+}
+
+interface SynchronizeReviewViewsOptions {
+  readonly key: string;
+  readonly state: FileComparisonState | undefined;
+  readonly resource: vscode.Uri | undefined;
+  readonly activeKey: string | undefined;
+  readonly activeState: FileComparisonState | undefined;
+  readonly views: SynchronizedReviewViews;
+}
+
 function errorDetail(error: unknown): string {
   return error instanceof Error ? error.stack ?? error.message : String(error);
+}
+
+export function createReviewHost(
+  api: StableReviewHostApi,
+  output: Pick<vscode.OutputChannel, 'appendLine'>,
+  uriKey: (uri: vscode.Uri) => string = (uri) => uri.toString(),
+): ReviewHost {
+  const currentEditor = (expected?: LiveReviewDocument): vscode.TextEditor | undefined => {
+    const editor = api.window.activeTextEditor;
+    if (editor === undefined) {
+      return undefined;
+    }
+    if (
+      expected !== undefined
+      && (
+        uriKey(editor.document.uri) !== expected.key
+        || editor.document.version !== expected.version
+        || editor.document.getText() !== expected.text
+      )
+    ) {
+      return undefined;
+    }
+    return editor;
+  };
+
+  const applyReplacement = async (
+    document: LiveReviewDocument,
+    startOffset: number,
+    endOffset: number,
+    replacementText: string,
+  ): Promise<boolean> => {
+    const editor = currentEditor(document);
+    if (editor === undefined) {
+      return false;
+    }
+    const edit = new api.WorkspaceEdit();
+    edit.replace(
+      editor.document.uri,
+      new api.Range(
+        editor.document.positionAt(startOffset),
+        editor.document.positionAt(endOffset),
+      ),
+      replacementText,
+    );
+    return api.workspace.applyEdit(edit);
+  };
+
+  return {
+    activeDocument(): LiveReviewDocument | undefined {
+      const editor = currentEditor();
+      if (editor === undefined) {
+        return undefined;
+      }
+      const { document } = editor;
+      return {
+        uri: document.uri,
+        key: uriKey(document.uri),
+        text: document.getText(),
+        version: document.version,
+        cursorLine: editor.selection.active.line,
+        lineCount: document.lineCount,
+        eol: document.eol,
+      };
+    },
+    applyReplacement(document, replacement): Promise<boolean> {
+      return applyReplacement(
+        document,
+        replacement.startOffset,
+        replacement.endOffset,
+        replacement.replacementText,
+      );
+    },
+    replaceAll(document, text): Promise<boolean> {
+      return applyReplacement(document, 0, document.text.length, text);
+    },
+    async deleteToTrash(uri): Promise<void> {
+      await api.workspace.fs.delete(uri, { useTrash: true });
+    },
+    reveal(document, line): void {
+      const editor = currentEditor(document);
+      if (editor === undefined) {
+        return;
+      }
+      const range = new api.Range(line, 0, line, 0);
+      editor.selection = new api.Selection(range.start, range.start);
+      editor.revealRange(range, api.TextEditorRevealType.InCenter);
+    },
+    showError(message): void {
+      void Promise.resolve(api.window.showErrorMessage(message)).catch((error) => {
+        try {
+          output.appendLine(`[Review message] ${errorDetail(error)}`);
+        } catch {
+          // Reporting must not leak a rejected promise into VS Code's event loop.
+        }
+      });
+    },
+    log(scope, error): void {
+      try {
+        output.appendLine(`[${scope}] ${errorDetail(error)}`);
+      } catch {
+        // Logging failures must not escape command callbacks.
+      }
+    },
+  };
+}
+
+export function registerReviewCommands(
+  ownership: DisposableStore,
+  registerCommand: RegisterCommand,
+  controller: ReviewCommandController,
+  onError: (scope: string, error: unknown) => void = () => undefined,
+): void {
+  const guarded = (
+    scope: string,
+    operation: (...args: any[]) => void | PromiseLike<void>,
+  ): ((...args: any[]) => Promise<void>) => async (...args): Promise<void> => {
+    try {
+      await operation(...args);
+    } catch (error) {
+      try {
+        onError(scope, error);
+      } catch {
+        // Error reporting must not reject a command callback.
+      }
+    }
+  };
+
+  ownership.use(registerCommand(
+    'codexExtensionHelper.approveHunk',
+    guarded('ApproveHunkCommand', (reference: HunkReference) => controller.approveHunk(reference)),
+  ));
+  ownership.use(registerCommand(
+    'codexExtensionHelper.rejectHunk',
+    guarded('RejectHunkCommand', (reference: HunkReference) => controller.rejectHunk(reference)),
+  ));
+  ownership.use(registerCommand(
+    'codexExtensionHelper.previousChange',
+    guarded('PreviousChangeCommand', (uri?: vscode.Uri) => controller.previousChange(uri)),
+  ));
+  ownership.use(registerCommand(
+    'codexExtensionHelper.nextChange',
+    guarded('NextChangeCommand', (uri?: vscode.Uri) => controller.nextChange(uri)),
+  ));
+  ownership.use(registerCommand(
+    'codexExtensionHelper.approveAll',
+    guarded('ApproveAllCommand', (uri?: vscode.Uri) => controller.approveAll(uri)),
+  ));
+  ownership.use(registerCommand(
+    'codexExtensionHelper.rejectAll',
+    guarded('RejectAllCommand', (uri?: vscode.Uri) => controller.rejectAll(uri)),
+  ));
+}
+
+export async function synchronizeReviewViews({
+  key,
+  state,
+  resource,
+  activeKey,
+  activeState,
+  views,
+}: SynchronizeReviewViewsOptions): Promise<void> {
+  const pending: PromiseLike<void>[] = [];
+  if (state !== undefined && state.hunks.length > 0) {
+    pending.push(views.renderer.render(key, state.hunks));
+    views.deletedLines.update({
+      key,
+      sourceRevision: state.sourceRevision,
+      currentText: state.currentText,
+      hunks: state.hunks,
+    });
+    if (resource === undefined) {
+      views.quickDiff.clear(key);
+    } else {
+      views.quickDiff.update(key, resource, state.baselineText);
+    }
+  } else {
+    views.renderer.clear(key);
+    views.deletedLines.clear(key);
+    views.quickDiff.clear(key, state?.currentText);
+  }
+  pending.push(views.activeContext.update(activeKey, activeState));
+  await Promise.all(pending);
 }
 
 function sameStrings(first: readonly string[], second: readonly string[]): boolean {
@@ -64,13 +302,14 @@ function readSettings(): ExtensionSettings {
   });
 }
 
-class ExtensionRuntime implements vscode.Disposable {
+export class ExtensionRuntime implements vscode.Disposable {
   private readonly snapshots: SnapshotStore;
   private readonly renderer: InlineRenderer;
   private readonly view: DiagnosticView;
   private readonly coordinator: ComparisonCoordinator;
   private readonly quickDiff: QuickDiffBridge;
   private readonly deletedLines: DeletedLinesCodeLensProvider;
+  private readonly activeReviewContext: ActiveReviewContext;
   private readonly detector: ExternalChangeDetector;
   private readonly documentDebouncer: PerKeyDebouncer<string>;
   private readonly ownership: DisposableStore;
@@ -88,6 +327,9 @@ class ExtensionRuntime implements vscode.Disposable {
   ) {
     const construction = constructWithRollback((ownership) => {
       const snapshots = new SnapshotStore();
+      const activeReviewContext = ownership.use(new ActiveReviewContext(
+        (key, value) => vscode.commands.executeCommand('setContext', key, value),
+      ));
       const quickDiff = ownership.use(new QuickDiffBridge());
       const deletedLines = ownership.use(new DeletedLinesCodeLensProvider(vscode, normalizeUriKey));
       const renderer = ownership.use(new InlineRenderer(
@@ -102,6 +344,17 @@ class ExtensionRuntime implements vscode.Disposable {
         snapshots,
         view,
       ));
+      const reviewController = ownership.use(new ReviewController(
+        coordinator,
+        createReviewHost(vscode, output, normalizeUriKey),
+        (key) => this.syncComparison(key),
+      ));
+      registerReviewCommands(
+        ownership,
+        (command, callback) => vscode.commands.registerCommand(command, callback),
+        reviewController,
+        (scope, error) => this.log(scope, error),
+      );
       const detector = ownership.use(new ExternalChangeDetector({
         readFile: (uri) => vscode.workspace.fs.readFile(uri as vscode.Uri),
         settings: () => this.settingsValue,
@@ -123,6 +376,7 @@ class ExtensionRuntime implements vscode.Disposable {
       ownership.use(vscode.workspace.onDidSaveTextDocument((document) => this.guard('DocumentSave', () => this.handleDidSave(document))));
       ownership.use(vscode.workspace.onDidCloseTextDocument((document) => this.guard('DocumentClose', () => this.handleDocumentClose(document))));
       ownership.use(vscode.window.onDidChangeVisibleTextEditors((editors) => this.guard('VisibleEditors', () => this.handleVisibleEditors(editors))));
+      ownership.use(vscode.window.onDidChangeActiveTextEditor((editor) => this.guard('ActiveEditor', () => this.handleActiveEditor(editor))));
       ownership.use(vscode.workspace.onDidChangeWorkspaceFolders((event) => this.guard('WorkspaceFolders', () => this.handleWorkspaceFolders(event))));
 
       return {
@@ -134,6 +388,7 @@ class ExtensionRuntime implements vscode.Disposable {
         documentDebouncer,
         quickDiff,
         deletedLines,
+        activeReviewContext,
       };
     }, (error) => output.appendLine(`[ConstructionRollback] ${errorDetail(error)}`));
 
@@ -144,6 +399,7 @@ class ExtensionRuntime implements vscode.Disposable {
     this.coordinator = construction.value.coordinator;
     this.quickDiff = construction.value.quickDiff;
     this.deletedLines = construction.value.deletedLines;
+    this.activeReviewContext = construction.value.activeReviewContext;
     this.detector = construction.value.detector;
     this.documentDebouncer = construction.value.documentDebouncer;
 
@@ -152,6 +408,7 @@ class ExtensionRuntime implements vscode.Disposable {
         this.guard('InitialDocument', () => this.seedDocument(document));
       }
       this.guard('InitialEditors', () => this.handleVisibleEditors(vscode.window.visibleTextEditors));
+      this.guard('InitialActiveEditor', () => this.handleActiveEditor(vscode.window.activeTextEditor));
     } catch (error) {
       this.ownership.dispose();
       throw error;
@@ -191,6 +448,10 @@ class ExtensionRuntime implements vscode.Disposable {
       return;
     }
 
+    for (const key of [...this.trackedUris.keys()]) {
+      this.deleteKey(key);
+    }
+    void this.activeReviewContext.clear();
     this.disposed = true;
     this.ownership.dispose();
     this.trackedUris.clear();
@@ -321,7 +582,7 @@ class ExtensionRuntime implements vscode.Disposable {
     if (!vscode.window.visibleTextEditors.some(
       (editor) => normalizeUriKey(editor.document.uri) === key,
     )) {
-      this.view.clear(key);
+      this.syncComparison(key);
     }
   }
 
@@ -345,19 +606,26 @@ class ExtensionRuntime implements vscode.Disposable {
       }
     }
 
-    for (const key of this.visibleKeys) {
-      if (!nextVisible.has(key)) {
-        this.view.clear(key);
-      }
-    }
+    const affectedKeys = new Set([...this.visibleKeys, ...nextVisible]);
     this.visibleKeys = nextVisible;
 
-    for (const key of nextVisible) {
-      void this.run('VisibleEditor', () => this.coordinator.show(
-        key,
-        (expectedText) => this.liveDocumentMatches(key, expectedText),
-      ));
+    for (const key of affectedKeys) {
+      this.syncComparison(key);
     }
+  }
+
+  private handleActiveEditor(editor: vscode.TextEditor | undefined): void {
+    if (this.disposed) {
+      return;
+    }
+
+    if (editor === undefined || !this.isEligible(editor.document.uri, editor.document.getText())) {
+      void this.activeReviewContext.update(undefined, undefined);
+      return;
+    }
+
+    this.seedDocument(editor.document);
+    this.syncComparison(normalizeUriKey(editor.document.uri));
   }
 
   private handleWorkspaceFolders(event: vscode.WorkspaceFoldersChangeEvent): void {
@@ -383,26 +651,38 @@ class ExtensionRuntime implements vscode.Disposable {
     }
     this.documentDebouncer.cancel(key);
     this.coordinator.delete(key);
-    this.quickDiff.clear(key);
-    this.deletedLines.clear(key);
+    this.syncComparison(key);
     this.trackedUris.delete(key);
-    this.comparisonKeys.delete(key);
   }
 
   private syncComparison(key: string): void {
     const state = this.snapshots.get(key);
     if (state !== undefined && state.hunks.length > 0) {
       this.comparisonKeys.add(key);
-      const uri = this.trackedUris.get(key);
-      if (uri !== undefined) {
-        this.quickDiff.show(key, uri, state.baselineText);
-      }
-      this.deletedLines.update(key, state.hunks);
     } else {
       this.comparisonKeys.delete(key);
-      this.quickDiff.clear(key, state?.currentText);
-      this.deletedLines.clear(key);
     }
+
+    const activeDocument = vscode.window.activeTextEditor?.document;
+    const activeKey = activeDocument?.uri.scheme === 'file'
+      ? normalizeUriKey(activeDocument.uri)
+      : undefined;
+    const activeState = activeKey === undefined
+      ? undefined
+      : this.snapshots.get(activeKey);
+    void this.run('SynchronizeComparison', () => synchronizeReviewViews({
+      key,
+      state,
+      resource: this.trackedUris.get(key),
+      activeKey,
+      activeState,
+      views: {
+        renderer: this.view,
+        deletedLines: this.deletedLines,
+        quickDiff: this.quickDiff,
+        activeContext: this.activeReviewContext,
+      },
+    }));
   }
 
   private async applyExternalComparison(

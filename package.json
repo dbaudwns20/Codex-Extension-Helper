@@ -21,8 +21,60 @@
       {
         "command": "codexExtensionHelper.openDiff",
         "title": "Codex Changes: Open Full Diff"
+      },
+      {
+        "command": "codexExtensionHelper.approveHunk",
+        "title": "Codex Changes: Approve Change"
+      },
+      {
+        "command": "codexExtensionHelper.rejectHunk",
+        "title": "Codex Changes: Reject Change"
+      },
+      {
+        "command": "codexExtensionHelper.previousChange",
+        "title": "Codex Changes: Previous Change",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "codexExtensionHelper.nextChange",
+        "title": "Codex Changes: Next Change",
+        "icon": "$(arrow-down)"
+      },
+      {
+        "command": "codexExtensionHelper.approveAll",
+        "title": "Codex Changes: Approve All",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "codexExtensionHelper.rejectAll",
+        "title": "Codex Changes: Reject All",
+        "icon": "$(discard)"
       }
     ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "codexExtensionHelper.previousChange",
+          "when": "resourceScheme == file && codexExtensionHelper.activeFileHasChanges",
+          "group": "navigation@10"
+        },
+        {
+          "command": "codexExtensionHelper.nextChange",
+          "when": "resourceScheme == file && codexExtensionHelper.activeFileHasChanges",
+          "group": "navigation@11"
+        },
+        {
+          "command": "codexExtensionHelper.approveAll",
+          "when": "resourceScheme == file && codexExtensionHelper.activeFileHasChanges",
+          "group": "navigation@20"
+        },
+        {
+          "command": "codexExtensionHelper.rejectAll",
+          "when": "resourceScheme == file && codexExtensionHelper.activeFileHasChanges",
+          "group": "navigation@21"
+        }
+      ]
+    },
     "configuration": {
       "title": "Codex Extension Helper",
       "properties": {
