@@ -1,4 +1,5 @@
 import type { ChangeHunk } from './types';
+import type { DisplayEditFence } from './displayEditFence';
 
 export interface SpacerTextEdit {
   readonly offset: number;
@@ -48,6 +49,55 @@ export interface SpacerReconciliation {
   readonly cleanupEdits: readonly SpacerTextEdit[];
   readonly intersectedSpacerCount: number;
 }
+
+export interface SpacerDocument {
+  readonly key: string;
+  readonly text: string;
+  readonly version: number;
+  readonly isDirty: boolean;
+  readonly eol: '\n' | '\r\n';
+}
+
+export interface SpacerEditHost {
+  document(key: string): SpacerDocument | undefined;
+  apply(
+    document: SpacerDocument,
+    edits: readonly SpacerTextEdit[],
+    expectedText: string,
+  ): Promise<boolean>;
+  log(scope: string, error: unknown): void;
+}
+
+export interface SpacerInstallRequest {
+  readonly key: string;
+  readonly canonicalText: string;
+  readonly hunks: readonly ChangeHunk[];
+}
+
+export interface InstalledSpacerPresentation {
+  readonly key: string;
+  readonly canonicalText: string;
+  readonly displayText: string;
+  readonly documentVersion: number;
+  readonly revision: number;
+  readonly plan: TemporaryLineSpacerPlan;
+}
+
+export interface SpacerDocumentChange {
+  readonly key: string;
+  readonly documentVersion: number;
+  readonly resultingText: string;
+  readonly changes: readonly DisplayContentChange[];
+}
+
+export type SpacerUnexpectedEditResult =
+  | { readonly status: 'canonicalized'; readonly text: string }
+  | { readonly status: 'unsafe' };
+
+export type SpacerRemovalResult =
+  | { readonly status: 'removed'; readonly canonicalText: string }
+  | { readonly status: 'absent' }
+  | { readonly status: 'unsafe' };
 
 interface PendingHunkInsertion {
   readonly hunkIndex: number;
@@ -299,4 +349,299 @@ export function reconcileSpacerEdit(
     cleanupEdits,
     intersectedSpacerCount,
   };
+}
+
+function displayChanges(edits: readonly SpacerTextEdit[]): DisplayContentChange[] {
+  return [...edits]
+    .sort((left, right) => left.offset - right.offset)
+    .map((edit) => ({
+      rangeOffset: edit.offset,
+      rangeLength: edit.length,
+      text: edit.text,
+    }));
+}
+
+function removalEdits(plan: TemporaryLineSpacerPlan): SpacerTextEdit[] {
+  return plan.spans
+    .map((span) => ({
+      offset: span.displayStart,
+      length: span.displayEnd - span.displayStart,
+      text: '',
+    }))
+    .sort((left, right) => right.offset - left.offset);
+}
+
+export class TemporaryLineSpacerManager {
+  private readonly presentations = new Map<string, InstalledSpacerPresentation>();
+  private readonly revisions = new Map<string, number>();
+  private disposed = false;
+
+  constructor(
+    private readonly host: SpacerEditHost,
+    private readonly fence: DisplayEditFence,
+  ) {}
+
+  async install(
+    request: SpacerInstallRequest,
+  ): Promise<InstalledSpacerPresentation | undefined> {
+    if (this.disposed) {
+      return undefined;
+    }
+
+    const revision = this.nextRevision(request.key);
+    const existing = this.presentations.get(request.key);
+    if (existing !== undefined) {
+      const removed = await this.removePresentation(existing, false);
+      if (removed.status === 'unsafe' || !this.isCurrent(request.key, revision)) {
+        return undefined;
+      }
+    }
+
+    const document = this.host.document(request.key);
+    if (
+      document === undefined
+      || document.isDirty
+      || document.text !== request.canonicalText
+      || !this.isCurrent(request.key, revision)
+    ) {
+      return undefined;
+    }
+
+    const plan = createTemporaryLineSpacerPlan(
+      request.canonicalText,
+      document.eol,
+      request.hunks,
+    );
+    if (plan.spans.length === 0) {
+      return undefined;
+    }
+
+    const applied = await this.applyExact(
+      document,
+      plan.insertions,
+      plan.displayText,
+    );
+    if (!applied || !this.isCurrent(request.key, revision)) {
+      await this.rollbackPlan(request.key, plan);
+      return undefined;
+    }
+
+    const current = this.host.document(request.key);
+    if (
+      current === undefined
+      || current.text !== plan.displayText
+      || current.version !== document.version + 1
+      || !this.isCurrent(request.key, revision)
+    ) {
+      await this.rollbackPlan(request.key, plan);
+      return undefined;
+    }
+
+    const presentation: InstalledSpacerPresentation = Object.freeze({
+      key: request.key,
+      canonicalText: request.canonicalText,
+      displayText: plan.displayText,
+      documentVersion: current.version,
+      revision,
+      plan,
+    });
+    this.presentations.set(request.key, presentation);
+    return presentation;
+  }
+
+  async remove(key: string): Promise<SpacerRemovalResult> {
+    if (this.disposed) {
+      return { status: 'absent' };
+    }
+    this.nextRevision(key);
+    const presentation = this.presentations.get(key);
+    return presentation === undefined
+      ? { status: 'absent' }
+      : this.removePresentation(presentation, true);
+  }
+
+  async reconcileUnexpectedChange(
+    event: SpacerDocumentChange,
+  ): Promise<SpacerUnexpectedEditResult | undefined> {
+    if (this.disposed) {
+      return undefined;
+    }
+    const presentation = this.presentations.get(event.key);
+    if (presentation === undefined) {
+      return undefined;
+    }
+
+    this.nextRevision(event.key);
+    this.presentations.delete(event.key);
+    const reconciled = reconcileSpacerEdit(presentation.plan, event.changes);
+    if (
+      reconciled === undefined
+      || reconciled.textAfterUserEdit !== event.resultingText
+    ) {
+      this.log('SpacerReconcile', new Error('Could not prove spacer ownership after an edit.'));
+      return { status: 'unsafe' };
+    }
+    if (reconciled.cleanupEdits.length === 0) {
+      return { status: 'canonicalized', text: reconciled.canonicalizedText };
+    }
+
+    const document = this.host.document(event.key);
+    if (
+      document === undefined
+      || document.version !== event.documentVersion
+      || document.text !== event.resultingText
+      || !await this.applyExact(
+        document,
+        reconciled.cleanupEdits,
+        reconciled.canonicalizedText,
+      )
+    ) {
+      this.log('SpacerReconcile', new Error('Could not remove untouched spacer rows.'));
+      return { status: 'unsafe' };
+    }
+    return { status: 'canonicalized', text: reconciled.canonicalizedText };
+  }
+
+  willSaveEdits(document: SpacerDocument): readonly SpacerTextEdit[] {
+    if (this.disposed) {
+      return [];
+    }
+    const presentation = this.presentations.get(document.key);
+    if (
+      presentation === undefined
+      || presentation.documentVersion !== document.version
+      || presentation.displayText !== document.text
+    ) {
+      return [];
+    }
+
+    this.nextRevision(document.key);
+    this.presentations.delete(document.key);
+    const edits = removalEdits(presentation.plan);
+    this.fence.begin({
+      key: document.key,
+      startingVersion: document.version,
+      originalText: document.text,
+      resultingText: presentation.canonicalText,
+      changes: displayChanges(edits),
+    });
+    return edits;
+  }
+
+  presentation(key: string): InstalledSpacerPresentation | undefined {
+    return this.presentations.get(key);
+  }
+
+  displayLine(key: string, canonicalLine: number): number {
+    return this.presentations.get(key)?.plan.displayLineForCanonical(canonicalLine)
+      ?? canonicalLine;
+  }
+
+  async clear(key: string): Promise<SpacerRemovalResult> {
+    return this.remove(key);
+  }
+
+  async clearAll(): Promise<void> {
+    for (const key of [...this.presentations.keys()]) {
+      await this.remove(key);
+    }
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.presentations.clear();
+    this.revisions.clear();
+    this.fence.clear();
+  }
+
+  private async removePresentation(
+    presentation: InstalledSpacerPresentation,
+    invalidate: boolean,
+  ): Promise<SpacerRemovalResult> {
+    if (invalidate) {
+      this.nextRevision(presentation.key);
+    }
+    if (this.presentations.get(presentation.key) !== presentation) {
+      return { status: 'absent' };
+    }
+
+    const document = this.host.document(presentation.key);
+    if (
+      document === undefined
+      || document.version !== presentation.documentVersion
+      || document.text !== presentation.displayText
+    ) {
+      this.presentations.delete(presentation.key);
+      this.log('SpacerRemoval', new Error('Live document no longer matches spacer presentation.'));
+      return { status: 'unsafe' };
+    }
+
+    const applied = await this.applyExact(
+      document,
+      removalEdits(presentation.plan),
+      presentation.canonicalText,
+    );
+    this.presentations.delete(presentation.key);
+    return applied
+      ? { status: 'removed', canonicalText: presentation.canonicalText }
+      : { status: 'unsafe' };
+  }
+
+  private async rollbackPlan(
+    key: string,
+    plan: TemporaryLineSpacerPlan,
+  ): Promise<void> {
+    const document = this.host.document(key);
+    if (document === undefined || document.text !== plan.displayText) {
+      return;
+    }
+    await this.applyExact(document, removalEdits(plan), plan.canonicalText);
+  }
+
+  private async applyExact(
+    document: SpacerDocument,
+    edits: readonly SpacerTextEdit[],
+    expectedText: string,
+  ): Promise<boolean> {
+    if (edits.length === 0) {
+      return document.text === expectedText;
+    }
+    const finish = this.fence.begin({
+      key: document.key,
+      startingVersion: document.version,
+      originalText: document.text,
+      resultingText: expectedText,
+      changes: displayChanges(edits),
+    });
+    try {
+      if (!await this.host.apply(document, edits, expectedText)) {
+        return false;
+      }
+      const current = this.host.document(document.key);
+      return current?.version === document.version + 1 && current.text === expectedText;
+    } catch (error) {
+      this.log('SpacerEdit', error);
+      return false;
+    } finally {
+      finish();
+    }
+  }
+
+  private nextRevision(key: string): number {
+    const revision = (this.revisions.get(key) ?? 0) + 1;
+    this.revisions.set(key, revision);
+    return revision;
+  }
+
+  private isCurrent(key: string, revision: number): boolean {
+    return !this.disposed && this.revisions.get(key) === revision;
+  }
+
+  private log(scope: string, error: unknown): void {
+    try {
+      this.host.log(scope, error);
+    } catch {
+      // Logging failures must not escape cleanup paths.
+    }
+  }
 }
