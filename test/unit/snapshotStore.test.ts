@@ -20,6 +20,24 @@ describe('SnapshotStore', () => {
       sourceRevision: 4,
       comparisonActive: true,
       pending: true,
+      createdFile: false,
+    };
+
+    store.setComparison('file:///workspace/file.ts', state);
+
+    expect(store.get('file:///workspace/file.ts')).toEqual(state);
+  });
+
+  it('preserves the created-file origin on an explicit comparison state', () => {
+    const store = new SnapshotStore();
+    const state = {
+      baselineText: '',
+      currentText: 'created',
+      hunks: [],
+      sourceRevision: 4,
+      comparisonActive: true,
+      pending: true,
+      createdFile: true,
     };
 
     store.setComparison('file:///workspace/file.ts', state);
@@ -45,6 +63,7 @@ describe('SnapshotStore', () => {
       sourceRevision: 4,
       comparisonActive: true,
       pending: true,
+      createdFile: false,
     });
 
     store.accept(key, 'saved');
@@ -55,6 +74,25 @@ describe('SnapshotStore', () => {
       hunks: [],
       comparisonActive: false,
       pending: false,
+      createdFile: false,
+    });
+  });
+
+  it('marks seeded and accepted states as non-created files', () => {
+    const store = new SnapshotStore();
+    const key = 'file:///workspace/file.ts';
+
+    store.seed(key, 'seeded');
+    expect(store.get(key)).toMatchObject({ createdFile: false });
+
+    store.accept(key, 'accepted');
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'accepted',
+      currentText: 'accepted',
+      hunks: [],
+      comparisonActive: false,
+      pending: false,
+      createdFile: false,
     });
   });
 

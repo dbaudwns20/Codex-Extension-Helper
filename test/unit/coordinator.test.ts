@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { PerKeyDebouncer } from '../../src/changePolicy';
 import { ComparisonCoordinator, ComparisonView } from '../../src/coordinator';
 import { SnapshotStore } from '../../src/snapshotStore';
-import type { ChangeHunk } from '../../src/types';
+import type { ChangeHunk, HunkReference } from '../../src/types';
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -113,6 +113,7 @@ describe('ComparisonCoordinator', () => {
       currentText: 'const value = 1;\nexport { value };\n',
       hunks: createdHunks,
       comparisonActive: true,
+      createdFile: true,
     });
     expect(view.renders).toEqual([{ key, hunks: createdHunks }]);
   });
@@ -127,6 +128,7 @@ describe('ComparisonCoordinator', () => {
       currentText: 'baseline',
       hunks: [],
       pending: false,
+      createdFile: false,
     });
     expect(engine.calls).toEqual([]);
     expect(view.renders).toEqual([]);
@@ -191,6 +193,7 @@ describe('ComparisonCoordinator', () => {
       sourceRevision: store.get(key)!.sourceRevision,
       comparisonActive: true,
       pending: true,
+      createdFile: false,
     });
 
     coordinator.save(key, 'saved');
@@ -200,6 +203,7 @@ describe('ComparisonCoordinator', () => {
       currentText: 'saved',
       hunks: [],
       pending: false,
+      createdFile: false,
     });
     expect(view.clear).toHaveBeenCalledWith(key);
   });
@@ -376,6 +380,142 @@ describe('ComparisonCoordinator', () => {
 
     expect(store.get(key)?.currentText).toBe('changed-elsewhere');
     expect(view.renders).toEqual([]);
+  });
+
+  it('approves one hunk by advancing only that baseline section', async () => {
+    const { coordinator, engine, store } = setup();
+    const firstHunk: ChangeHunk = {
+      kind: 'modification',
+      originalStart: 0,
+      originalEnd: 1,
+      modifiedStart: 0,
+      modifiedEnd: 1,
+      originalLines: ['alpha'],
+      modifiedLines: ['ALPHA'],
+    };
+    const secondHunk: ChangeHunk = {
+      kind: 'modification',
+      originalStart: 2,
+      originalEnd: 3,
+      modifiedStart: 2,
+      modifiedEnd: 3,
+      originalLines: ['gamma'],
+      modifiedLines: ['GAMMA'],
+    };
+    const remainingHunk: ChangeHunk = {
+      ...secondHunk,
+      originalLines: ['gamma'],
+    };
+    coordinator.seed(key, 'alpha\nbeta\ngamma\n');
+    engine.queue([firstHunk, secondHunk], [remainingHunk]);
+    await coordinator.externalChange(key, 'ALPHA\nbeta\nGAMMA\n');
+    const state = store.get(key)!;
+    const reference: HunkReference = {
+      key,
+      sourceRevision: state.sourceRevision,
+      hunkIndex: 0,
+      expectedText: state.currentText,
+    };
+
+    expect(await coordinator.approveHunk(reference)).toBe('approved');
+    expect(engine.calls).toEqual([
+      { original: 'alpha\nbeta\ngamma\n', modified: 'ALPHA\nbeta\nGAMMA\n' },
+      { original: 'ALPHA\nbeta\ngamma\n', modified: 'ALPHA\nbeta\nGAMMA\n' },
+    ]);
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'ALPHA\nbeta\ngamma\n',
+      currentText: 'ALPHA\nbeta\nGAMMA\n',
+      hunks: [remainingHunk],
+      comparisonActive: true,
+      pending: true,
+      createdFile: false,
+    });
+  });
+
+  it('clears the comparison view when approving the final hunk', async () => {
+    const { coordinator, engine, store, view } = setup();
+    const finalHunk: ChangeHunk = {
+      kind: 'modification',
+      originalStart: 0,
+      originalEnd: 1,
+      modifiedStart: 0,
+      modifiedEnd: 1,
+      originalLines: ['before'],
+      modifiedLines: ['after'],
+    };
+    coordinator.seed(key, 'before\n');
+    engine.queue([finalHunk], []);
+    await coordinator.externalChange(key, 'after\n');
+    const state = store.get(key)!;
+    const reference: HunkReference = {
+      key,
+      sourceRevision: state.sourceRevision,
+      hunkIndex: 0,
+      expectedText: state.currentText,
+    };
+
+    expect(await coordinator.approveHunk(reference)).toBe('approved');
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'after\n',
+      currentText: 'after\n',
+      hunks: [],
+      comparisonActive: false,
+      pending: false,
+      createdFile: false,
+    });
+    expect(view.clear).toHaveBeenCalledWith(key);
+  });
+
+  it('accepts all current text without writing through a callback', () => {
+    const { coordinator, engine, store, view } = setup();
+    coordinator.seed(key, 'before');
+    const state = store.get(key)!;
+    store.setComparison(key, { ...state, currentText: 'after', hunks: newerHunks, comparisonActive: true, pending: true });
+    expect(coordinator.approveAll(key, 'after')).toBe('approved');
+    expect(engine.calls).toEqual([]);
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'after',
+      currentText: 'after',
+      hunks: [],
+      comparisonActive: false,
+      pending: false,
+      createdFile: false,
+    });
+    expect(view.clear).toHaveBeenCalledWith(key);
+  });
+
+  it('rejects missing or stale hunk references before applying a patch', () => {
+    const { coordinator, store } = setup();
+    expect(coordinator.state(key)).toBeUndefined();
+    expect(coordinator.resolveHunk({
+      key,
+      sourceRevision: 1,
+      hunkIndex: 0,
+      expectedText: 'after',
+    })).toEqual({ status: 'missing' });
+
+    coordinator.seed(key, 'before');
+    const seeded = store.get(key)!;
+    store.setComparison(key, { ...seeded, currentText: 'after', hunks: newerHunks, comparisonActive: true, pending: true });
+    const current = store.get(key)!;
+    expect(coordinator.resolveHunk({
+      key,
+      sourceRevision: current.sourceRevision - 1,
+      hunkIndex: 0,
+      expectedText: current.currentText,
+    })).toEqual({ status: 'stale' });
+    expect(coordinator.resolveHunk({
+      key,
+      sourceRevision: current.sourceRevision,
+      hunkIndex: current.hunks.length,
+      expectedText: current.currentText,
+    })).toEqual({ status: 'stale' });
+    expect(coordinator.resolveHunk({
+      key,
+      sourceRevision: current.sourceRevision,
+      hunkIndex: 0,
+      expectedText: 'changed elsewhere',
+    })).toEqual({ status: 'stale' });
   });
 
   it('disposes pending work, rejects in-flight results, and clears all rendering', async () => {
