@@ -63,6 +63,19 @@ export class ComparisonCoordinator {
     await this.compare(key, text, isCurrent);
   }
 
+  async externalCreate(
+    key: string,
+    text: string,
+    isCurrent: ComparisonApplicability = ALWAYS_CURRENT,
+  ): Promise<void> {
+    if (this.disposed || !isCurrent()) {
+      return;
+    }
+
+    this.seed(key, '');
+    await this.compare(key, text, isCurrent);
+  }
+
   async documentEdit(
     key: string,
     text: string,

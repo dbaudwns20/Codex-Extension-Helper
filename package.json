@@ -1,13 +1,13 @@
 {
   "name": "codex-extension-helper",
   "displayName": "Codex Extension Helper",
-  "description": "Show external file changes inline in VS Code Insiders editors.",
+  "description": "Show external file changes inline in VS Code editors.",
   "version": "0.0.1",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "local",
   "engines": {
-    "vscode": "^1.134.0"
+    "vscode": "^1.105.0"
   },
   "categories": [
     "Other"
@@ -16,10 +16,13 @@
   "activationEvents": [
     "onStartupFinished"
   ],
-  "enabledApiProposals": [
-    "editorInsets"
-  ],
   "contributes": {
+    "commands": [
+      {
+        "command": "codexExtensionHelper.openDiff",
+        "title": "Codex Changes: Open Full Diff"
+      }
+    ],
     "configuration": {
       "title": "Codex Extension Helper",
       "properties": {

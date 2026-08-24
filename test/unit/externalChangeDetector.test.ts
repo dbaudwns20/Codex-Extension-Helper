@@ -72,6 +72,18 @@ afterEach(() => {
 });
 
 describe('ExternalChangeDetector', () => {
+  it('preserves create origin when a follow-up change is debounced with it', async () => {
+    vi.useFakeTimers();
+    const file = uri('new-file.ts');
+    const { instance, onComparison } = detector();
+
+    instance.handleCreate(file);
+    instance.handleChange(file);
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(onComparison).toHaveBeenCalledWith(file.toString(), 'changed', 'create');
+  });
+
   it('collapses repeated watcher events into one read and comparison per URI', async () => {
     vi.useFakeTimers();
     const file = uri('file.ts');
@@ -83,7 +95,7 @@ describe('ExternalChangeDetector', () => {
 
     expect(readFile).toHaveBeenCalledOnce();
     expect(onComparison).toHaveBeenCalledOnce();
-    expect(onComparison).toHaveBeenCalledWith(file.toString(), 'changed');
+    expect(onComparison).toHaveBeenCalledWith(file.toString(), 'changed', 'create');
   });
 
   it('processes distinct URI timers independently', async () => {
@@ -98,8 +110,8 @@ describe('ExternalChangeDetector', () => {
     await vi.advanceTimersByTimeAsync(100);
 
     expect(onComparison.mock.calls).toEqual([
-      [first.toString(), first.path],
-      [second.toString(), second.path],
+      [first.toString(), first.path, 'change'],
+      [second.toString(), second.path, 'change'],
     ]);
   });
 
@@ -183,7 +195,7 @@ describe('ExternalChangeDetector', () => {
     expect(onComparison).not.toHaveBeenCalled();
   });
 
-  it('seeds unseen content through the coordinator without rendering a comparison', async () => {
+  it('renders unseen created content as an addition from an empty baseline', async () => {
     vi.useFakeTimers();
     const file = uri('unseen.ts');
     const store = new SnapshotStore();
@@ -192,23 +204,34 @@ describe('ExternalChangeDetector', () => {
       clear: vi.fn(),
       clearAll: vi.fn(),
     };
-    const diffEngine = { compute: vi.fn(() => []) };
+    const createdHunk = {
+      kind: 'addition' as const,
+      originalStart: 0,
+      originalEnd: 0,
+      modifiedStart: 0,
+      modifiedEnd: 1,
+      originalLines: [],
+      modifiedLines: ['changed'],
+    };
+    const diffEngine = { compute: vi.fn(() => [createdHunk]) };
     const coordinator = new ComparisonCoordinator(diffEngine, store, view);
     const { instance } = detector({
-      onComparison: (key, text) => coordinator.externalChange(key, text),
+      onComparison: (key, text, kind) => kind === 'create'
+        ? coordinator.externalCreate(key, text)
+        : coordinator.externalChange(key, text),
     });
 
     instance.handleCreate(file);
     await vi.advanceTimersByTimeAsync(100);
 
     expect(store.get(file.toString())).toMatchObject({
-      baselineText: 'changed',
+      baselineText: '',
       currentText: 'changed',
-      hunks: [],
-      pending: false,
+      hunks: [createdHunk],
+      comparisonActive: true,
     });
-    expect(diffEngine.compute).not.toHaveBeenCalled();
-    expect(view.render).not.toHaveBeenCalled();
+    expect(diffEngine.compute).toHaveBeenCalledWith('', 'changed');
+    expect(view.render).toHaveBeenCalledWith(file.toString(), [createdHunk]);
   });
 
   it('cancels a pending read and clears coordinator state on delete', async () => {

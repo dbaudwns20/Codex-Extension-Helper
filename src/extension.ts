@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { PerKeyDebouncer } from './changePolicy';
 import { ComparisonCoordinator } from './coordinator';
+import { DeletedLinesCodeLensProvider } from './deletedLinesCodeLensProvider';
 import { DiagnosticView } from './diagnosticView';
 import { LineDiffEngine } from './diffEngine';
 import {
@@ -13,12 +14,14 @@ import { isEligibleFile, normalizeSettings, type ExtensionSettings } from './eli
 import {
   ExternalChangeDetector,
   normalizeUriKey,
+  type ExternalChangeKind,
 } from './externalChangeDetector';
 import {
   createInlineRendererSessionState,
   InlineRenderer,
   type InlineRendererSessionState,
 } from './inlineRenderer';
+import { QuickDiffBridge } from './quickDiffBridge';
 import { SnapshotStore } from './snapshotStore';
 
 const CONFIGURATION_SECTION = 'codexExtensionHelper';
@@ -35,6 +38,7 @@ interface TestExtensionApi {
 
 interface ExternalComparisonCandidate {
   readonly text: string;
+  readonly kind: ExternalChangeKind;
 }
 
 function errorDetail(error: unknown): string {
@@ -65,6 +69,8 @@ class ExtensionRuntime implements vscode.Disposable {
   private readonly renderer: InlineRenderer;
   private readonly view: DiagnosticView;
   private readonly coordinator: ComparisonCoordinator;
+  private readonly quickDiff: QuickDiffBridge;
+  private readonly deletedLines: DeletedLinesCodeLensProvider;
   private readonly detector: ExternalChangeDetector;
   private readonly documentDebouncer: PerKeyDebouncer<string>;
   private readonly ownership: DisposableStore;
@@ -82,6 +88,8 @@ class ExtensionRuntime implements vscode.Disposable {
   ) {
     const construction = constructWithRollback((ownership) => {
       const snapshots = new SnapshotStore();
+      const quickDiff = ownership.use(new QuickDiffBridge());
+      const deletedLines = ownership.use(new DeletedLinesCodeLensProvider(vscode, normalizeUriKey));
       const renderer = ownership.use(new InlineRenderer(
         vscode,
         output,
@@ -98,8 +106,8 @@ class ExtensionRuntime implements vscode.Disposable {
         readFile: (uri) => vscode.workspace.fs.readFile(uri as vscode.Uri),
         settings: () => this.settingsValue,
         relativePath: (uri) => this.relativePath(uri as vscode.Uri),
-        onComparison: async (key, text) => {
-          await this.applyExternalComparison(key, text);
+        onComparison: async (key, text, kind) => {
+          await this.applyExternalComparison(key, text, kind);
         },
         onDelete: (key) => this.deleteKey(key, false),
         onError: (error) => this.log('ExternalChangeDetector', error),
@@ -117,7 +125,16 @@ class ExtensionRuntime implements vscode.Disposable {
       ownership.use(vscode.window.onDidChangeVisibleTextEditors((editors) => this.guard('VisibleEditors', () => this.handleVisibleEditors(editors))));
       ownership.use(vscode.workspace.onDidChangeWorkspaceFolders((event) => this.guard('WorkspaceFolders', () => this.handleWorkspaceFolders(event))));
 
-      return { snapshots, renderer, view, coordinator, detector, documentDebouncer };
+      return {
+        snapshots,
+        renderer,
+        view,
+        coordinator,
+        detector,
+        documentDebouncer,
+        quickDiff,
+        deletedLines,
+      };
     }, (error) => output.appendLine(`[ConstructionRollback] ${errorDetail(error)}`));
 
     this.ownership = construction.resources;
@@ -125,6 +142,8 @@ class ExtensionRuntime implements vscode.Disposable {
     this.renderer = construction.value.renderer;
     this.view = construction.value.view;
     this.coordinator = construction.value.coordinator;
+    this.quickDiff = construction.value.quickDiff;
+    this.deletedLines = construction.value.deletedLines;
     this.detector = construction.value.detector;
     this.documentDebouncer = construction.value.documentDebouncer;
 
@@ -145,6 +164,13 @@ class ExtensionRuntime implements vscode.Disposable {
 
   get renderedComparisonCount(): number {
     return this.view.renderedComparisonCount;
+  }
+
+  async openActiveDiff(): Promise<void> {
+    const resource = vscode.window.activeTextEditor?.document.uri;
+    if (resource === undefined || !await this.quickDiff.openDiff(resource)) {
+      void vscode.window.showInformationMessage('No active Codex comparison for this file.');
+    }
   }
 
   updateSettings(settings: ExtensionSettings): void {
@@ -357,6 +383,8 @@ class ExtensionRuntime implements vscode.Disposable {
     }
     this.documentDebouncer.cancel(key);
     this.coordinator.delete(key);
+    this.quickDiff.clear(key);
+    this.deletedLines.clear(key);
     this.trackedUris.delete(key);
     this.comparisonKeys.delete(key);
   }
@@ -365,13 +393,24 @@ class ExtensionRuntime implements vscode.Disposable {
     const state = this.snapshots.get(key);
     if (state !== undefined && state.hunks.length > 0) {
       this.comparisonKeys.add(key);
+      const uri = this.trackedUris.get(key);
+      if (uri !== undefined) {
+        this.quickDiff.show(key, uri, state.baselineText);
+      }
+      this.deletedLines.update(key, state.hunks);
     } else {
       this.comparisonKeys.delete(key);
+      this.quickDiff.clear(key, state?.currentText);
+      this.deletedLines.clear(key);
     }
   }
 
-  private async applyExternalComparison(key: string, text: string): Promise<void> {
-    const candidate = { text };
+  private async applyExternalComparison(
+    key: string,
+    text: string,
+    kind: ExternalChangeKind,
+  ): Promise<void> {
+    const candidate = { text, kind };
     this.externalCandidates.set(key, candidate);
     await this.tryApplyExternalComparison(key, candidate);
   }
@@ -397,7 +436,11 @@ class ExtensionRuntime implements vscode.Disposable {
       return;
     }
 
-    await this.coordinator.externalChange(key, candidate.text, isCurrent);
+    if (candidate.kind === 'create') {
+      await this.coordinator.externalCreate(key, candidate.text, isCurrent);
+    } else {
+      await this.coordinator.externalChange(key, candidate.text, isCurrent);
+    }
     if (this.externalCandidates.get(key) === candidate) {
       this.externalCandidates.delete(key);
     }
@@ -511,6 +554,14 @@ class ExtensionController implements vscode.Disposable {
     return this.runtime?.renderedComparisonCount ?? 0;
   }
 
+  async openActiveDiff(): Promise<void> {
+    if (this.runtime === undefined) {
+      void vscode.window.showInformationMessage('Codex Extension Helper is disabled.');
+      return;
+    }
+    await this.runtime.openActiveDiff();
+  }
+
   start(): void {
     this.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration(CONFIGURATION_SECTION)) {
@@ -585,6 +636,10 @@ export function activate(context: vscode.ExtensionContext): TestExtensionApi | u
   const controller = new ExtensionController(output);
   activeController = controller;
   context.subscriptions.push(controller);
+  context.subscriptions.push(vscode.commands.registerCommand(
+    'codexExtensionHelper.openDiff',
+    () => controller.openActiveDiff(),
+  ));
   controller.start();
 
   return process.env.CODEX_EXTENSION_HELPER_TEST === '1' ? { testDiagnostics } : undefined;

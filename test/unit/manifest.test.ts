@@ -2,9 +2,9 @@ import { describe, expect, it } from 'vitest';
 import manifest from '../../package.json';
 
 describe('extension manifest', () => {
-  it('targets Insiders and enables only the required proposal', () => {
-    expect(manifest.engines.vscode).toBe('^1.134.0');
-    expect(manifest.enabledApiProposals).toEqual(['editorInsets']);
+  it('targets Stable without a proposed API', () => {
+    expect(manifest.engines.vscode).toBe('^1.105.0');
+    expect(manifest).not.toHaveProperty('enabledApiProposals');
     expect(manifest.activationEvents).toContain('onStartupFinished');
   });
 

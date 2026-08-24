@@ -51,7 +51,8 @@ async function main(): Promise<void> {
       launchArgs: [
         workspacePath,
         '--disable-extensions',
-        '--enable-proposed-api=local.codex-extension-helper',
+        '--enable-proposed-api',
+        'local.codex-extension-helper',
         `--user-data-dir=${userDataPath}`,
         `--extensions-dir=${extensionsPath}`,
       ],

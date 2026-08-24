@@ -27,11 +27,6 @@ async function waitFor(
 }
 
 export async function runExtensionSmokeTest(): Promise<void> {
-  if (typeof vscode.window.createWebviewTextEditorInset !== 'function') {
-    console.log('[SKIP] VS Code host does not expose window.createWebviewTextEditorInset; a manual Insiders launch remains the definitive inset check.');
-    return;
-  }
-
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   assert.ok(workspaceFolder, 'The Extension Host must open the temporary workspace');
   const fileUri = vscode.Uri.joinPath(workspaceFolder.uri, 'smoke.ts');

@@ -37,6 +37,16 @@ const newerHunks: readonly ChangeHunk[] = [{
   modifiedLines: ['new-result'],
 }];
 
+const createdHunks: readonly ChangeHunk[] = [{
+  kind: 'addition',
+  originalStart: 0,
+  originalEnd: 0,
+  modifiedStart: 0,
+  modifiedEnd: 2,
+  originalLines: [],
+  modifiedLines: ['const value = 1;', 'export { value };'],
+}];
+
 class FakeDiffEngine {
   readonly calls: Array<{ original: string; modified: string }> = [];
   private readonly results: Array<readonly ChangeHunk[] | Promise<readonly ChangeHunk[]>> = [];
@@ -79,6 +89,33 @@ function setup() {
 
 describe('ComparisonCoordinator', () => {
   const key = 'file:///workspace/file.ts';
+
+  it('treats newly created content as an addition from an empty baseline', async () => {
+    const { coordinator, engine, store, view } = setup();
+    view.visible.add(key);
+    engine.queue(createdHunks);
+    const externalCreate = (coordinator as ComparisonCoordinator & {
+      externalCreate?: (createdKey: string, text: string) => Promise<void>;
+    }).externalCreate;
+
+    expect(typeof externalCreate).toBe('function');
+    if (externalCreate === undefined) {
+      return;
+    }
+    await externalCreate.call(coordinator, key, 'const value = 1;\nexport { value };\n');
+
+    expect(engine.calls).toEqual([{
+      original: '',
+      modified: 'const value = 1;\nexport { value };\n',
+    }]);
+    expect(store.get(key)).toMatchObject({
+      baselineText: '',
+      currentText: 'const value = 1;\nexport { value };\n',
+      hunks: createdHunks,
+      comparisonActive: true,
+    });
+    expect(view.renders).toEqual([{ key, hunks: createdHunks }]);
+  });
 
   it('seeds unseen external content without diffing or rendering', async () => {
     const { coordinator, engine, store, view } = setup();

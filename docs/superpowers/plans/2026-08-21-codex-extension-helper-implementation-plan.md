@@ -517,7 +517,8 @@ Configure an extension-host launch that uses `${workspaceFolder}` as the extensi
 
 ```json
 [
-  "--enable-proposed-api=local.codex-extension-helper",
+  "--enable-proposed-api",
+  "local.codex-extension-helper",
   "${workspaceFolder}/test-fixtures/workspace"
 ]
 ```
@@ -531,7 +532,7 @@ README must explain:
 - this extension displays all qualifying external writes, not Codex identity;
 - VS Code Insiders is required;
 - install commands for the generated VSIX;
-- the `--enable-proposed-api=local.codex-extension-helper` launch requirement;
+- the `--enable-proposed-api local.codex-extension-helper` launch requirement;
 - red blocks are read-only history, green lines are current editable content;
 - saving clears the comparison;
 - settings and defaults;

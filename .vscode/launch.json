@@ -2,13 +2,12 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Run Extension (Insiders)",
+      "name": "Run Extension (Stable)",
       "type": "extensionHost",
       "request": "launch",
       "runtimeExecutable": "${execPath}",
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
-        "--enable-proposed-api=local.codex-extension-helper",
         "${workspaceFolder}/test-fixtures/workspace"
       ],
       "outFiles": [
