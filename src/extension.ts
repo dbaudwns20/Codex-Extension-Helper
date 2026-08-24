@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { ActiveReviewContext } from './activeReviewContext';
 import { PerKeyDebouncer } from './changePolicy';
-import { ComparisonCoordinator } from './coordinator';
+import { ComparisonCoordinator, type ComparisonView } from './coordinator';
 import {
   DeletedLinesCodeLensProvider,
   type ReviewCodeLensState,
@@ -89,13 +89,19 @@ interface SynchronizedReviewViews {
 }
 
 interface SynchronizeReviewViewsOptions {
-  readonly key: string;
+  readonly key: string | undefined;
   readonly state: FileComparisonState | undefined;
   readonly resource: vscode.Uri | undefined;
   readonly activeKey: string | undefined;
   readonly activeState: FileComparisonState | undefined;
   readonly views: SynchronizedReviewViews;
 }
+
+const STATE_ONLY_COMPARISON_VIEW: ComparisonView = Object.freeze({
+  async render(): Promise<void> {},
+  clear(): void {},
+  clearAll(): void {},
+});
 
 function errorDetail(error: unknown): string {
   return error instanceof Error ? error.stack ?? error.message : String(error);
@@ -261,23 +267,25 @@ export async function synchronizeReviewViews({
   views,
 }: SynchronizeReviewViewsOptions): Promise<void> {
   const pending: PromiseLike<void>[] = [];
-  if (state !== undefined && state.hunks.length > 0) {
-    pending.push(views.renderer.render(key, state.hunks));
-    views.deletedLines.update({
-      key,
-      sourceRevision: state.sourceRevision,
-      currentText: state.currentText,
-      hunks: state.hunks,
-    });
-    if (resource === undefined) {
-      views.quickDiff.clear(key);
+  if (key !== undefined) {
+    if (state !== undefined && state.hunks.length > 0) {
+      pending.push(views.renderer.render(key, state.hunks));
+      views.deletedLines.update({
+        key,
+        sourceRevision: state.sourceRevision,
+        currentText: state.currentText,
+        hunks: state.hunks,
+      });
+      if (resource === undefined) {
+        views.quickDiff.clear(key);
+      } else {
+        views.quickDiff.update(key, resource, state.baselineText);
+      }
     } else {
-      views.quickDiff.update(key, resource, state.baselineText);
+      views.renderer.clear(key);
+      views.deletedLines.clear(key);
+      views.quickDiff.clear(key, state?.currentText);
     }
-  } else {
-    views.renderer.clear(key);
-    views.deletedLines.clear(key);
-    views.quickDiff.clear(key, state?.currentText);
   }
   pending.push(views.activeContext.update(activeKey, activeState));
   await Promise.all(pending);
@@ -304,7 +312,6 @@ function readSettings(): ExtensionSettings {
 
 export class ExtensionRuntime implements vscode.Disposable {
   private readonly snapshots: SnapshotStore;
-  private readonly renderer: InlineRenderer;
   private readonly view: DiagnosticView;
   private readonly coordinator: ComparisonCoordinator;
   private readonly quickDiff: QuickDiffBridge;
@@ -342,7 +349,7 @@ export class ExtensionRuntime implements vscode.Disposable {
       const coordinator = ownership.use(new ComparisonCoordinator(
         new LineDiffEngine(),
         snapshots,
-        view,
+        STATE_ONLY_COMPARISON_VIEW,
       ));
       const reviewController = ownership.use(new ReviewController(
         coordinator,
@@ -381,7 +388,6 @@ export class ExtensionRuntime implements vscode.Disposable {
 
       return {
         snapshots,
-        renderer,
         view,
         coordinator,
         detector,
@@ -394,7 +400,6 @@ export class ExtensionRuntime implements vscode.Disposable {
 
     this.ownership = construction.resources;
     this.snapshots = construction.value.snapshots;
-    this.renderer = construction.value.renderer;
     this.view = construction.value.view;
     this.coordinator = construction.value.coordinator;
     this.quickDiff = construction.value.quickDiff;
@@ -451,7 +456,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     for (const key of [...this.trackedUris.keys()]) {
       this.deleteKey(key);
     }
-    void this.activeReviewContext.clear();
+    this.syncPresentation();
     this.disposed = true;
     this.ownership.dispose();
     this.trackedUris.clear();
@@ -620,7 +625,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
 
     if (editor === undefined || !this.isEligible(editor.document.uri, editor.document.getText())) {
-      void this.activeReviewContext.update(undefined, undefined);
+      this.syncPresentation();
       return;
     }
 
@@ -663,6 +668,11 @@ export class ExtensionRuntime implements vscode.Disposable {
       this.comparisonKeys.delete(key);
     }
 
+    this.syncPresentation(key);
+  }
+
+  private syncPresentation(key?: string): void {
+    const state = key === undefined ? undefined : this.snapshots.get(key);
     const activeDocument = vscode.window.activeTextEditor?.document;
     const activeKey = activeDocument?.uri.scheme === 'file'
       ? normalizeUriKey(activeDocument.uri)
@@ -673,7 +683,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     void this.run('SynchronizeComparison', () => synchronizeReviewViews({
       key,
       state,
-      resource: this.trackedUris.get(key),
+      resource: key === undefined ? undefined : this.trackedUris.get(key),
       activeKey,
       activeState,
       views: {
@@ -817,7 +827,7 @@ export class ExtensionRuntime implements vscode.Disposable {
   }
 }
 
-class ExtensionController implements vscode.Disposable {
+export class ExtensionController implements vscode.Disposable {
   private readonly subscriptions: vscode.Disposable[] = [];
   private readonly rendererSessionState = createInlineRendererSessionState();
   private runtime: ExtensionRuntime | undefined;

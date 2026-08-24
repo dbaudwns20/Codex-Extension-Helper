@@ -34,6 +34,13 @@ class FakeSelection {
   constructor(readonly anchor: unknown, readonly active: unknown) {}
 }
 
+class FakeCodeLens {
+  constructor(readonly range: unknown, readonly command?: {
+    readonly command: string;
+    readonly arguments?: readonly unknown[];
+  }) {}
+}
+
 class FakeWorkspaceEdit {
   readonly replacements: unknown[][] = [];
 
@@ -90,7 +97,7 @@ function reviewState(overrides: Partial<FileComparisonState> = {}): FileComparis
   };
 }
 
-function installRuntimeVscode() {
+function installRuntimeVscode(initialText = 'before\n') {
   const callbacks = new Map<string, (...args: any[]) => unknown>();
   const commands = new Map<string, (...args: any[]) => unknown>();
   const uri = {
@@ -109,12 +116,18 @@ function installRuntimeVscode() {
       };
     },
   };
-  let text = 'before\n';
+  let text = initialText;
   let version = 1;
+  let dirty = false;
+  let enabled = true;
   const document = {
     uri,
-    isDirty: false,
-    lineCount: 2,
+    get isDirty() {
+      return dirty;
+    },
+    get lineCount() {
+      return text.split('\n').length;
+    },
     eol: 1,
     get version() {
       return version;
@@ -170,6 +183,8 @@ function installRuntimeVscode() {
     quickDiffProvider: undefined as unknown,
     dispose: vi.fn(),
   };
+  let contentProvider: { provideTextDocumentContent(uri: unknown): string } | undefined;
+  let codeLensProvider: { provideCodeLenses(document: unknown): FakeCodeLens[] } | undefined;
   const window = {
     activeTextEditor: editor as typeof editor | typeof secondEditor | undefined,
     visibleTextEditors: [editor] as Array<typeof editor | typeof secondEditor>,
@@ -182,6 +197,7 @@ function installRuntimeVscode() {
     createTextEditorDecorationType: vi.fn(() => ({ dispose: vi.fn() })),
     showInformationMessage: vi.fn().mockResolvedValue(undefined),
     showErrorMessage: vi.fn().mockResolvedValue(undefined),
+    createOutputChannel: vi.fn(),
     onDidChangeVisibleTextEditors: event('visibleEditors'),
     onDidChangeActiveTextEditor: event('activeEditor'),
   };
@@ -191,9 +207,34 @@ function installRuntimeVscode() {
       readFile: vi.fn(async () => new TextEncoder().encode(text)),
       delete: vi.fn().mockResolvedValue(undefined),
     },
-    applyEdit: vi.fn().mockResolvedValue(true),
+    applyEdit: vi.fn(async (edit: FakeWorkspaceEdit) => {
+      const replacement = edit.replacements[0];
+      if (replacement === undefined) {
+        return false;
+      }
+      const range = replacement[1] as FakeRange;
+      const startOffset = (range.start as { offset: number }).offset;
+      const endOffset = (range.end as { offset: number }).offset;
+      text = text.slice(0, startOffset) + String(replacement[2]) + text.slice(endOffset);
+      version += 1;
+      dirty = true;
+      callbacks.get('documentChange')?.({ document, contentChanges: [{}] });
+      return true;
+    }),
     createFileSystemWatcher: vi.fn(() => watcher),
-    registerTextDocumentContentProvider: vi.fn(() => disposable()),
+    registerTextDocumentContentProvider: vi.fn((_scheme: string, provider: typeof contentProvider) => {
+      contentProvider = provider;
+      return disposable();
+    }),
+    getConfiguration: vi.fn(() => ({
+      get: (key: string) => ({
+        enabled,
+        debounceMs: 0,
+        maxFileSizeKb: 1,
+        exclude: [],
+      })[key],
+    })),
+    onDidChangeConfiguration: event('configuration'),
     onDidOpenTextDocument: event('documentOpen'),
     onDidChangeTextDocument: event('documentChange'),
     onWillSaveTextDocument: event('documentWillSave'),
@@ -204,10 +245,17 @@ function installRuntimeVscode() {
     asRelativePath: vi.fn((resource: { path: string }) => resource.path.slice('/workspace/'.length)),
   };
   const executeCommand = vi.fn().mockResolvedValue(undefined);
+  const output = { appendLine: vi.fn(), dispose: vi.fn() };
+  window.createOutputChannel.mockReturnValue(output);
   Object.assign(vscodeMock, {
     window,
     workspace,
-    languages: { registerCodeLensProvider: vi.fn(() => disposable()) },
+    languages: {
+      registerCodeLensProvider: vi.fn((_selector: unknown, provider: typeof codeLensProvider) => {
+        codeLensProvider = provider;
+        return disposable();
+      }),
+    },
     scm: { createSourceControl: vi.fn(() => sourceControl) },
     commands: {
       executeCommand,
@@ -219,6 +267,7 @@ function installRuntimeVscode() {
     EventEmitter: FakeEventEmitter,
     WorkspaceEdit: FakeWorkspaceEdit,
     Range: FakeRange,
+    CodeLens: FakeCodeLens,
     Selection: FakeSelection,
     ThemeColor: FakeThemeColor,
     TabInputText: FakeTabInputText,
@@ -229,17 +278,37 @@ function installRuntimeVscode() {
 
   return {
     callbacks,
+    codeLenses() {
+      return codeLensProvider?.provideCodeLenses(document) ?? [];
+    },
     commands,
+    currentText() {
+      return text;
+    },
     document,
     editor,
     executeCommand,
-    output: { appendLine: vi.fn() },
+    output,
+    quickDiffBaseline(): string | undefined {
+      const provider = sourceControl.quickDiffProvider as {
+        provideOriginalResource(uri: unknown): unknown;
+      } | undefined;
+      const baseline = provider?.provideOriginalResource(uri);
+      return baseline === undefined
+        ? undefined
+        : contentProvider?.provideTextDocumentContent(baseline);
+    },
     secondDocument,
     secondEditor,
-    setText(value: string) {
+    setText(value: string, isDirty = false) {
       text = value;
       version += 1;
+      dirty = isDirty;
     },
+    setEnabled(value: boolean) {
+      enabled = value;
+    },
+    sourceControl,
     uri,
     window,
     workspace,
@@ -543,6 +612,33 @@ describe('stable review runtime boundaries', () => {
     );
   });
 
+  it('updates only active context when synchronization has no eligible file', async () => {
+    const { synchronizeReviewViews } = await import('../../src/extension');
+    const views = {
+      renderer: { render: vi.fn(), clear: vi.fn() },
+      deletedLines: { update: vi.fn(), clear: vi.fn() },
+      quickDiff: { update: vi.fn(), clear: vi.fn() },
+      activeContext: { update: vi.fn().mockResolvedValue(undefined) },
+    };
+
+    await synchronizeReviewViews({
+      key: undefined,
+      state: undefined,
+      resource: undefined,
+      activeKey: undefined,
+      activeState: undefined,
+      views,
+    });
+
+    expect(views.renderer.render).not.toHaveBeenCalled();
+    expect(views.renderer.clear).not.toHaveBeenCalled();
+    expect(views.deletedLines.update).not.toHaveBeenCalled();
+    expect(views.deletedLines.clear).not.toHaveBeenCalled();
+    expect(views.quickDiff.update).not.toHaveBeenCalled();
+    expect(views.quickDiff.clear).not.toHaveBeenCalled();
+    expect(views.activeContext.update).toHaveBeenCalledWith(undefined, undefined);
+  });
+
   it('wires command and active-file context lifecycles inside the extension runtime', async () => {
     vi.useFakeTimers();
     try {
@@ -606,6 +702,211 @@ describe('stable review runtime boundaries', () => {
       );
 
       runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('uses one presentation transition for external comparison and real approve/reject commands', async () => {
+    vi.useFakeTimers();
+    try {
+      const baseline = 'one\nkeep\ntwo\n';
+      const modified = 'ONE\nkeep\nTWO\n';
+      const fake = installRuntimeVscode(baseline);
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+      const view = (runtime as unknown as {
+        view: { render(key: string, hunks: readonly ChangeHunk[]): Promise<void> };
+      }).view;
+      const render = vi.spyOn(view, 'render');
+
+      fake.setText(modified);
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await vi.runAllTimersAsync();
+      await Promise.resolve();
+
+      expect(render).toHaveBeenCalledTimes(1);
+      expect(fake.editor.setDecorations).toHaveBeenCalledTimes(1);
+      expect(fake.quickDiffBaseline()).toBe(baseline);
+      expect(runtime.renderedComparisonCount).toBe(1);
+
+      const approveLenses = fake.codeLenses().filter(
+        (lens) => lens.command?.command === 'codexExtensionHelper.approveHunk',
+      );
+      expect(approveLenses).toHaveLength(2);
+      await fake.commands.get('codexExtensionHelper.approveHunk')!(
+        ...approveLenses[0].command!.arguments!,
+      );
+      await Promise.resolve();
+
+      expect(render).toHaveBeenCalledTimes(2);
+      expect(fake.editor.setDecorations).toHaveBeenCalledTimes(3);
+      expect(fake.quickDiffBaseline()).toBe('ONE\nkeep\ntwo\n');
+
+      const rejectLens = fake.codeLenses().find(
+        (lens) => lens.command?.command === 'codexExtensionHelper.rejectHunk',
+      );
+      expect(rejectLens).toBeDefined();
+      await fake.commands.get('codexExtensionHelper.rejectHunk')!(
+        ...rejectLens!.command!.arguments!,
+      );
+      expect(fake.workspace.applyEdit).toHaveBeenCalledTimes(1);
+      expect(runtime.comparisonCount).toBe(1);
+      expect(fake.quickDiffBaseline()).toBe('ONE\nkeep\ntwo\n');
+      await vi.runAllTimersAsync();
+      await Promise.resolve();
+
+      expect(fake.currentText()).toBe('ONE\nkeep\ntwo\n');
+      expect(fake.quickDiffBaseline()).toBeUndefined();
+      expect(runtime.comparisonCount).toBe(0);
+      expect(runtime.renderedComparisonCount).toBe(0);
+
+      render.mockRestore();
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears the real presentation once for save, delete, and runtime disposal', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const setup = async () => {
+        const fake = installRuntimeVscode('before\n');
+        const runtime = new ExtensionRuntime({
+          enabled: true,
+          debounceMs: 0,
+          maxFileSizeBytes: 1024,
+          exclude: [],
+        }, fake.output as never, {
+          renderingDisabled: false,
+          warningShown: false,
+        });
+        fake.setText('after\n');
+        fake.callbacks.get('watcherChange')!(fake.uri);
+        await vi.runAllTimersAsync();
+        await Promise.resolve();
+        const view = (runtime as unknown as { view: { clear(key: string): void } }).view;
+        return { fake, runtime, clear: vi.spyOn(view, 'clear') };
+      };
+
+      const saved = await setup();
+      saved.fake.callbacks.get('documentSave')!(saved.fake.document);
+      await Promise.resolve();
+      expect(saved.clear).toHaveBeenCalledTimes(1);
+      saved.clear.mockRestore();
+      saved.runtime.dispose();
+
+      const deleted = await setup();
+      deleted.fake.callbacks.get('watcherDelete')!(deleted.fake.uri);
+      await Promise.resolve();
+      expect(deleted.clear).toHaveBeenCalledTimes(1);
+      deleted.clear.mockRestore();
+      deleted.runtime.dispose();
+
+      const disposed = await setup();
+      disposed.runtime.dispose();
+      expect(disposed.clear).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('routes visible-editor show and an ineligible active editor through presentation synchronization', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await vi.runAllTimersAsync();
+      await Promise.resolve();
+      const view = (runtime as unknown as {
+        view: { render(key: string, hunks: readonly ChangeHunk[]): Promise<void> };
+      }).view;
+      const render = vi.spyOn(view, 'render');
+
+      fake.window.visibleTextEditors = [];
+      fake.callbacks.get('visibleEditors')!([]);
+      await Promise.resolve();
+      expect(render).toHaveBeenCalledTimes(1);
+      expect(runtime.renderedComparisonCount).toBe(0);
+
+      render.mockClear();
+      fake.window.visibleTextEditors = [fake.editor];
+      fake.callbacks.get('visibleEditors')!([fake.editor]);
+      await Promise.resolve();
+      expect(render).toHaveBeenCalledTimes(1);
+      expect(runtime.renderedComparisonCount).toBe(1);
+
+      render.mockClear();
+      const untitledEditor = {
+        ...fake.editor,
+        document: {
+          ...fake.document,
+          uri: { ...fake.uri, scheme: 'untitled', toString: () => 'untitled:review' },
+        },
+      };
+      fake.window.activeTextEditor = untitledEditor as never;
+      fake.callbacks.get('activeEditor')!(untitledEditor);
+      await Promise.resolve();
+      expect(render).not.toHaveBeenCalled();
+      expect(fake.executeCommand).toHaveBeenLastCalledWith(
+        'setContext',
+        'codexExtensionHelper.activeFileHasChanges',
+        false,
+      );
+
+      render.mockRestore();
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears through the presentation boundary once on settings disable and not again on controller disposal', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionController } = await import('../../src/extension');
+      const controller = new ExtensionController(fake.output as never);
+      controller.start();
+      const runtime = (controller as unknown as {
+        runtime: { view: { clear(key: string): void } };
+      }).runtime;
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await vi.runAllTimersAsync();
+      await Promise.resolve();
+      const clear = vi.spyOn(runtime.view, 'clear');
+
+      fake.setEnabled(false);
+      fake.callbacks.get('configuration')!({
+        affectsConfiguration: () => true,
+      });
+      await Promise.resolve();
+      expect(clear).toHaveBeenCalledTimes(1);
+
+      controller.dispose();
+      expect(clear).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
