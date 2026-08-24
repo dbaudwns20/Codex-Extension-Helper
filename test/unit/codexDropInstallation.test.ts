@@ -28,7 +28,7 @@ afterEach(async () => {
 });
 
 describe('Codex drop installation discovery', () => {
-  it('discovers compatible installations and selects the numerically newest compatible bundle', async () => {
+  it('discovers installations and selects the numerically newest installation bundle', async () => {
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { discoverCodexInstallations, resolveCodexTarget } = await import('../../scripts/lib/codex-drop-installation.mjs');
     const extensionsRoot = await makeTemporaryDirectory();
@@ -117,7 +117,7 @@ describe('Codex drop installation lifecycle', () => {
 
     const first = await applyCodexDropPatch({ extensionDir });
     expect(first.status).toBe('patched');
-    expect(await readFile(first.metadataPath, 'utf8')).toContain('"patchVersion": 1');
+    expect(await readFile(first.metadataPath, 'utf8')).toContain('"patchVersion": 2');
 
     const second = await applyCodexDropPatch({ extensionDir });
     expect(second.status).toBe('already-patched');
@@ -129,9 +129,15 @@ describe('Codex drop installation lifecycle', () => {
     const secondRestore = await restoreCodexDropPatch({ extensionDir });
     expect(secondRestore.status).toBe('already-restored');
 
+    const legacyMetadata = JSON.parse(await readFile(first.metadataPath, 'utf8'));
+    legacyMetadata.patchVersion = 1;
+    legacyMetadata.patchedSha256 = '0'.repeat(64);
+    await writeFile(first.metadataPath, `${JSON.stringify(legacyMetadata, null, 2)}\n`);
+
     const repatched = await applyCodexDropPatch({ extensionDir });
     expect(repatched.status).toBe('patched');
     expect(repatched.backupPath).toBe(first.backupPath);
+    expect(await readFile(first.metadataPath, 'utf8')).toContain('"patchVersion": 2');
   });
 
   it('refuses to restore a patched bundle changed after patching', async () => {

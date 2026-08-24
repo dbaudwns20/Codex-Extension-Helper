@@ -44,6 +44,50 @@ describe('Codex drop source transformation', () => {
     expect(result.source).toContain('stopImmediatePropagation');
   });
 
+  it('runs the drop handler in the anchor scope before a trailing source-map comment', async () => {
+    // Removing anchor-relative insertion, or omitting its statement terminator, breaks this fixture.
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
+    const original = [
+      'globalThis.__codexDropFixture=()=>{',
+      'const listeners={},mentions=[];',
+      'const it={view:{dom:{dataset:{},addEventListener:(type,handler)=>{listeners[type]=handler}}}};',
+      'let focusCount=0;const Ei=()=>{focusCount+=1};const bee=(items)=>{mentions.push(...items)};const IR=()=>{};',
+      anchor,
+      'return {listeners,mentions,get focusCount(){return focusCount}}};',
+      '//# sourceMappingURL=app-initial.js.map',
+    ].join('');
+    const patched = patchBundleSource(original);
+    const runFixture = new Function(`${patched.source}\nreturn globalThis.__codexDropFixture;`)();
+    const fixture = runFixture();
+    const event = {
+      dataTransfer: {
+        getData: (type: string) => type === 'text/uri-list' ? 'file:///workspace/src' : '',
+        dropEffect: 'none',
+      },
+      preventDefault() {},
+      stopImmediatePropagation() {},
+    };
+
+    fixture.listeners.drop(event);
+
+    expect(fixture.mentions).toEqual([{
+      label: 'src',
+      path: '/workspace/src',
+      fsPath: '/workspace/src',
+    }]);
+    expect(fixture.focusCount).toBe(1);
+    delete (globalThis as typeof globalThis & { __codexDropFixture?: unknown }).__codexDropFixture;
+  });
+
+  it('rejects a legacy v1 injection instead of silently preserving it', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
+    const legacy = `${anchor}/* codex-explorer-drop-chips:start:v1 */legacy();/* codex-explorer-drop-chips:end:v1 */`;
+
+    expect(() => patchBundleSource(legacy)).toThrow(/unsupported Codex drop patch version v1/u);
+  });
+
   it('is idempotent and restores the exact original source', async () => {
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { patchBundleSource, unpatchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');

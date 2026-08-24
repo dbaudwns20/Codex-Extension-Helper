@@ -452,6 +452,10 @@ describe('packaged runtime', () => {
     expect(readme).toContain('npm run unpatch:codex-drop');
     expect(readme).toContain('openai.chatgpt-*');
     expect(readme).toContain('Reload VS Code');
+    expect(readme).toContain('numerically newest installed');
+    expect(readme).toContain('fails closed');
+    expect(readme).toContain('--extension-dir');
+    expect(readme).toContain('older side-by-side installation');
   });
 });
 

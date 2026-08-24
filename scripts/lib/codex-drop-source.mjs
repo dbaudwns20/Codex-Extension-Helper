@@ -1,8 +1,8 @@
 import path from 'node:path';
 
-export const PATCH_VERSION = 1;
-export const PATCH_START_MARKER = '/* codex-explorer-drop-chips:start:v1 */';
-export const PATCH_END_MARKER = '/* codex-explorer-drop-chips:end:v1 */';
+export const PATCH_VERSION = 2;
+export const PATCH_START_MARKER = '/* codex-explorer-drop-chips:start:v2 */';
+export const PATCH_END_MARKER = '/* codex-explorer-drop-chips:end:v2 */';
 
 export function filePathFromUri(value, platform = process.platform) {
   const uri = new URL(value);
@@ -66,10 +66,16 @@ const COMPOSER_ANCHOR = /IR\(`add-context-file`,(?<controller>[A-Za-z_$][\w$]*)\
 
 function browserDropInjection({ controller, focus, add }) {
   const descriptorsSource = descriptorsFromDrop.toString();
-  return `${PATCH_START_MARKER}(()=>{const composer=${controller}.view.dom;if(composer.dataset.codexExplorerDropChips==='1')return;composer.dataset.codexExplorerDropChips='1';const descriptorsFromDrop=${descriptorsSource};const read=(event)=>event.dataTransfer?.getData('text/uri-list')??'';composer.addEventListener('dragover',(event)=>{if(descriptorsFromDrop(read(event)).length===0)return;event.preventDefault();event.stopPropagation();event.dataTransfer.dropEffect='copy';},true);composer.addEventListener('drop',(event)=>{const descriptors=descriptorsFromDrop(read(event));if(descriptors.length===0)return;event.preventDefault();event.stopImmediatePropagation();${add}(descriptors);${focus}();},true);})()${PATCH_END_MARKER}`;
+  return `${PATCH_START_MARKER}(()=>{const composer=${controller}.view.dom;if(composer.dataset.codexExplorerDropChips==='1')return;composer.dataset.codexExplorerDropChips='1';const descriptorsFromDrop=${descriptorsSource};const read=(event)=>event.dataTransfer?.getData('text/uri-list')??'';composer.addEventListener('dragover',(event)=>{if(descriptorsFromDrop(read(event)).length===0)return;event.preventDefault();event.stopPropagation();event.dataTransfer.dropEffect='copy';},true);composer.addEventListener('drop',(event)=>{const descriptors=descriptorsFromDrop(read(event));if(descriptors.length===0)return;event.preventDefault();event.stopImmediatePropagation();${add}(descriptors);${focus}();},true);})();${PATCH_END_MARKER}`;
 }
 
 export function patchBundleSource(source) {
+  const markerVersions = [...source.matchAll(/\/\* codex-explorer-drop-chips:(?:start|end):v(?<version>\d+) \*\//gu)]
+    .map((match) => Number(match.groups.version));
+  const unsupportedVersion = markerVersions.find((version) => version !== PATCH_VERSION);
+  if (unsupportedVersion !== undefined) {
+    throw new Error(`Found unsupported Codex drop patch version v${unsupportedVersion}; restore it before applying v${PATCH_VERSION}`);
+  }
   const startCount = source.split(PATCH_START_MARKER).length - 1;
   const endCount = source.split(PATCH_END_MARKER).length - 1;
   if (startCount !== 0 || endCount !== 0) {
@@ -84,7 +90,11 @@ export function patchBundleSource(source) {
   if (matches.length !== 1) throw new Error('Expected exactly one Codex composer anchor');
   const match = matches[0];
   const injection = browserDropInjection(match.groups);
-  return { status: 'patched', source: `${source}${injection}` };
+  const insertionIndex = match.index + match[0].length;
+  return {
+    status: 'patched',
+    source: source.slice(0, insertionIndex) + injection + source.slice(insertionIndex),
+  };
 }
 
 export function unpatchBundleSource(source) {

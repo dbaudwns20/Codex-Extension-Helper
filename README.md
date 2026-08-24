@@ -59,11 +59,16 @@ npm run unpatch:codex-drop
 ```
 
 Each dropped file or folder becomes one chip; directories are not expanded.
-The patch command targets the newest compatible `openai.chatgpt-*`
-installation. After a Codex update, rerun `npm run patch:codex-drop` and
-reload VS Code. To restore the original installation, run
-`npm run unpatch:codex-drop` and reload VS Code again. If the installed bundle
-has an unknown layout, the command fails without modifying the installation.
+In automatic mode, the patch command chooses the numerically newest installed
+`openai.chatgpt-*` version first and fails closed if that installation's bundle
+layout is unsupported; it does not fall back to an older installation. To
+intentionally target an older side-by-side installation, run
+`node scripts/patch-codex-drop.mjs --extension-dir <extension-path>` (and use
+the same `--extension-dir` option with the restore script). After a Codex
+update, rerun `npm run patch:codex-drop` and reload VS Code. To restore the
+original installation, run `npm run unpatch:codex-drop` and reload VS Code
+again. If the installed bundle has an unknown layout, the command fails without
+modifying the installation.
 
 ## Develop in VS Code Stable
 

@@ -121,7 +121,9 @@ function assertMetadataShape(metadata, target, paths) {
   if (
     metadata === null
     || typeof metadata !== 'object'
-    || metadata.patchVersion !== PATCH_VERSION
+    || !Number.isInteger(metadata.patchVersion)
+    || metadata.patchVersion < 1
+    || metadata.patchVersion > PATCH_VERSION
     || metadata.extensionVersion !== target.extensionVersion
     || metadata.bundlePath !== target.bundlePath
     || metadata.backupPath !== paths.backupPath
@@ -194,6 +196,7 @@ export async function applyCodexDropPatch(options = {}) {
 
   if (transformed.status === 'already-patched') {
     const metadata = await readMetadata(target, paths);
+    if (metadata.patchVersion !== PATCH_VERSION) throw new Error('Codex drop patch metadata is invalid');
     if (sha256(source) !== metadata.patchedSha256) throw new Error('Current bundle hash does not match patch metadata');
     if (sha256(await readFile(paths.backupPath)) !== metadata.originalSha256) throw new Error('Backup hash does not match patch metadata');
     return { status: 'already-patched', ...target, ...paths };
@@ -206,7 +209,7 @@ export async function applyCodexDropPatch(options = {}) {
     const metadata = await readMetadata(target, paths);
     if (
       metadata.originalSha256 !== originalSha256
-      || metadata.patchedSha256 !== patchedSha256
+      || (metadata.patchVersion === PATCH_VERSION && metadata.patchedSha256 !== patchedSha256)
       || sha256(await readFile(paths.backupPath)) !== originalSha256
     ) {
       throw new Error('Existing Codex drop backup does not match the current original bundle');
