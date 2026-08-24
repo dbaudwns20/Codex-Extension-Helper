@@ -61,4 +61,19 @@ describe('Codex drop source transformation', () => {
     const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
     expect(() => patchBundleSource(source)).toThrow(/exactly one Codex composer anchor/u);
   });
+
+  it.each([
+    ['duplicate markers', 'duplicate'],
+    ['reversed markers', 'reversed'],
+    ['incomplete markers', 'incomplete'],
+  ])('rejects %s rather than treating it as already patched', async (_name, kind) => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { PATCH_START_MARKER, PATCH_END_MARKER, patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
+    const source = kind === 'duplicate'
+      ? `x${PATCH_START_MARKER}y${PATCH_START_MARKER}z${PATCH_END_MARKER}`
+      : kind === 'reversed'
+        ? `x${PATCH_END_MARKER}y${PATCH_START_MARKER}z`
+        : `x${PATCH_START_MARKER}y`;
+    expect(() => patchBundleSource(source)).toThrow(/well-formed/u);
+  });
 });

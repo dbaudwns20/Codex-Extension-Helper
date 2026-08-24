@@ -70,11 +70,15 @@ function browserDropInjection({ controller, focus, add }) {
 }
 
 export function patchBundleSource(source) {
-  if (source.includes(PATCH_START_MARKER) || source.includes(PATCH_END_MARKER)) {
-    if (source.includes(PATCH_START_MARKER) && source.includes(PATCH_END_MARKER)) {
+  const startCount = source.split(PATCH_START_MARKER).length - 1;
+  const endCount = source.split(PATCH_END_MARKER).length - 1;
+  if (startCount !== 0 || endCount !== 0) {
+    const start = source.indexOf(PATCH_START_MARKER);
+    const end = source.indexOf(PATCH_END_MARKER);
+    if (startCount === 1 && endCount === 1 && start < end) {
       return { status: 'already-patched', source };
     }
-    throw new Error('Malformed Codex drop patch markers');
+    throw new Error('Expected exactly one well-formed Codex drop patch marker pair');
   }
   const matches = [...source.matchAll(COMPOSER_ANCHOR)];
   if (matches.length !== 1) throw new Error('Expected exactly one Codex composer anchor');
