@@ -13,9 +13,26 @@ import type { TextReplacement } from '../../src/reviewText';
 
 const key = 'file:///workspace/file.ts';
 
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
 class RecordingView implements ComparisonView {
   readonly cleared: string[] = [];
   readonly rendered: Array<{ key: string; hunks: readonly ChangeHunk[] }> = [];
+  clearError: unknown;
 
   async render(renderedKey: string, hunks: readonly ChangeHunk[]): Promise<void> {
     this.rendered.push({ key: renderedKey, hunks });
@@ -23,6 +40,9 @@ class RecordingView implements ComparisonView {
 
   clear(clearedKey: string): void {
     this.cleared.push(clearedKey);
+    if (this.clearError !== undefined) {
+      throw this.clearError;
+    }
   }
 
   clearAll(): void {}
@@ -42,11 +62,12 @@ class RecordingHost implements ReviewHost {
   readonly revealCalls: Array<{ document: LiveReviewDocument; line: number }> = [];
   readonly errors: string[] = [];
   readonly logs: Array<{ scope: string; error: unknown }> = [];
-  replacementResult = true;
-  replaceAllResult = true;
+  replacementResult: boolean | Promise<boolean> = true;
+  replaceAllResult: boolean | Promise<boolean> = true;
   replacementError: unknown;
   replaceAllError: unknown;
   deleteError: unknown;
+  deleteResult: Promise<void> | undefined;
   private readonly activeQueue: QueuedActiveDocument[] = [];
 
   activeDocument(): LiveReviewDocument | undefined {
@@ -69,7 +90,7 @@ class RecordingHost implements ReviewHost {
     if (this.replacementError !== undefined) {
       throw this.replacementError;
     }
-    return this.replacementResult;
+    return await this.replacementResult;
   }
 
   async replaceAll(document: LiveReviewDocument, text: string): Promise<boolean> {
@@ -77,7 +98,7 @@ class RecordingHost implements ReviewHost {
     if (this.replaceAllError !== undefined) {
       throw this.replaceAllError;
     }
-    return this.replaceAllResult;
+    return await this.replaceAllResult;
   }
 
   async deleteToTrash(uri: vscode.Uri): Promise<void> {
@@ -85,6 +106,7 @@ class RecordingHost implements ReviewHost {
     if (this.deleteError !== undefined) {
       throw this.deleteError;
     }
+    await this.deleteResult;
   }
 
   reveal(document: LiveReviewDocument, line: number): void {
@@ -155,6 +177,7 @@ function setup(
   baselineText = 'a\nold\nz\n',
   currentText = 'a\nnew\nz\n',
   overrides: Partial<FileComparisonState> = {},
+  afterStateChanged?: (key: string) => void,
 ) {
   const store = new SnapshotStore();
   const view = new RecordingView();
@@ -165,6 +188,7 @@ function setup(
   const changed: string[] = [];
   const controller = new ReviewController(coordinator, host, (changedKey) => {
     changed.push(changedKey);
+    afterStateChanged?.(changedKey);
   });
   return { changed, controller, coordinator, host, state, store, view };
 }
@@ -360,6 +384,48 @@ describe('ReviewController rejection edits', () => {
     expect(host.logs).toEqual([{ scope: 'Reject Codex changes', error: failure }]);
   });
 
+  it('logs a post-edit hunk synchronization failure without claiming rejection failed', async () => {
+    const failure = new Error('sync failed');
+    const { changed, controller, coordinator, host, state } = setup(
+      'a\nold\nz\n',
+      'a\nnew\nz\n',
+      {},
+      () => { throw failure; },
+    );
+
+    await controller.rejectHunk(reference(key, state));
+
+    expect(host.replacementCalls).toHaveLength(1);
+    expect(coordinator.state(key)).toEqual(state);
+    expect(changed).toEqual([key]);
+    expect(host.errors).toEqual([]);
+    expect(host.logs).toEqual([{
+      scope: 'Synchronize Codex review state',
+      error: failure,
+    }]);
+  });
+
+  it('logs a post-edit reject-all synchronization failure without claiming rejection failed', async () => {
+    const failure = new Error('sync failed');
+    const { changed, controller, coordinator, host, state } = setup(
+      'a\nold\nz\n',
+      'a\nnew\nz\n',
+      {},
+      () => { throw failure; },
+    );
+
+    await controller.rejectAll();
+
+    expect(host.replaceAllCalls).toHaveLength(1);
+    expect(coordinator.state(key)).toEqual(state);
+    expect(changed).toEqual([key]);
+    expect(host.errors).toEqual([]);
+    expect(host.logs).toEqual([{
+      scope: 'Synchronize Codex review state',
+      error: failure,
+    }]);
+  });
+
   it('synchronizes without editing when live text does not exactly match state', async () => {
     const { changed, controller, coordinator, host, state } = setup();
     host.document = liveDocument(key, 'changed elsewhere');
@@ -451,6 +517,101 @@ describe('ReviewController created-file rejection', () => {
     expect(changed).toEqual([]);
     expect(host.errors).toEqual(['Could not reject Codex changes.']);
     expect(host.logs).toEqual([{ scope: 'Reject Codex changes', error: failure }]);
+  });
+
+  it('logs coordinator cleanup failure after trash deletion without claiming deletion failed', async () => {
+    const { changed, controller, coordinator, host, state, view } = setupCreated();
+    const failure = new Error('view clear failed');
+    view.clearError = failure;
+
+    await controller.rejectHunk(reference(key, state));
+
+    expect(host.deleteCalls).toEqual([host.document!.uri]);
+    expect(coordinator.state(key)).toBeUndefined();
+    expect(view.cleared).toEqual([key]);
+    expect(changed).toEqual([key]);
+    expect(host.errors).toEqual([]);
+    expect(host.logs).toEqual([{
+      scope: 'Synchronize Codex review state',
+      error: failure,
+    }]);
+  });
+
+  it('logs callback failure after trash deletion without claiming deletion failed', async () => {
+    const failure = new Error('sync failed');
+    const { changed, controller, coordinator, host } = setup(
+      '',
+      'one\ntwo\n',
+      { createdFile: true },
+      () => { throw failure; },
+    );
+
+    await controller.rejectAll();
+
+    expect(host.deleteCalls).toEqual([host.document!.uri]);
+    expect(coordinator.state(key)).toBeUndefined();
+    expect(changed).toEqual([key]);
+    expect(host.errors).toEqual([]);
+    expect(host.logs).toEqual([{
+      scope: 'Synchronize Codex review state',
+      error: failure,
+    }]);
+  });
+});
+
+describe('ReviewController in-flight disposal', () => {
+  it('suppresses user-facing failure UI when a deferred host failure arrives after dispose', async () => {
+    const { changed, controller, coordinator, host, state } = setup();
+    const result = deferred<boolean>();
+    const failure = new Error('late apply failure');
+    host.replacementResult = result.promise;
+
+    const rejection = controller.rejectHunk(reference(key, state));
+    expect(host.replacementCalls).toHaveLength(1);
+    controller.dispose();
+    result.reject(failure);
+    await rejection;
+
+    expect(coordinator.state(key)).toEqual(state);
+    expect(changed).toEqual([]);
+    expect(host.errors).toEqual([]);
+    expect(host.logs).toEqual([{ scope: 'Reject Codex changes', error: failure }]);
+  });
+
+  it('does not synchronize after a deferred existing-file edit succeeds after dispose', async () => {
+    const { changed, controller, coordinator, host, state } = setup();
+    const result = deferred<boolean>();
+    host.replacementResult = result.promise;
+
+    const rejection = controller.rejectHunk(reference(key, state));
+    expect(host.replacementCalls).toHaveLength(1);
+    controller.dispose();
+    result.resolve(true);
+    await rejection;
+
+    expect(coordinator.state(key)).toEqual(state);
+    expect(changed).toEqual([]);
+    expect(host.errors).toEqual([]);
+  });
+
+  it('clears created-file state but does not synchronize after deferred trash succeeds after dispose', async () => {
+    const { changed, controller, coordinator, host } = setup(
+      '',
+      'one\ntwo\n',
+      { createdFile: true },
+    );
+    const result = deferred<void>();
+    host.deleteResult = result.promise;
+
+    const rejection = controller.rejectAll();
+    expect(host.deleteCalls).toHaveLength(1);
+    controller.dispose();
+    result.resolve();
+    await rejection;
+
+    expect(coordinator.state(key)).toBeUndefined();
+    expect(changed).toEqual([]);
+    expect(host.errors).toEqual([]);
   });
 });
 
