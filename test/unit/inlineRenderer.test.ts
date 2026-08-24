@@ -22,6 +22,15 @@ class FakeTabInputTextDiff {
   ) {}
 }
 
+class FakeRange {
+  constructor(
+    readonly startLine: number,
+    readonly startCharacter: number,
+    readonly endLine: number,
+    readonly endCharacter: number,
+  ) {}
+}
+
 function fakeUri(value: string): FakeUri {
   return { toString: () => value };
 }
@@ -132,11 +141,6 @@ describe('inline renderer helpers', () => {
         visibleTextEditors: [editor],
         tabGroups: { all: [tabGroup(1, new FakeTabInputText(fakeUri(key)))] },
         createTextEditorDecorationType: () => ({ dispose: vi.fn() }),
-        createWebviewTextEditorInset: () => ({
-          dispose: vi.fn(),
-          webview: { html: '' },
-        }),
-        showWarningMessage: vi.fn().mockResolvedValue(undefined),
       },
       Range: class {},
       ThemeColor: class {},
@@ -154,20 +158,17 @@ describe('inline renderer helpers', () => {
     expect(renderedStatus(renderer, key)).toBe(false);
   });
 
-  it('disposes a newly created inset when assigning its HTML fails', async () => {
-    const insetDispose = vi.fn();
-    const warning = vi.fn().mockResolvedValue(undefined);
-    const htmlFailure = new Error('webview rejected HTML');
-    const webview = Object.defineProperty({}, 'html', {
-      set: () => { throw htmlFailure; },
-    });
+  it('logs a decoration install failure and does not report the editor as rendered', async () => {
+    const decorationFailure = new Error('decoration install failed');
     const editor = {
       viewColumn: 1,
       document: {
         lineCount: 1,
         uri: { toString: () => 'file:///test.ts' },
       },
-      setDecorations: vi.fn(),
+      setDecorations: vi.fn()
+        .mockImplementationOnce(() => { throw decorationFailure; })
+        .mockImplementationOnce(() => undefined),
     };
     const api = {
       window: {
@@ -176,13 +177,8 @@ describe('inline renderer helpers', () => {
           all: [tabGroup(1, new FakeTabInputText(fakeUri('file:///test.ts')))],
         },
         createTextEditorDecorationType: () => ({ dispose: vi.fn() }),
-        createWebviewTextEditorInset: () => ({
-          dispose: insetDispose,
-          webview,
-        }),
-        showWarningMessage: warning,
       },
-      Range: class {},
+      Range: FakeRange,
       ThemeColor: class {},
       DecorationRangeBehavior: { ClosedClosed: 0 },
       OverviewRulerLane: { Full: 7 },
@@ -191,17 +187,22 @@ describe('inline renderer helpers', () => {
     const output = { appendLine: vi.fn() };
     const renderer = new InlineRenderer(api as never, output);
 
-    await renderer.render('file:///test.ts', [hunk()]);
-    await renderer.render('file:///test.ts', [hunk()]);
+    await renderer.render('file:///test.ts', [hunk({
+      kind: 'modification',
+      modifiedEnd: 1,
+      modifiedLines: ['new'],
+    })]);
 
     expect(renderedStatus(renderer, 'file:///test.ts')).toBe(false);
-    expect(insetDispose).toHaveBeenCalledOnce();
-    expect(warning).toHaveBeenCalledOnce();
-    expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(htmlFailure.message));
+    expect(editor.setDecorations).toHaveBeenCalledTimes(2);
+    expect(output.appendLine).toHaveBeenCalledWith(
+      expect.stringContaining(decorationFailure.message),
+    );
   });
 
-  it('renders a normal editor while skipping both sides of a diff editor for the same URI', async () => {
+  it('decorates a normal editor while skipping a diff editor for the same URI', async () => {
     const key = 'file:///test.ts';
+    const decorationType = { dispose: vi.fn() };
     const normalEditor = {
       viewColumn: 1,
       document: { lineCount: 1, uri: fakeUri(key) },
@@ -212,7 +213,6 @@ describe('inline renderer helpers', () => {
       document: { lineCount: 1, uri: fakeUri(key) },
       setDecorations: vi.fn(),
     };
-    const createInset = vi.fn(() => ({ dispose: vi.fn(), webview: { html: '' } }));
     const api = {
       window: {
         visibleTextEditors: [normalEditor, diffEditor],
@@ -222,11 +222,9 @@ describe('inline renderer helpers', () => {
             tabGroup(2, new FakeTabInputTextDiff(fakeUri('file:///before.ts'), fakeUri(key))),
           ],
         },
-        createTextEditorDecorationType: () => ({ dispose: vi.fn() }),
-        createWebviewTextEditorInset: createInset,
-        showWarningMessage: vi.fn().mockResolvedValue(undefined),
+        createTextEditorDecorationType: () => decorationType,
       },
-      Range: class {},
+      Range: FakeRange,
       ThemeColor: class {},
       DecorationRangeBehavior: { ClosedClosed: 0 },
       OverviewRulerLane: { Full: 7 },
@@ -234,12 +232,19 @@ describe('inline renderer helpers', () => {
     };
     const renderer = new InlineRenderer(api as never, { appendLine: vi.fn() });
 
-    await renderer.render(key, [hunk()]);
+    await renderer.render(key, [hunk({
+      kind: 'modification',
+      modifiedStart: 2,
+      modifiedEnd: 4,
+      modifiedLines: ['new', 'lines'],
+    })]);
 
     expect(normalEditor.setDecorations).toHaveBeenCalledOnce();
+    expect(normalEditor.setDecorations).toHaveBeenCalledWith(
+      decorationType,
+      [new FakeRange(2, 0, 3, 0)],
+    );
     expect(diffEditor.setDecorations).not.toHaveBeenCalled();
-    expect(createInset).toHaveBeenCalledOnce();
-    expect(createInset).toHaveBeenCalledWith(normalEditor, -1, 1, { enableScripts: false });
   });
 
   it('skips unsupported custom tab inputs entirely', async () => {
@@ -249,14 +254,11 @@ describe('inline renderer helpers', () => {
       document: { lineCount: 1, uri: fakeUri(key) },
       setDecorations: vi.fn(),
     };
-    const createInset = vi.fn(() => ({ dispose: vi.fn(), webview: { html: '' } }));
     const api = {
       window: {
         visibleTextEditors: [editor],
         tabGroups: { all: [tabGroup(1, { uri: fakeUri(key), viewType: 'custom' })] },
         createTextEditorDecorationType: () => ({ dispose: vi.fn() }),
-        createWebviewTextEditorInset: createInset,
-        showWarningMessage: vi.fn().mockResolvedValue(undefined),
       },
       Range: class {},
       ThemeColor: class {},
@@ -269,31 +271,24 @@ describe('inline renderer helpers', () => {
     await renderer.render(key, [hunk()]);
 
     expect(editor.setDecorations).not.toHaveBeenCalled();
-    expect(createInset).not.toHaveBeenCalled();
     expect(renderedStatus(renderer, key)).toBe(false);
   });
 
-  it('disposes the previous inset before installing a rerender', async () => {
+  it('clears previous decorations before installing a rerender', async () => {
     const key = 'file:///rerender.ts';
-    const firstDispose = vi.fn();
-    const secondDispose = vi.fn();
+    const decorationType = { dispose: vi.fn() };
     const editor = {
       viewColumn: 1,
       document: { lineCount: 1, uri: fakeUri(key) },
       setDecorations: vi.fn(),
     };
-    const createInset = vi.fn()
-      .mockReturnValueOnce({ dispose: firstDispose, webview: { html: '' } })
-      .mockReturnValueOnce({ dispose: secondDispose, webview: { html: '' } });
     const api = {
       window: {
         visibleTextEditors: [editor],
         tabGroups: { all: [tabGroup(1, new FakeTabInputText(fakeUri(key)))] },
-        createTextEditorDecorationType: () => ({ dispose: vi.fn() }),
-        createWebviewTextEditorInset: createInset,
-        showWarningMessage: vi.fn().mockResolvedValue(undefined),
+        createTextEditorDecorationType: () => decorationType,
       },
-      Range: class {},
+      Range: FakeRange,
       ThemeColor: class {},
       DecorationRangeBehavior: { ClosedClosed: 0 },
       OverviewRulerLane: { Full: 7 },
@@ -301,41 +296,46 @@ describe('inline renderer helpers', () => {
     };
     const renderer = new InlineRenderer(api as never, { appendLine: vi.fn() });
 
-    await renderer.render(key, [hunk()]);
-    await renderer.render(key, [hunk()]);
+    const changed = hunk({
+      kind: 'addition',
+      modifiedEnd: 1,
+      modifiedLines: ['new'],
+    });
+    await renderer.render(key, [changed]);
+    await renderer.render(key, [changed]);
 
-    expect(firstDispose).toHaveBeenCalledOnce();
-    expect(secondDispose).not.toHaveBeenCalled();
-    expect(createInset).toHaveBeenCalledTimes(2);
+    expect(editor.setDecorations.mock.calls).toEqual([
+      [decorationType, [new FakeRange(0, 0, 0, 0)]],
+      [decorationType, []],
+      [decorationType, [new FakeRange(0, 0, 0, 0)]],
+    ]);
   });
 
-  it('continues clearing later resources when a decoration or inset disposer throws', async () => {
+  it('continues clearing later editors when one decoration cleanup throws', async () => {
     const key = 'file:///throwing-cleanup.ts';
     const decorationFailure = new Error('decoration cleanup failed');
-    const insetFailure = new Error('first inset cleanup failed');
-    const secondInsetDispose = vi.fn();
-    const editor = {
+    const firstEditor = {
       viewColumn: 1,
-      document: { lineCount: 3, uri: fakeUri(key) },
+      document: { lineCount: 1, uri: fakeUri(key) },
       setDecorations: vi.fn()
         .mockImplementationOnce(() => undefined)
         .mockImplementationOnce(() => { throw decorationFailure; }),
     };
-    const createInset = vi.fn()
-      .mockReturnValueOnce({
-        dispose: vi.fn(() => { throw insetFailure; }),
-        webview: { html: '' },
-      })
-      .mockReturnValueOnce({ dispose: secondInsetDispose, webview: { html: '' } });
+    const secondEditor = {
+      viewColumn: 2,
+      document: { lineCount: 1, uri: fakeUri(key) },
+      setDecorations: vi.fn(),
+    };
     const api = {
       window: {
-        visibleTextEditors: [editor],
-        tabGroups: { all: [tabGroup(1, new FakeTabInputText(fakeUri(key)))] },
+        visibleTextEditors: [firstEditor, secondEditor],
+        tabGroups: { all: [
+          tabGroup(1, new FakeTabInputText(fakeUri(key))),
+          tabGroup(2, new FakeTabInputText(fakeUri(key))),
+        ] },
         createTextEditorDecorationType: () => ({ dispose: vi.fn() }),
-        createWebviewTextEditorInset: createInset,
-        showWarningMessage: vi.fn().mockResolvedValue(undefined),
       },
-      Range: class {},
+      Range: FakeRange,
       ThemeColor: class {},
       DecorationRangeBehavior: { ClosedClosed: 0 },
       OverviewRulerLane: { Full: 7 },
@@ -343,41 +343,39 @@ describe('inline renderer helpers', () => {
     };
     const output = { appendLine: vi.fn() };
     const renderer = new InlineRenderer(api as never, output);
-    const twoDeletions = [
-      hunk(),
-      hunk({ originalStart: 2, originalEnd: 3, modifiedStart: 2, modifiedEnd: 2 }),
-    ];
 
-    await renderer.render(key, twoDeletions);
+    await renderer.render(key, [hunk({
+      kind: 'addition',
+      modifiedEnd: 1,
+      modifiedLines: ['new'],
+    })]);
     expect(() => renderer.clear(key)).not.toThrow();
 
-    expect(secondInsetDispose).toHaveBeenCalledOnce();
+    expect(firstEditor.setDecorations).toHaveBeenCalledTimes(2);
+    expect(secondEditor.setDecorations).toHaveBeenCalledTimes(2);
+    expect(secondEditor.setDecorations).toHaveBeenLastCalledWith(expect.anything(), []);
     expect(renderedStatus(renderer, key)).toBe(false);
     expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(decorationFailure.message));
-    expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(insetFailure.message));
   });
 
-  it('preserves a later-editor render failure while cleanup failures are logged', async () => {
+  it('rolls back every editor after a later decoration install fails', async () => {
     const key = 'file:///later-editor.ts';
-    const primaryFailure = new Error('later editor inset failed');
-    const cleanupFailure = new Error('earlier inset cleanup failed');
+    const primaryFailure = new Error('later editor decoration failed');
+    const cleanupFailure = new Error('earlier decoration cleanup failed');
     const firstEditor = {
       viewColumn: 1,
       document: { lineCount: 1, uri: fakeUri(key) },
-      setDecorations: vi.fn(),
+      setDecorations: vi.fn()
+        .mockImplementationOnce(() => undefined)
+        .mockImplementationOnce(() => { throw cleanupFailure; }),
     };
     const secondEditor = {
       viewColumn: 2,
       document: { lineCount: 1, uri: fakeUri(key) },
-      setDecorations: vi.fn(),
+      setDecorations: vi.fn()
+        .mockImplementationOnce(() => { throw primaryFailure; })
+        .mockImplementationOnce(() => undefined),
     };
-    const createInset = vi.fn()
-      .mockReturnValueOnce({
-        dispose: vi.fn(() => { throw cleanupFailure; }),
-        webview: { html: '' },
-      })
-      .mockImplementationOnce(() => { throw primaryFailure; });
-    const warning = vi.fn().mockResolvedValue(undefined);
     const api = {
       window: {
         visibleTextEditors: [firstEditor, secondEditor],
@@ -388,10 +386,8 @@ describe('inline renderer helpers', () => {
           ],
         },
         createTextEditorDecorationType: () => ({ dispose: vi.fn() }),
-        createWebviewTextEditorInset: createInset,
-        showWarningMessage: warning,
       },
-      Range: class {},
+      Range: FakeRange,
       ThemeColor: class {},
       DecorationRangeBehavior: { ClosedClosed: 0 },
       OverviewRulerLane: { Full: 7 },
@@ -400,17 +396,20 @@ describe('inline renderer helpers', () => {
     const output = { appendLine: vi.fn() };
     const renderer = new InlineRenderer(api as never, output);
 
-    await expect(renderer.render(key, [hunk()])).resolves.toBeUndefined();
+    await expect(renderer.render(key, [hunk({
+      kind: 'addition',
+      modifiedEnd: 1,
+      modifiedLines: ['new'],
+    })])).resolves.toBeUndefined();
 
     expect(firstEditor.setDecorations).toHaveBeenCalledTimes(2);
     expect(secondEditor.setDecorations).toHaveBeenCalledTimes(2);
-    expect(warning).toHaveBeenCalledOnce();
     expect(renderedStatus(renderer, key)).toBe(false);
     expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(primaryFailure.message));
     expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(cleanupFailure.message));
   });
 
-  it('warns once when applying decorations fails and cleanup also throws', async () => {
+  it('logs both the primary decoration failure and its cleanup failure', async () => {
     const key = 'file:///decoration-failure.ts';
     const primaryFailure = new Error('decoration apply failed');
     const cleanupFailure = new Error('decoration clear failed');
@@ -421,16 +420,13 @@ describe('inline renderer helpers', () => {
         .mockImplementationOnce(() => { throw primaryFailure; })
         .mockImplementationOnce(() => { throw cleanupFailure; }),
     };
-    const warning = vi.fn().mockResolvedValue(undefined);
     const api = {
       window: {
         visibleTextEditors: [editor],
         tabGroups: { all: [tabGroup(1, new FakeTabInputText(fakeUri(key)))] },
         createTextEditorDecorationType: () => ({ dispose: vi.fn() }),
-        createWebviewTextEditorInset: vi.fn(),
-        showWarningMessage: warning,
       },
-      Range: class {},
+      Range: FakeRange,
       ThemeColor: class {},
       DecorationRangeBehavior: { ClosedClosed: 0 },
       OverviewRulerLane: { Full: 7 },
@@ -442,34 +438,47 @@ describe('inline renderer helpers', () => {
     await expect(renderer.render(key, [hunk()])).resolves.toBeUndefined();
 
     expect(editor.setDecorations).toHaveBeenCalledTimes(2);
-    expect(warning).toHaveBeenCalledOnce();
     expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(primaryFailure.message));
     expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(cleanupFailure.message));
   });
 
-  it('disables and warns during construction when the proposed API is unavailable', () => {
-    const warning = vi.fn().mockResolvedValue(undefined);
-    const session = { renderingDisabled: false, warningShown: false };
+  it('disposes Stable decorations once and ignores renders after disposal', async () => {
+    const key = 'file:///dispose.ts';
+    const decorationFailure = new Error('decoration type cleanup failed');
+    const decorationType = { dispose: vi.fn(() => { throw decorationFailure; }) };
+    const editor = {
+      viewColumn: 1,
+      document: { lineCount: 1, uri: fakeUri(key) },
+      setDecorations: vi.fn(),
+    };
     const api = {
       window: {
-        visibleTextEditors: [],
-        tabGroups: { all: [] },
-        createTextEditorDecorationType: () => ({ dispose: vi.fn() }),
-        showWarningMessage: warning,
+        visibleTextEditors: [editor],
+        tabGroups: { all: [tabGroup(1, new FakeTabInputText(fakeUri(key)))] },
+        createTextEditorDecorationType: () => decorationType,
       },
-      Range: class {},
+      Range: FakeRange,
       ThemeColor: class {},
       DecorationRangeBehavior: { ClosedClosed: 0 },
       OverviewRulerLane: { Full: 7 },
       TabInputText: FakeTabInputText,
     };
     const output = { appendLine: vi.fn() };
+    const renderer = new InlineRenderer(api as never, output);
 
-    new InlineRenderer(api as never, output, undefined, session);
-    new InlineRenderer(api as never, output, undefined, session);
+    await renderer.render(key, [hunk({
+      kind: 'addition',
+      modifiedEnd: 1,
+      modifiedLines: ['new'],
+    })]);
+    renderer.dispose();
+    renderer.dispose();
+    await renderer.render(key, [hunk()]);
 
-    expect(warning).toHaveBeenCalledOnce();
-    expect(output.appendLine).toHaveBeenCalledOnce();
-    expect(session).toEqual({ renderingDisabled: true, warningShown: true });
+    expect(editor.setDecorations).toHaveBeenCalledTimes(2);
+    expect(editor.setDecorations).toHaveBeenLastCalledWith(decorationType, []);
+    expect(decorationType.dispose).toHaveBeenCalledOnce();
+    expect(renderedStatus(renderer, key)).toBe(false);
+    expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining(decorationFailure.message));
   });
 });

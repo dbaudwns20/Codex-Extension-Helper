@@ -11,16 +11,18 @@ endorsed by, or sponsored by OpenAI.
 - A single deletion shows its original text; multiple deletions show a compact `N deleted lines` summary.
 - Added or replacement lines in the current document are highlighted in green and remain fully editable.
 - VS Code Quick Diff gutter markers provide the native inline diff peek for complete deletion blocks.
+- Each change has **Approve** and **Reject** CodeLens actions. The source already contains the external writer's latest text: Approve keeps that text and advances the comparison baseline without saving, while Reject edits the document back to the latest baseline and leaves that edit unsaved.
+- The active editor's title bar shows previous/next change arrows plus **Approve All** and **Reject All** while that file has pending changes. Previous and next wrap from the first change to the last and from the last change to the first.
+- Rejecting the single change in a newly created file—or choosing **Reject All**—moves the entire file to the operating system trash.
 - Run **Codex Changes: Open Full Diff** from the Command Palette for a full comparison.
-- Saving accepts the current document as the new baseline and immediately clears both kinds of comparison UI.
+- Saving accepts the current document as the new baseline and immediately clears its comparison UI and title actions.
 - A previously snapshotted background file keeps its pending comparison and renders it when opened.
 
-The deletion rows are visual history only. They are never inserted into the document, and the extension never edits, reverts, or saves a file for you.
+Deletion rows are visual history only and are never inserted into the document. Approve never saves; Reject applies an ordinary unsaved editor change so it can be reviewed before you save it.
 
 ## Requirements
 
 - VS Code 1.105 or newer.
-- No proposed API flag or Insiders build is required.
 
 ## Build, package, and install
 
@@ -29,7 +31,8 @@ From the repository root:
 ```bash
 npm ci
 npm run package
-code --install-extension ./codex-extension-helper-0.0.1.vsix --force
+mv codex-extension-helper-0.0.1.vsix codex-extension-helper-0.0.1-stable.vsix
+code --install-extension ./codex-extension-helper-0.0.1-stable.vsix --force
 ```
 
 ## Develop in VS Code Stable
@@ -82,15 +85,14 @@ software remains subject to the licenses and notices in the included
 
 ## Limitations
 
-- There are no Accept or Reject controls. The current document already contains the external writer's latest content; saving simply clears the visual comparison and establishes the next baseline.
 - Comparison state is memory-only and does not persist across VS Code restarts.
 - The extension cannot distinguish Codex from formatters, scripts, generators, Git operations, or other external writers.
-- Stable VS Code cannot render custom red editor insets, so deletion rows use the editor's CodeLens styling and open native diff when clicked.
-- `editor.codeLens` must remain enabled for deletion rows to be visible.
+- Deleted content uses CodeLens summaries and VS Code's native Quick Diff/full-diff views; added and replacement content uses Stable editor decorations.
+- `editor.codeLens` must remain enabled for all per-change Approve/Reject actions and deletion summaries to be visible.
 - Diff editors, custom editors, binary or undecodable files, oversized files, excluded paths, and non-file documents do not render inline comparisons.
 
 ## Troubleshooting
 
 Open **View → Output**, then choose **Codex Extension Helper** from the channel picker. File-read, eligibility, diff, and rendering failures are reported there and never cause the extension to modify the affected document.
 
-If no UI appears, confirm that the setting is enabled and the file had an observed baseline before the external write. Use the gutter change marker for native Quick Diff or run **Codex Changes: Open Full Diff** from the Command Palette.
+If no UI appears, confirm that the setting is enabled and the file had an observed baseline before the external write. Review actions apply only to the active file. Use the gutter change marker for native Quick Diff or run **Codex Changes: Open Full Diff** from the Command Palette.

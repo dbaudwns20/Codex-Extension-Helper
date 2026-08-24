@@ -13,6 +13,8 @@ describe('LineDiffEngine', () => {
       modifiedEnd: 2,
       originalLines: [],
       modifiedLines: ['b'],
+      originalEofTerminator: '\n',
+      modifiedEofTerminator: '\n',
     }]);
   });
 
@@ -25,6 +27,8 @@ describe('LineDiffEngine', () => {
       modifiedEnd: 1,
       originalLines: ['b'],
       modifiedLines: [],
+      originalEofTerminator: '\n',
+      modifiedEofTerminator: '\n',
     }]);
   });
 
@@ -61,6 +65,8 @@ describe('LineDiffEngine', () => {
       modifiedEnd: 1,
       originalLines: ['last'],
       modifiedLines: [],
+      originalEofTerminator: '\n',
+      modifiedEofTerminator: '\n',
     }]);
   });
 
@@ -73,6 +79,8 @@ describe('LineDiffEngine', () => {
       modifiedEnd: 1,
       originalLines: [],
       modifiedLines: ['only'],
+      originalEofTerminator: '',
+      modifiedEofTerminator: '\n',
     }]);
   });
 
@@ -85,7 +93,28 @@ describe('LineDiffEngine', () => {
       modifiedEnd: 2,
       originalLines: ['b'],
       modifiedLines: ['b'],
+      originalEofTerminator: '\n',
+      modifiedEofTerminator: '',
     }]);
+  });
+
+  it('preserves each side EOF terminator on a generated EOF hunk', () => {
+    const cases = [
+      { original: '', modified: 'x\r\n', originalEofTerminator: '', modifiedEofTerminator: '\r\n' },
+      { original: 'x\r\n', modified: '', originalEofTerminator: '\r\n', modifiedEofTerminator: '' },
+      { original: 'old\r\n', modified: 'new', originalEofTerminator: '\r\n', modifiedEofTerminator: '' },
+      { original: 'old', modified: 'new\n', originalEofTerminator: '', modifiedEofTerminator: '\n' },
+    ];
+
+    for (const testCase of cases) {
+      const hunks = engine.compute(testCase.original, testCase.modified);
+
+      expect(hunks).toHaveLength(1);
+      expect(hunks[0]).toMatchObject({
+        originalEofTerminator: testCase.originalEofTerminator,
+        modifiedEofTerminator: testCase.modifiedEofTerminator,
+      });
+    }
   });
 
   it('returns no hunks for unchanged input', () => {

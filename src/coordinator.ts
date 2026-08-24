@@ -1,6 +1,7 @@
 import { PerKeyDebouncer } from './changePolicy';
+import { applyApprovedHunk } from './reviewText';
 import { SnapshotStore } from './snapshotStore';
-import type { ChangeHunk } from './types';
+import type { ChangeHunk, FileComparisonState, HunkReference } from './types';
 
 interface CoordinatorDiffEngine {
   compute(
@@ -43,6 +44,7 @@ export class ComparisonCoordinator {
       sourceRevision: this.nextRevision(key),
       comparisonActive: false,
       pending: false,
+      createdFile: false,
     });
   }
 
@@ -72,7 +74,16 @@ export class ComparisonCoordinator {
       return;
     }
 
-    this.seed(key, '');
+    this.debouncer.cancel(key);
+    this.snapshots.setComparison(key, {
+      baselineText: '',
+      currentText: '',
+      hunks: [],
+      sourceRevision: this.nextRevision(key),
+      comparisonActive: false,
+      pending: false,
+      createdFile: true,
+    });
     await this.compare(key, text, isCurrent);
   }
 
@@ -115,8 +126,120 @@ export class ComparisonCoordinator {
       sourceRevision: this.nextRevision(key),
       comparisonActive: false,
       pending: false,
+      createdFile: false,
     });
     this.view.clear(key);
+  }
+
+  state(key: string): FileComparisonState | undefined {
+    return this.snapshots.get(key);
+  }
+
+  resolveHunk(reference: HunkReference):
+    | { status: 'ok'; state: FileComparisonState; hunk: ChangeHunk }
+    | { status: 'missing' | 'stale' } {
+    const state = this.snapshots.get(reference.key);
+    if (state === undefined) {
+      return { status: 'missing' };
+    }
+
+    if (
+      state.sourceRevision !== reference.sourceRevision
+      || state.currentText !== reference.expectedText
+      || reference.hunkIndex < 0
+      || reference.hunkIndex >= state.hunks.length
+    ) {
+      return { status: 'stale' };
+    }
+
+    return { status: 'ok', state, hunk: state.hunks[reference.hunkIndex] };
+  }
+
+  async approveHunk(reference: HunkReference): Promise<'approved' | 'missing' | 'stale'> {
+    const resolved = this.resolveHunk(reference);
+    if (resolved.status !== 'ok') {
+      return resolved.status;
+    }
+
+    const baselineText = applyApprovedHunk(resolved.state.baselineText, resolved.hunk);
+    const sourceRevision = this.nextRevision(reference.key);
+    const currentText = resolved.state.currentText;
+    this.snapshots.setComparison(reference.key, {
+      ...resolved.state,
+      baselineText,
+      hunks: [],
+      sourceRevision,
+      pending: true,
+      createdFile: resolved.state.createdFile,
+    });
+
+    const hunks = await this.diffEngine.compute(baselineText, currentText);
+    const current = this.snapshots.get(reference.key);
+    if (
+      this.disposed
+      || current?.sourceRevision !== sourceRevision
+      || current.baselineText !== baselineText
+      || current.currentText !== currentText
+    ) {
+      return 'stale';
+    }
+
+    if (hunks.length === 0) {
+      this.snapshots.setComparison(reference.key, {
+        baselineText: currentText,
+        currentText,
+        hunks: [],
+        sourceRevision,
+        comparisonActive: false,
+        pending: false,
+        createdFile: false,
+      });
+      this.view.clear(reference.key);
+      return 'approved';
+    }
+
+    this.snapshots.setComparison(reference.key, {
+      ...current,
+      hunks,
+      comparisonActive: true,
+      pending: true,
+      createdFile: resolved.state.createdFile,
+    });
+    await this.view.render(reference.key, hunks);
+    const rendered = this.snapshots.get(reference.key);
+    if (
+      this.disposed
+      || rendered?.sourceRevision !== sourceRevision
+      || rendered.baselineText !== baselineText
+      || rendered.currentText !== currentText
+      || rendered.hunks !== hunks
+    ) {
+      await this.synchronizeView(reference.key);
+      return 'stale';
+    }
+    return 'approved';
+  }
+
+  approveAll(key: string, expectedText: string): 'approved' | 'missing' | 'stale' {
+    const state = this.snapshots.get(key);
+    if (state === undefined) {
+      return 'missing';
+    }
+    if (state.currentText !== expectedText) {
+      return 'stale';
+    }
+
+    this.snapshots.setComparison(key, {
+      baselineText: expectedText,
+      currentText: expectedText,
+      hunks: [],
+      sourceRevision: this.nextRevision(key),
+      comparisonActive: false,
+      pending: false,
+      createdFile: false,
+    });
+    this.view.clear(key);
+    return 'approved';
   }
 
   delete(key: string): void {
@@ -209,6 +332,7 @@ export class ComparisonCoordinator {
       hunks,
       comparisonActive,
       pending: hunks.length > 0,
+      createdFile: hunks.length > 0 ? current.createdFile : false,
     });
     if (hunks.length === 0) {
       this.view.clear(key);
@@ -216,6 +340,28 @@ export class ComparisonCoordinator {
     }
 
     await this.view.render(key, hunks);
+  }
+
+  private async synchronizeView(key: string): Promise<void> {
+    while (!this.disposed) {
+      const state = this.snapshots.get(key);
+      if (state === undefined || state.hunks.length === 0) {
+        this.view.clear(key);
+        return;
+      }
+
+      const { baselineText, currentText, hunks, sourceRevision } = state;
+      await this.view.render(key, hunks);
+      const current = this.snapshots.get(key);
+      if (
+        current?.sourceRevision === sourceRevision
+        && current.baselineText === baselineText
+        && current.currentText === currentText
+        && current.hunks === hunks
+      ) {
+        return;
+      }
+    }
   }
 
   private nextRevision(key: string): number {

@@ -1,13 +1,6 @@
-import type { ChangeHunk } from './types';
+import type { FileComparisonState } from './types';
 
-export interface FileComparisonState {
-  baselineText: string;
-  currentText: string;
-  hunks: readonly ChangeHunk[];
-  sourceRevision: number;
-  comparisonActive: boolean;
-  pending: boolean;
-}
+export type { FileComparisonState } from './types';
 
 export class SnapshotStore {
   private readonly states = new Map<string, FileComparisonState>();
@@ -45,6 +38,7 @@ export class SnapshotStore {
       sourceRevision,
       comparisonActive: false,
       pending: false,
+      createdFile: false,
     };
   }
 }

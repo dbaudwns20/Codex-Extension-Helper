@@ -1,5 +1,5 @@
 import { diffLines } from 'diff';
-import { ChangeHunk, DiffEngine } from './types';
+import { ChangeHunk, DiffEngine, type EofTerminator } from './types';
 
 function normalizeLineEndings(text: string): string {
   return text.replace(/\r\n/g, '\n');
@@ -14,13 +14,26 @@ function toLines(value: string): readonly string[] {
   return content.split('\n');
 }
 
+function eofTerminator(text: string): EofTerminator {
+  if (text.endsWith('\r\n')) {
+    return '\r\n';
+  }
+  return text.endsWith('\n') ? '\n' : '';
+}
+
 export class LineDiffEngine implements DiffEngine {
   compute(original: string, modified: string): readonly ChangeHunk[] {
+    const normalizedOriginal = normalizeLineEndings(original);
+    const normalizedModified = normalizeLineEndings(modified);
     const changes = diffLines(
-      normalizeLineEndings(original),
-      normalizeLineEndings(modified),
+      normalizedOriginal,
+      normalizedModified,
       { newlineIsToken: false, ignoreNewlineAtEof: false },
     );
+    const originalLineCount = toLines(normalizedOriginal).length;
+    const modifiedLineCount = toLines(normalizedModified).length;
+    const originalEofTerminator = eofTerminator(original);
+    const modifiedEofTerminator = eofTerminator(modified);
     const hunks: ChangeHunk[] = [];
     let originalLine = 0;
     let modifiedLine = 0;
@@ -32,7 +45,7 @@ export class LineDiffEngine implements DiffEngine {
       if (change.removed && changes[index + 1]?.added) {
         const addedChange = changes[index + 1];
         const modifiedLines = toLines(addedChange.value);
-        hunks.push({
+        const hunk: ChangeHunk = {
           kind: 'modification',
           originalStart: originalLine,
           originalEnd: originalLine + originalLines.length,
@@ -40,7 +53,14 @@ export class LineDiffEngine implements DiffEngine {
           modifiedEnd: modifiedLine + modifiedLines.length,
           originalLines,
           modifiedLines,
-        });
+        };
+        hunks.push(this.withEofTerminators(
+          hunk,
+          originalLineCount,
+          modifiedLineCount,
+          originalEofTerminator,
+          modifiedEofTerminator,
+        ));
         originalLine += originalLines.length;
         modifiedLine += modifiedLines.length;
         index += 1;
@@ -48,7 +68,7 @@ export class LineDiffEngine implements DiffEngine {
       }
 
       if (change.removed) {
-        hunks.push({
+        const hunk: ChangeHunk = {
           kind: 'deletion',
           originalStart: originalLine,
           originalEnd: originalLine + originalLines.length,
@@ -56,13 +76,20 @@ export class LineDiffEngine implements DiffEngine {
           modifiedEnd: modifiedLine,
           originalLines,
           modifiedLines: [],
-        });
+        };
+        hunks.push(this.withEofTerminators(
+          hunk,
+          originalLineCount,
+          modifiedLineCount,
+          originalEofTerminator,
+          modifiedEofTerminator,
+        ));
         originalLine += originalLines.length;
         continue;
       }
 
       if (change.added) {
-        hunks.push({
+        const hunk: ChangeHunk = {
           kind: 'addition',
           originalStart: originalLine,
           originalEnd: originalLine,
@@ -70,7 +97,14 @@ export class LineDiffEngine implements DiffEngine {
           modifiedEnd: modifiedLine + originalLines.length,
           originalLines: [],
           modifiedLines: originalLines,
-        });
+        };
+        hunks.push(this.withEofTerminators(
+          hunk,
+          originalLineCount,
+          modifiedLineCount,
+          originalEofTerminator,
+          modifiedEofTerminator,
+        ));
         modifiedLine += originalLines.length;
         continue;
       }
@@ -80,5 +114,25 @@ export class LineDiffEngine implements DiffEngine {
     }
 
     return hunks;
+  }
+
+  private withEofTerminators(
+    hunk: ChangeHunk,
+    originalLineCount: number,
+    modifiedLineCount: number,
+    originalEofTerminator: EofTerminator,
+    modifiedEofTerminator: EofTerminator,
+  ): ChangeHunk {
+    if (
+      hunk.originalEnd !== originalLineCount
+      || hunk.modifiedEnd !== modifiedLineCount
+    ) {
+      return hunk;
+    }
+    return {
+      ...hunk,
+      originalEofTerminator,
+      modifiedEofTerminator,
+    };
   }
 }

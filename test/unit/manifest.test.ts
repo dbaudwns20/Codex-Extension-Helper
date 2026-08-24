@@ -27,4 +27,60 @@ describe('extension manifest', () => {
     expect(debounce.minimum).toBe(50);
     expect(debounce.maximum).toBe(5000);
   });
+
+  it('contributes every review command alongside the existing full diff command', () => {
+    expect(manifest.contributes.commands.map(({ command }) => command)).toEqual([
+      'codexExtensionHelper.openDiff',
+      'codexExtensionHelper.approveHunk',
+      'codexExtensionHelper.rejectHunk',
+      'codexExtensionHelper.previousChange',
+      'codexExtensionHelper.nextChange',
+      'codexExtensionHelper.approveAll',
+      'codexExtensionHelper.rejectAll',
+    ]);
+  });
+
+  it('shows only active-file navigation and all-change actions in the editor title', () => {
+    expect(manifest.contributes.menus['editor/title']).toEqual([
+      {
+        command: 'codexExtensionHelper.previousChange',
+        when: 'resourceScheme == file && codexExtensionHelper.activeFileHasChanges',
+        group: 'navigation@10',
+      },
+      {
+        command: 'codexExtensionHelper.nextChange',
+        when: 'resourceScheme == file && codexExtensionHelper.activeFileHasChanges',
+        group: 'navigation@11',
+      },
+      {
+        command: 'codexExtensionHelper.approveAll',
+        when: 'resourceScheme == file && codexExtensionHelper.activeFileHasChanges',
+        group: 'navigation@20',
+      },
+      {
+        command: 'codexExtensionHelper.rejectAll',
+        when: 'resourceScheme == file && codexExtensionHelper.activeFileHasChanges',
+        group: 'navigation@21',
+      },
+    ]);
+
+    expect(manifest.contributes.commands).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        command: 'codexExtensionHelper.previousChange',
+        icon: '$(arrow-up)',
+      }),
+      expect.objectContaining({
+        command: 'codexExtensionHelper.nextChange',
+        icon: '$(arrow-down)',
+      }),
+      expect.objectContaining({
+        command: 'codexExtensionHelper.approveAll',
+        icon: '$(check-all)',
+      }),
+      expect.objectContaining({
+        command: 'codexExtensionHelper.rejectAll',
+        icon: '$(discard)',
+      }),
+    ]));
+  });
 });
