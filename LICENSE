@@ -1,7 +1,27 @@
-UNLICENSED
+LIMITED DISTRIBUTION LICENSE
 
 Copyright (c) 2026. All rights reserved.
 
-This source code and its packaged extension are provided for the copyright
-holder's personal use. No permission is granted to copy, modify, distribute,
-sublicense, or sell the software.
+An "Authorized Recipient" is a person or entity to whom the copyright holder
+directly provides this software or its packaged extension.
+
+Subject to the terms below, the copyright holder grants each Authorized
+Recipient a limited, non-exclusive, non-transferable license to install and use
+the packaged extension for the recipient's personal or internal purposes. An
+Authorized Recipient may make copies only as reasonably necessary for
+installation and backup.
+
+No permission is granted to redistribute, publish, sell, sublicense, or modify
+the software, or to reverse engineer the packaged extension, except to the
+extent that such a restriction is prohibited by applicable law. All rights not
+expressly granted are reserved by the copyright holder.
+
+Third-party components included with the software are licensed under their own
+terms. Those terms and required notices are provided in
+THIRD_PARTY_NOTICES.txt and control with respect to those components.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. TO THE MAXIMUM EXTENT
+PERMITTED BY LAW, THE COPYRIGHT HOLDER WILL NOT BE LIABLE FOR ANY CLAIM,
+DAMAGES, OR OTHER LIABILITY ARISING FROM OR RELATED TO THE SOFTWARE OR ITS USE.

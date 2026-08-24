@@ -4,7 +4,7 @@
   "description": "Show external file changes inline in VS Code editors.",
   "version": "0.0.1",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "SEE LICENSE IN LICENSE",
   "publisher": "local",
   "engines": {
     "vscode": "^1.105.0"

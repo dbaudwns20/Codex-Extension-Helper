@@ -8,6 +8,10 @@ describe('extension manifest', () => {
     expect(manifest.activationEvents).toContain('onStartupFinished');
   });
 
+  it('points recipients to the packaged proprietary license', () => {
+    expect(manifest.license).toBe('SEE LICENSE IN LICENSE');
+  });
+
   it('declares the documented defaults', () => {
     const properties = manifest.contributes.configuration.properties;
     expect(properties['codexExtensionHelper.enabled'].default).toBe(true);

@@ -50,5 +50,39 @@ describe('packaged runtime', () => {
         .split(/\r?\n/u)
         .filter((entry) => entry.startsWith('out/src/') && entry.endsWith('.js')),
     ).toEqual(['out/src/extension.js']);
-  });
+  }, 15_000);
+
+  it('packages the recipient license and third-party notices', async () => {
+    const executable = path.resolve(
+      'node_modules',
+      '.bin',
+      process.platform === 'win32' ? 'vsce.cmd' : 'vsce',
+    );
+    const temporaryPath = await mkdtemp(path.join(tmpdir(), 'codex-inline-package-'));
+
+    try {
+      const packageResult = spawnSync(executable, [
+        'package',
+        '--no-dependencies',
+        '--out',
+        path.join(temporaryPath, 'extension.vsix'),
+      ], {
+        cwd: path.resolve('.'),
+        encoding: 'utf8',
+      });
+      const listResult = spawnSync(executable, ['ls', '--no-dependencies'], {
+        cwd: path.resolve('.'),
+        encoding: 'utf8',
+      });
+
+      expect(packageResult.status, packageResult.stderr).toBe(0);
+      expect(listResult.status, listResult.stderr).toBe(0);
+      expect(listResult.stdout.split(/\r?\n/u)).toEqual(expect.arrayContaining([
+        'LICENSE',
+        'THIRD_PARTY_NOTICES.txt',
+      ]));
+    } finally {
+      await rm(temporaryPath, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
