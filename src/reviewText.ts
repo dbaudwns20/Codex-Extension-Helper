@@ -1,4 +1,4 @@
-import type { ChangeHunk } from './types';
+import type { ChangeHunk, EofTerminator } from './types';
 
 export interface TextReplacement {
   readonly startOffset: number;
@@ -136,6 +136,36 @@ function applyHunk(
   };
 }
 
+function replaceEofTerminator(text: string, terminator: EofTerminator): string {
+  const content = text.endsWith('\r\n')
+    ? text.slice(0, -2)
+    : text.endsWith('\n')
+      ? text.slice(0, -1)
+      : text;
+  return content + terminator;
+}
+
+function commonPrefixOffset(first: string, second: string): number {
+  let offset = 0;
+  while (offset < first.length && offset < second.length) {
+    const firstCodePoint = first.codePointAt(offset);
+    if (firstCodePoint !== second.codePointAt(offset)) {
+      break;
+    }
+    offset += firstCodePoint !== undefined && firstCodePoint > 0xFFFF ? 2 : 1;
+  }
+  return offset;
+}
+
+function replacementToTarget(currentText: string, targetText: string): TextReplacement {
+  const startOffset = commonPrefixOffset(currentText, targetText);
+  return {
+    startOffset,
+    endOffset: currentText.length,
+    replacementText: targetText.slice(startOffset),
+  };
+}
+
 export function applyApprovedHunk(
   baselineText: string,
   hunk: ChangeHunk,
@@ -146,19 +176,33 @@ export function applyApprovedHunk(
     hunk.originalEnd,
     hunk.modifiedLines,
   );
-  return baselineText.slice(0, patch.startOffset)
+  const approvedText = baselineText.slice(0, patch.startOffset)
     + patch.replacementText
     + baselineText.slice(patch.endOffset);
+  return hunk.modifiedEofTerminator === undefined
+    ? approvedText
+    : replaceEofTerminator(approvedText, hunk.modifiedEofTerminator);
 }
 
 export function rejectedHunkReplacement(
   currentText: string,
   hunk: ChangeHunk,
 ): TextReplacement {
-  return applyHunk(
+  const patch = applyHunk(
     currentText,
     hunk.modifiedStart,
     hunk.modifiedEnd,
     hunk.originalLines,
+  );
+  if (hunk.originalEofTerminator === undefined) {
+    return patch;
+  }
+
+  const rejectedText = currentText.slice(0, patch.startOffset)
+    + patch.replacementText
+    + currentText.slice(patch.endOffset);
+  return replacementToTarget(
+    currentText,
+    replaceEofTerminator(rejectedText, hunk.originalEofTerminator),
   );
 }

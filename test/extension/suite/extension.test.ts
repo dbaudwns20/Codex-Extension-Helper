@@ -99,6 +99,8 @@ export async function runExtensionSmokeTest(): Promise<void> {
     'reject-all.ts',
     'save.ts',
     'delete.ts',
+    'eof-approve.ts',
+    'eof-reject.ts',
   ];
   const fixtureDocuments = new Map(await Promise.all(fixtureNames.map(async (name) => {
     const uri = vscode.Uri.joinPath(workspaceFolder.uri, name);
@@ -186,6 +188,36 @@ export async function runExtensionSmokeTest(): Promise<void> {
     'Reject All must restore two separated spans from the latest baseline',
   );
   assert.equal(rejectAll.document.isDirty, true, 'Reject All must leave its baseline edit unsaved');
+
+  const eofApprove = await openFixture('eof-approve.ts');
+  await simulateReview(
+    eofApprove,
+    'export const eofApprove = true;',
+    'export const eofApprove = true;\n',
+    'EOF-newline Approve comparison to become active',
+  );
+  await execute(await hunkCommand(eofApprove.document, 'codexExtensionHelper.approveHunk'));
+  await waitForCleared(diagnostics, 'EOF-newline Approve to clear comparison UI and title context');
+  assert.equal(
+    eofApprove.document.getText(),
+    'export const eofApprove = true;\n',
+    'Approve must retain the added final newline exactly',
+  );
+
+  const eofReject = await openFixture('eof-reject.ts');
+  await simulateReview(
+    eofReject,
+    'export const first = 1;\r\nexport const eofReject = true;\r\n',
+    'export const first = 1;\r\nexport const eofReject = false;',
+    'EOF-newline Reject comparison to become active',
+  );
+  await execute(await hunkCommand(eofReject.document, 'codexExtensionHelper.rejectHunk'));
+  assert.equal(
+    eofReject.document.getText(),
+    'export const first = 1;\r\nexport const eofReject = true;\r\n',
+    'Reject must restore changed EOF content and the CRLF terminator exactly',
+  );
+  await waitForCleared(diagnostics, 'EOF-newline Reject to clear comparison UI and title context');
 
   const saved = await openFixture('save.ts');
   await simulateReview(

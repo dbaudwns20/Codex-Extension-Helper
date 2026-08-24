@@ -1,5 +1,5 @@
 import type * as vscode from 'vscode';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ComparisonCoordinator, type ComparisonView } from '../../src/coordinator';
 import { LineDiffEngine } from '../../src/diffEngine';
 import {
@@ -199,6 +199,12 @@ function expectNoHostMutation(host: RecordingHost): void {
   expect(host.deleteCalls).toEqual([]);
 }
 
+function applyReplacement(text: string, replacement: TextReplacement): string {
+  return text.slice(0, replacement.startOffset)
+    + replacement.replacementText
+    + text.slice(replacement.endOffset);
+}
+
 describe('ReviewController approvals', () => {
   it('approves the referenced hunk through coordinator state only', async () => {
     const { changed, controller, coordinator, host, state } = setup();
@@ -321,6 +327,27 @@ describe('ReviewController rejection edits', () => {
       expect(coordinator.state(key)).toEqual(state);
       expect(coordinator.state(key)?.pending).toBe(true);
       expect(changed).toEqual([key]);
+    });
+  }
+
+  const eofCases = [
+    { name: 'a final LF', baselineText: 'x\n', currentText: 'x' },
+    { name: 'no final LF', baselineText: 'x', currentText: 'x\n' },
+    { name: 'changed EOF content and CRLF', baselineText: 'old\r\n', currentText: 'new' },
+    { name: 'changed EOF content without CRLF', baselineText: 'old', currentText: 'new\r\n' },
+  ];
+
+  for (const testCase of eofCases) {
+    it(`restores ${testCase.name} exactly from a real diff hunk`, async () => {
+      const { controller, host, state } = setup(testCase.baselineText, testCase.currentText);
+
+      await controller.rejectHunk(reference(key, state));
+
+      expect(host.replacementCalls).toHaveLength(1);
+      expect(applyReplacement(
+        testCase.currentText,
+        host.replacementCalls[0].replacement,
+      )).toBe(testCase.baselineText);
     });
   }
 
@@ -492,7 +519,7 @@ describe('ReviewController rejection edits', () => {
 
     expect(host.replacementCalls).toHaveLength(1);
     expect(host.replaceAllCalls).toEqual([]);
-    expect(changed).toEqual([key]);
+    expect(changed).toEqual([key, key]);
   });
 
   it('releases the per-key rejection queue after a false or throwing host edit', async () => {
@@ -517,6 +544,88 @@ describe('ReviewController rejection edits', () => {
       expect(host.replacementCalls).toHaveLength(2);
       expect(host.errors).toEqual(['Could not reject Codex changes.']);
     }
+  });
+});
+
+describe('ReviewController mutation serialization', () => {
+  for (const approval of ['hunk', 'all'] as const) {
+    it(`waits for a same-key Reject before ${approval === 'hunk' ? 'Approve Hunk' : 'Approve All'} revalidation`, async () => {
+      const { controller, coordinator, host, state } = setup('', 'one\ntwo\n', { createdFile: true });
+      const firstDelete = deferred<void>();
+      host.deleteResult = firstDelete.promise;
+
+      const rejection = controller.rejectAll();
+      expect(host.deleteCalls).toHaveLength(1);
+      const approvalRun = approval === 'hunk'
+        ? controller.approveHunk(reference(key, state))
+        : controller.approveAll();
+      await Promise.resolve();
+
+      expect(coordinator.state(key)).toEqual(state);
+      firstDelete.resolve();
+      await Promise.all([rejection, approvalRun]);
+
+      expect(coordinator.state(key)).toBeUndefined();
+      expect(host.deleteCalls).toHaveLength(1);
+    });
+  }
+
+  for (const rejection of ['hunk', 'all'] as const) {
+    it(`waits for a same-key Approve Hunk before ${rejection === 'hunk' ? 'Reject Hunk' : 'Reject All'} revalidation`, async () => {
+      const { controller, coordinator, host, state } = setup();
+      const approvalGate = deferred<void>();
+      const approveHunk = coordinator.approveHunk.bind(coordinator);
+      vi.spyOn(coordinator, 'approveHunk').mockImplementation(async (hunkReference) => {
+        await approvalGate.promise;
+        return approveHunk(hunkReference);
+      });
+
+      const approvalRun = controller.approveHunk(reference(key, state));
+      await Promise.resolve();
+      const rejectionRun = rejection === 'hunk'
+        ? controller.rejectHunk(reference(key, state))
+        : controller.rejectAll();
+      await Promise.resolve();
+
+      expectNoHostMutation(host);
+      approvalGate.resolve();
+      await Promise.all([approvalRun, rejectionRun]);
+
+      expect(coordinator.state(key)?.pending).toBe(false);
+      expectNoHostMutation(host);
+    });
+  }
+
+  it('keeps different file keys independent while one mutation is deferred', async () => {
+    const otherKey = 'file:///workspace/other.ts';
+    const { controller, coordinator, host, state, store } = setup('', 'created\n', { createdFile: true });
+    const otherState = installState(store, otherKey, 'before', 'after');
+    const firstDelete = deferred<void>();
+    host.deleteResult = firstDelete.promise;
+
+    const first = controller.rejectAll(fakeUri(key));
+    expect(host.deleteCalls).toHaveLength(1);
+    host.document = liveDocument(otherKey, otherState.currentText);
+    await controller.approveAll(fakeUri(otherKey));
+
+    expect(coordinator.state(key)).toEqual(state);
+    expect(coordinator.state(otherKey)?.pending).toBe(false);
+    firstDelete.resolve();
+    await first;
+    expect(coordinator.state(key)).toBeUndefined();
+  });
+
+  it('runs the next same-key mutation after an approval throws', async () => {
+    const { controller, coordinator, host, state } = setup();
+    const failure = new Error('approval failed');
+    vi.spyOn(coordinator, 'approveHunk').mockRejectedValueOnce(failure);
+
+    const approval = controller.approveHunk(reference(key, state));
+    const rejection = controller.rejectHunk(reference(key, state));
+
+    await expect(approval).rejects.toBe(failure);
+    await rejection;
+    expect(host.replacementCalls).toHaveLength(1);
   });
 });
 

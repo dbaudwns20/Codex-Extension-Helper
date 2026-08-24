@@ -10,7 +10,7 @@ Codex Extension Helper is a personal VS Code Stable extension that shows qualify
 - VS Code Quick Diff gutter markers provide the native inline diff peek for complete deletion blocks.
 - Each change has **Approve** and **Reject** CodeLens actions. The source already contains the external writer's latest text: Approve keeps that text and advances the comparison baseline without saving, while Reject edits the document back to the latest baseline and leaves that edit unsaved.
 - The active editor's title bar shows previous/next change arrows plus **Approve All** and **Reject All** while that file has pending changes. Previous and next wrap from the first change to the last and from the last change to the first.
-- Rejecting all changes in a newly created file moves the file to the operating system trash.
+- Rejecting the single change in a newly created file—or choosing **Reject All**—moves the entire file to the operating system trash.
 - Run **Codex Changes: Open Full Diff** from the Command Palette for a full comparison.
 - Saving accepts the current document as the new baseline and immediately clears its comparison UI and title actions.
 - A previously snapshotted background file keeps its pending comparison and renders it when opened.
@@ -66,7 +66,7 @@ Only `file` documents with decodable, non-binary content, a valid pre-change sna
 - Comparison state is memory-only and does not persist across VS Code restarts.
 - The extension cannot distinguish Codex from formatters, scripts, generators, Git operations, or other external writers.
 - Deleted content uses CodeLens summaries and VS Code's native Quick Diff/full-diff views; added and replacement content uses Stable editor decorations.
-- `editor.codeLens` must remain enabled for deletion rows to be visible.
+- `editor.codeLens` must remain enabled for all per-change Approve/Reject actions and deletion summaries to be visible.
 - Diff editors, custom editors, binary or undecodable files, oversized files, excluded paths, and non-file documents do not render inline comparisons.
 
 ## Troubleshooting

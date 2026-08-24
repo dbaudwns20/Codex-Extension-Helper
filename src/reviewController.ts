@@ -43,7 +43,7 @@ const REJECT_SCOPE = 'Reject Codex changes';
 const SYNCHRONIZE_SCOPE = 'Synchronize Codex review state';
 
 export class ReviewController implements vscode.Disposable {
-  private readonly rejectionTails = new Map<string, Promise<void>>();
+  private readonly mutationTails = new Map<string, Promise<void>>();
   private disposed = false;
 
   constructor(
@@ -53,27 +53,28 @@ export class ReviewController implements vscode.Disposable {
   ) {}
 
   async approveHunk(reference: HunkReference): Promise<void> {
-    const initial = this.resolveHunkAction(reference);
-    if (initial === undefined) {
-      return;
-    }
+    await this.serializeMutation(reference.key, async () => {
+      const initial = this.resolveHunkAction(reference);
+      if (initial === undefined) {
+        return;
+      }
 
-    const current = this.resolveHunkAction(reference, initial.document.version);
-    if (current === undefined) {
-      return;
-    }
+      const current = this.resolveHunkAction(reference, initial.document.version);
+      if (current === undefined) {
+        return;
+      }
 
-    await this.coordinator.approveHunk(reference);
-    this.synchronize(reference.key);
+      await this.coordinator.approveHunk(reference);
+      this.synchronize(reference.key);
+    });
   }
 
   async rejectHunk(reference: HunkReference): Promise<void> {
-    const initial = this.resolveHunkAction(reference);
-    if (initial === undefined) {
-      return;
-    }
-
-    await this.serializeRejection(reference.key, async () => {
+    await this.serializeMutation(reference.key, async () => {
+      const initial = this.resolveHunkAction(reference);
+      if (initial === undefined) {
+        return;
+      }
       const current = this.resolveHunkAction(reference, initial.document.version);
       if (current === undefined) {
         return;
@@ -104,37 +105,56 @@ export class ReviewController implements vscode.Disposable {
   }
 
   async approveAll(uri?: vscode.Uri): Promise<void> {
-    const initial = this.resolveActiveState(uri);
-    if (initial === undefined) {
+    const key = this.mutationKey(uri);
+    if (key === undefined) {
       return;
     }
 
-    const current = this.resolveActiveState(
-      uri,
-      initial.document.version,
-      initial.state.sourceRevision,
-    );
-    if (current === undefined) {
-      return;
-    }
+    await this.serializeMutation(key, async () => {
+      const initial = this.resolveActiveState(uri);
+      if (initial === undefined) {
+        return;
+      }
+      if (initial.document.key !== key) {
+        this.synchronize(key);
+        return;
+      }
 
-    this.coordinator.approveAll(current.document.key, current.document.text);
-    this.synchronize(current.document.key);
-  }
-
-  async rejectAll(uri?: vscode.Uri): Promise<void> {
-    const initial = this.resolveActiveState(uri);
-    if (initial === undefined) {
-      return;
-    }
-
-    await this.serializeRejection(initial.document.key, async () => {
       const current = this.resolveActiveState(
         uri,
         initial.document.version,
         initial.state.sourceRevision,
       );
-      if (current === undefined) {
+      if (current === undefined || current.document.key !== key) {
+        return;
+      }
+
+      this.coordinator.approveAll(current.document.key, current.document.text);
+      this.synchronize(current.document.key);
+    });
+  }
+
+  async rejectAll(uri?: vscode.Uri): Promise<void> {
+    const key = this.mutationKey(uri);
+    if (key === undefined) {
+      return;
+    }
+
+    await this.serializeMutation(key, async () => {
+      const initial = this.resolveActiveState(uri);
+      if (initial === undefined) {
+        return;
+      }
+      if (initial.document.key !== key) {
+        this.synchronize(key);
+        return;
+      }
+      const current = this.resolveActiveState(
+        uri,
+        initial.document.version,
+        initial.state.sourceRevision,
+      );
+      if (current === undefined || current.document.key !== key) {
         return;
       }
 
@@ -174,7 +194,7 @@ export class ReviewController implements vscode.Disposable {
 
   dispose(): void {
     this.disposed = true;
-    this.rejectionTails.clear();
+    this.mutationTails.clear();
   }
 
   private resolveHunkAction(
@@ -285,16 +305,23 @@ export class ReviewController implements vscode.Disposable {
     }
   }
 
-  private async serializeRejection(key: string, operation: () => Promise<void>): Promise<void> {
-    const previous = this.rejectionTails.get(key);
+  private mutationKey(uri?: vscode.Uri): string | undefined {
+    if (this.disposed) {
+      return undefined;
+    }
+    return uri?.toString() ?? this.host.activeDocument()?.key;
+  }
+
+  private async serializeMutation(key: string, operation: () => Promise<void>): Promise<void> {
+    const previous = this.mutationTails.get(key);
     const current = previous === undefined ? operation() : previous.then(operation);
     const settled = current.catch(() => {});
-    this.rejectionTails.set(key, settled);
+    this.mutationTails.set(key, settled);
     try {
       await current;
     } finally {
-      if (this.rejectionTails.get(key) === settled) {
-        this.rejectionTails.delete(key);
+      if (this.mutationTails.get(key) === settled) {
+        this.mutationTails.delete(key);
       }
     }
   }

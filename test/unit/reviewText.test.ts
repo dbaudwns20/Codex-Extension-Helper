@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { LineDiffEngine } from '../../src/diffEngine';
 import { applyApprovedHunk, rejectedHunkReplacement } from '../../src/reviewText';
 import type { ChangeHunk } from '../../src/types';
 
@@ -13,6 +14,12 @@ function hunk(overrides: Partial<ChangeHunk>): ChangeHunk {
     modifiedLines: [],
     ...overrides,
   };
+}
+
+function applyReplacement(text: string, replacement: ReturnType<typeof rejectedHunkReplacement>): string {
+  return text.slice(0, replacement.startOffset)
+    + replacement.replacementText
+    + text.slice(replacement.endOffset);
 }
 
 describe('applyApprovedHunk', () => {
@@ -228,4 +235,33 @@ describe('rejectedHunkReplacement', () => {
       replacementText: 'old\n',
     });
   });
+});
+
+describe('real diff EOF round trips', () => {
+  const engine = new LineDiffEngine();
+  const cases = [
+    { name: 'empty to LF-terminated content', original: '', modified: 'x\n' },
+    { name: 'LF-terminated content to empty', original: 'x\n', modified: '' },
+    { name: 'content gaining a final LF', original: 'x', modified: 'x\n' },
+    { name: 'content losing its final LF', original: 'x\n', modified: 'x' },
+    { name: 'changed EOF content gaining a final LF', original: 'old', modified: 'new\n' },
+    { name: 'changed EOF content losing its final LF', original: 'old\n', modified: 'new' },
+    { name: 'empty to CRLF-terminated content', original: '', modified: 'x\r\n' },
+    { name: 'CRLF-terminated content to empty', original: 'x\r\n', modified: '' },
+    { name: 'changed EOF content gaining a final CRLF', original: 'old', modified: 'new\r\n' },
+    { name: 'changed EOF content losing its final CRLF', original: 'old\r\n', modified: 'new' },
+  ];
+
+  for (const testCase of cases) {
+    it(`approves and rejects ${testCase.name} exactly`, () => {
+      const hunks = engine.compute(testCase.original, testCase.modified);
+
+      expect(hunks).toHaveLength(1);
+      expect(applyApprovedHunk(testCase.original, hunks[0])).toBe(testCase.modified);
+      expect(applyReplacement(
+        testCase.modified,
+        rejectedHunkReplacement(testCase.modified, hunks[0]),
+      )).toBe(testCase.original);
+    });
+  }
 });

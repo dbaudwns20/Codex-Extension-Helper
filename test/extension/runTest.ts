@@ -38,6 +38,8 @@ async function main(): Promise<void> {
       ['reject-all.ts', 'const rejectAll = "red-middle-blue-tail";'],
       ['save.ts', 'const value = 40;'],
       ['delete.ts', 'const value = 50;'],
+      ['eof-approve.ts', 'export const eofApprove = true;'],
+      ['eof-reject.ts', 'export const first = 1;\r\nexport const eofReject = true;\r\n'],
     ].map(([name, text]) => writeFile(path.join(workspacePath, name), text, 'utf8')));
     await runTests({
       vscodeExecutablePath: await stableExecutable(),

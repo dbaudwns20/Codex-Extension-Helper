@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { PerKeyDebouncer } from '../../src/changePolicy';
 import { ComparisonCoordinator, ComparisonView } from '../../src/coordinator';
+import { LineDiffEngine } from '../../src/diffEngine';
 import { SnapshotStore } from '../../src/snapshotStore';
 import type { ChangeHunk, HunkReference } from '../../src/types';
 
@@ -495,6 +496,31 @@ describe('ComparisonCoordinator', () => {
       createdFile: false,
     });
     expect(view.clear).toHaveBeenCalledWith(key);
+  });
+
+  it('clears a generated EOF-newline hunk after one approval and keeps a repeated command stale', async () => {
+    const store = new SnapshotStore();
+    const view = new FakeView();
+    const coordinator = new ComparisonCoordinator(new LineDiffEngine(), store, view);
+    await coordinator.externalCreate(key, 'x\n');
+    const state = store.get(key)!;
+    const hunkReference: HunkReference = {
+      key,
+      sourceRevision: state.sourceRevision,
+      hunkIndex: 0,
+      expectedText: state.currentText,
+    };
+
+    expect(await coordinator.approveHunk(hunkReference)).toBe('approved');
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'x\n',
+      currentText: 'x\n',
+      hunks: [],
+      comparisonActive: false,
+      pending: false,
+      createdFile: false,
+    });
+    expect(await coordinator.approveHunk(hunkReference)).toBe('stale');
   });
 
   it('returns stale when an approval re-diff is superseded before it resolves', async () => {

@@ -1,4 +1,5 @@
 export type ChangeKind = 'addition' | 'deletion' | 'modification';
+export type EofTerminator = '' | '\n' | '\r\n';
 
 export interface ChangeHunk {
   kind: ChangeKind;
@@ -8,6 +9,8 @@ export interface ChangeHunk {
   modifiedEnd: number;
   originalLines: readonly string[];
   modifiedLines: readonly string[];
+  readonly originalEofTerminator?: EofTerminator;
+  readonly modifiedEofTerminator?: EofTerminator;
 }
 
 export interface HunkReference {
