@@ -20,8 +20,12 @@ interface CodeLensApi {
   readonly CodeLens: typeof vscode.CodeLens;
 }
 
+type StoredCodeLensState =
+  | { readonly mode: 'review'; readonly state: ReviewCodeLensState }
+  | { readonly mode: 'legacy'; readonly key: string; readonly hunks: readonly ChangeHunk[] };
+
 export class DeletedLinesCodeLensProvider implements vscode.CodeLensProvider, vscode.Disposable {
-  private readonly statesByKey = new Map<string, ReviewCodeLensState>();
+  private readonly statesByKey = new Map<string, StoredCodeLensState>();
   private readonly changeEmitter: vscode.EventEmitter<void>;
   private readonly registration: vscode.Disposable;
   readonly onDidChangeCodeLenses: vscode.Event<void>;
@@ -39,13 +43,15 @@ export class DeletedLinesCodeLensProvider implements vscode.CodeLensProvider, vs
   /** Compatibility overload for callers that have not yet supplied review metadata. */
   update(key: string, hunks: readonly ChangeHunk[]): void;
   update(stateOrKey: ReviewCodeLensState | string, legacyHunks?: readonly ChangeHunk[]): void {
-    const state = typeof stateOrKey === 'string'
-      ? { key: stateOrKey, sourceRevision: 0, currentText: '', hunks: legacyHunks ?? [] }
-      : stateOrKey;
-    if (state.hunks.length === 0) {
-      this.statesByKey.delete(state.key);
+    const stored = typeof stateOrKey === 'string'
+      ? { mode: 'legacy' as const, key: stateOrKey, hunks: legacyHunks ?? [] }
+      : { mode: 'review' as const, state: stateOrKey };
+    const key = stored.mode === 'legacy' ? stored.key : stored.state.key;
+    const hunks = stored.mode === 'legacy' ? stored.hunks : stored.state.hunks;
+    if (hunks.length === 0) {
+      this.statesByKey.delete(key);
     } else {
-      this.statesByKey.set(state.key, state);
+      this.statesByKey.set(key, stored);
     }
     this.changeEmitter.fire();
   }
@@ -64,12 +70,28 @@ export class DeletedLinesCodeLensProvider implements vscode.CodeLensProvider, vs
   }
 
   provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
-    const state = this.statesByKey.get(this.uriKey(document.uri));
-    if (state === undefined) {
+    const stored = this.statesByKey.get(this.uriKey(document.uri));
+    if (stored === undefined) {
       return [];
     }
 
     const finalLine = Math.max(0, document.lineCount - 1);
+    if (stored.mode === 'legacy') {
+      return stored.hunks.flatMap((hunk) => {
+        if (hunk.originalLines.length === 0) {
+          return [];
+        }
+        const line = Math.min(Math.max(0, hunk.modifiedStart), finalLine);
+        const range = new this.api.Range(line, 0, line, 0);
+        return [new this.api.CodeLens(range, {
+          title: this.title(hunk.originalLines),
+          command: OPEN_DIFF_COMMAND,
+          tooltip: this.tooltip(hunk.originalLines),
+        })];
+      });
+    }
+
+    const { state } = stored;
     return state.hunks.flatMap((hunk, hunkIndex) => {
       const line = Math.min(Math.max(0, hunk.modifiedStart), finalLine);
       const range = new this.api.Range(line, 0, line, 0);

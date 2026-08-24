@@ -189,6 +189,42 @@ describe('DeletedLinesCodeLensProvider', () => {
     expect(summary.command?.arguments).toBeUndefined();
   });
 
+  it('keeps legacy updates summary-only and does not show legacy additions', () => {
+    const { provider } = createProvider();
+    provider.update(key, [
+      hunk({ originalLines: ['old'], modifiedStart: 2 }),
+      hunk({ modifiedStart: 3 }),
+    ]);
+
+    const lenses = provide(provider);
+
+    expect(lenses.map((lens) => lens.command?.command)).toEqual([
+      'codexExtensionHelper.openDiff',
+    ]);
+    expect(lenses[0].command?.arguments).toBeUndefined();
+
+    provider.update(key, [hunk({ modifiedLines: ['only addition'] })]);
+    expect(provide(provider)).toEqual([]);
+  });
+
+  it('clamps negative modified starts to the first document line', () => {
+    const { provider } = createProvider();
+    provider.update(state({ hunks: [hunk({ modifiedStart: -4, originalLines: ['old'] })] }));
+
+    const [summary] = provide(provider, 5);
+
+    expect(summary.range).toEqual(new FakeRange(0, 0, 0, 0));
+  });
+
+  it('clamps past-end modified starts to the final document line', () => {
+    const { provider } = createProvider();
+    provider.update(state({ hunks: [hunk({ modifiedStart: 99, originalLines: ['old'] })] }));
+
+    const [summary] = provide(provider, 5);
+
+    expect(summary.range).toEqual(new FakeRange(4, 0, 4, 0));
+  });
+
   it('clears lenses and disposes its resources', () => {
     const { provider, emitter, registration } = createProvider();
     provider.update(state({ hunks: [hunk({})] }));
