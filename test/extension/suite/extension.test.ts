@@ -146,14 +146,18 @@ export async function runExtensionSmokeTest(): Promise<void> {
   const reject = await openFixture('reject.ts');
   await simulateReview(
     reject,
-    'const value = 10;',
-    'const value = 11;',
+    'const reject = "alpha-one-omega-two-end";',
+    'const reject = "ALPHA-one-omega-TWO-end";',
     'Reject comparison to be stored, rendered, and active',
   );
 
   await execute(await hunkCommand(reject.document, 'codexExtensionHelper.rejectHunk'));
   await waitForCleared(diagnostics, 'Reject to clear comparison UI and title context');
-  assert.equal(reject.document.getText(), 'const value = 10;', 'Reject must restore the latest baseline');
+  assert.equal(
+    reject.document.getText(),
+    'const reject = "alpha-one-omega-two-end";',
+    'Reject must restore two separated spans from the latest baseline',
+  );
   assert.equal(reject.document.isDirty, true, 'Reject must leave its baseline-restoring edit unsaved');
 
   const approveAll = await openFixture('approve-all.ts');
@@ -170,13 +174,17 @@ export async function runExtensionSmokeTest(): Promise<void> {
   const rejectAll = await openFixture('reject-all.ts');
   await simulateReview(
     rejectAll,
-    'const value = 30;',
-    'const value = 31;',
+    'const rejectAll = "red-middle-blue-tail";',
+    'const rejectAll = "RED-middle-BLUE-tail";',
     'Reject All comparison to become active',
   );
   await vscode.commands.executeCommand('codexExtensionHelper.rejectAll', rejectAll.uri);
   await waitForCleared(diagnostics, 'Reject All to clear comparison UI and title context');
-  assert.equal(rejectAll.document.getText(), 'const value = 30;', 'Reject All must restore the latest baseline');
+  assert.equal(
+    rejectAll.document.getText(),
+    'const rejectAll = "red-middle-blue-tail";',
+    'Reject All must restore two separated spans from the latest baseline',
+  );
   assert.equal(rejectAll.document.isDirty, true, 'Reject All must leave its baseline edit unsaved');
 
   const saved = await openFixture('save.ts');

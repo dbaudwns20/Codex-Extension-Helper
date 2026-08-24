@@ -72,9 +72,7 @@ interface StableReviewHostApi {
 export interface PendingReviewEditExpectation {
   readonly key: string;
   readonly startingVersion: number;
-  readonly rangeOffset: number;
-  readonly rangeLength: number;
-  readonly replacementText: string;
+  readonly originalText: string;
   readonly resultingText: string;
 }
 
@@ -109,15 +107,10 @@ export class PendingReviewEdits {
       return false;
     }
     this.pending.delete(event.key);
-    if (event.contentChanges.length !== 1) {
-      return false;
-    }
-    const [change] = event.contentChanges;
     return event.documentVersion === expectation.startingVersion + 1
       && event.resultingText === expectation.resultingText
-      && change.rangeOffset === expectation.rangeOffset
-      && change.rangeLength === expectation.rangeLength
-      && change.text === expectation.replacementText;
+      && applyContentChanges(expectation.originalText, event.contentChanges)
+        === expectation.resultingText;
   }
 
   clear(): void {
@@ -127,34 +120,42 @@ export class PendingReviewEdits {
 
 type BeginReviewEdit = (expectation: PendingReviewEditExpectation) => () => void;
 
-function canonicalTextChange(
+function applyContentChanges(
   originalText: string,
-  resultingText: string,
-): Pick<PendingReviewEditExpectation, 'rangeOffset' | 'rangeLength' | 'replacementText'> {
-  let prefixLength = 0;
-  const sharedLength = Math.min(originalText.length, resultingText.length);
-  while (
-    prefixLength < sharedLength
-    && originalText[prefixLength] === resultingText[prefixLength]
-  ) {
-    prefixLength += 1;
+  contentChanges: ReviewEditEvent['contentChanges'],
+): string | undefined {
+  if (contentChanges.length === 0) {
+    return undefined;
   }
 
-  let suffixLength = 0;
-  while (
-    suffixLength < originalText.length - prefixLength
-    && suffixLength < resultingText.length - prefixLength
-    && originalText[originalText.length - suffixLength - 1]
-      === resultingText[resultingText.length - suffixLength - 1]
-  ) {
-    suffixLength += 1;
+  const ordered = [...contentChanges].sort((left, right) => (
+    left.rangeOffset - right.rangeOffset
+  ));
+  let previousOffset = -1;
+  let previousEnd = 0;
+  for (const change of ordered) {
+    if (
+      !Number.isSafeInteger(change.rangeOffset)
+      || !Number.isSafeInteger(change.rangeLength)
+      || change.rangeOffset < 0
+      || change.rangeLength < 0
+      || change.rangeOffset + change.rangeLength > originalText.length
+      || change.rangeOffset < previousEnd
+      || change.rangeOffset === previousOffset
+    ) {
+      return undefined;
+    }
+    previousOffset = change.rangeOffset;
+    previousEnd = change.rangeOffset + change.rangeLength;
   }
 
-  return {
-    rangeOffset: prefixLength,
-    rangeLength: originalText.length - prefixLength - suffixLength,
-    replacementText: resultingText.slice(prefixLength, resultingText.length - suffixLength),
-  };
+  let result = originalText;
+  for (const change of ordered.reverse()) {
+    result = result.slice(0, change.rangeOffset)
+      + change.text
+      + result.slice(change.rangeOffset + change.rangeLength);
+  }
+  return result;
 }
 
 type ReviewCommandController = Pick<
@@ -251,7 +252,7 @@ export function createReviewHost(
     const finishReviewEdit = beginReviewEdit({
       key: document.key,
       startingVersion: document.version,
-      ...canonicalTextChange(document.text, resultingText),
+      originalText: document.text,
       resultingText,
     });
     try {

@@ -33,9 +33,9 @@ async function main(): Promise<void> {
     );
     await Promise.all([
       ['approve.ts', 'const value = 1;'],
-      ['reject.ts', 'const value = 10;'],
+      ['reject.ts', 'const reject = "alpha-one-omega-two-end";'],
       ['approve-all.ts', 'const value = 20;'],
-      ['reject-all.ts', 'const value = 30;'],
+      ['reject-all.ts', 'const rejectAll = "red-middle-blue-tail";'],
       ['save.ts', 'const value = 40;'],
       ['delete.ts', 'const value = 50;'],
     ].map(([name, text]) => writeFile(path.join(workspacePath, name), text, 'utf8')));

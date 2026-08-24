@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
+import { diffChars } from 'diff';
 import { describe, expect, it, vi } from 'vitest';
 import { DisposableStore } from '../../src/disposableStore';
 import type { ChangeHunk, FileComparisonState, HunkReference } from '../../src/types';
@@ -97,29 +98,33 @@ function reviewState(overrides: Partial<FileComparisonState> = {}): FileComparis
   };
 }
 
-function canonicalFakeChange(originalText: string, resultingText: string) {
-  let rangeOffset = 0;
-  while (
-    rangeOffset < originalText.length
-    && rangeOffset < resultingText.length
-    && originalText[rangeOffset] === resultingText[rangeOffset]
-  ) {
-    rangeOffset += 1;
-  }
-  let sharedSuffix = 0;
-  while (
-    sharedSuffix < originalText.length - rangeOffset
-    && sharedSuffix < resultingText.length - rangeOffset
-    && originalText[originalText.length - sharedSuffix - 1]
-      === resultingText[resultingText.length - sharedSuffix - 1]
-  ) {
-    sharedSuffix += 1;
-  }
-  return {
-    rangeOffset,
-    rangeLength: originalText.length - rangeOffset - sharedSuffix,
-    text: resultingText.slice(rangeOffset, resultingText.length - sharedSuffix),
+function disjointFakeChanges(originalText: string, resultingText: string) {
+  const changes: Array<{ rangeOffset: number; rangeLength: number; text: string }> = [];
+  let originalOffset = 0;
+  let pending: { rangeOffset: number; rangeLength: number; text: string } | undefined;
+  const flush = () => {
+    if (pending !== undefined) {
+      changes.push(pending);
+      pending = undefined;
+    }
   };
+
+  for (const part of diffChars(originalText, resultingText)) {
+    if (!part.added && !part.removed) {
+      flush();
+      originalOffset += part.value.length;
+      continue;
+    }
+    pending ??= { rangeOffset: originalOffset, rangeLength: 0, text: '' };
+    if (part.removed) {
+      pending.rangeLength += part.value.length;
+      originalOffset += part.value.length;
+    } else {
+      pending.text += part.value;
+    }
+  }
+  flush();
+  return changes;
 }
 
 function installRuntimeVscode(initialText = 'before\n') {
@@ -246,7 +251,7 @@ function installRuntimeVscode(initialText = 'before\n') {
       version += 1;
       callbacks.get('documentChange')?.({
         document,
-        contentChanges: [canonicalFakeChange(originalText, text)],
+        contentChanges: disjointFakeChanges(originalText, text),
       });
       dirty = true;
       return true;
@@ -397,7 +402,7 @@ describe('packaged runtime', () => {
 });
 
 describe('stable review runtime boundaries', () => {
-  it('matches only the exact expected review edit and invalidates a token on any other event', async () => {
+  it('consumes two separated edit spans in either event array order', async () => {
     const module = await import('../../src/extension');
     const PendingReviewEdits = (module as unknown as {
       PendingReviewEdits?: new () => {
@@ -410,36 +415,150 @@ describe('stable review runtime boundaries', () => {
     const expectation = {
       key: 'file:///workspace/file.ts',
       startingVersion: 4,
-      rangeOffset: 2,
-      rangeLength: 6,
-      replacementText: 'old',
-      resultingText: 'beoldfter\n',
+      originalText: 'aa11bb22cc',
+      resultingText: 'aaXXbbYYcc',
     };
     const matchingEvent = {
       key: expectation.key,
       documentVersion: 5,
       resultingText: expectation.resultingText,
-      contentChanges: [{ rangeOffset: 2, rangeLength: 6, text: 'old' }],
+      contentChanges: [
+        { rangeOffset: 2, rangeLength: 2, text: 'XX' },
+        { rangeOffset: 6, rangeLength: 2, text: 'YY' },
+      ],
+    };
+
+    for (const contentChanges of [
+      matchingEvent.contentChanges,
+      [...matchingEvent.contentChanges].reverse(),
+    ]) {
+      const edits = new PendingReviewEdits!();
+      edits.begin(expectation);
+      expect(edits.consume({ ...matchingEvent, contentChanges })).toBe(true);
+    }
+  });
+
+  it('rejects malformed, overlapping, out-of-bounds, incomplete, and unrelated changes', async () => {
+    const module = await import('../../src/extension');
+    const PendingReviewEdits = (module as unknown as {
+      PendingReviewEdits: new () => {
+        begin(expectation: Record<string, unknown>): () => void;
+        consume(event: Record<string, unknown>): boolean;
+      };
+    }).PendingReviewEdits;
+    const expectation = {
+      key: 'file:///workspace/file.ts',
+      startingVersion: 4,
+      originalText: 'aa11bb22cc',
+      resultingText: 'aaXXbbYYcc',
+    };
+    const matchingEvent = {
+      key: expectation.key,
+      documentVersion: 5,
+      resultingText: expectation.resultingText,
+      contentChanges: [
+        { rangeOffset: 2, rangeLength: 2, text: 'XX' },
+        { rangeOffset: 6, rangeLength: 2, text: 'YY' },
+      ],
     };
 
     for (const mismatchedEvent of [
       { ...matchingEvent, documentVersion: 6 },
-      { ...matchingEvent, resultingText: 'external refresh\n' },
-      { ...matchingEvent, contentChanges: [{ rangeOffset: 3, rangeLength: 6, text: 'old' }] },
-      { ...matchingEvent, contentChanges: [{ rangeOffset: 2, rangeLength: 5, text: 'old' }] },
-      { ...matchingEvent, contentChanges: [{ rangeOffset: 2, rangeLength: 6, text: 'external' }] },
+      { ...matchingEvent, resultingText: 'aaXXbbYYcc!' },
       { ...matchingEvent, contentChanges: [] },
+      { ...matchingEvent, contentChanges: [{ rangeOffset: 2, rangeLength: 2, text: 'XX' }] },
+      { ...matchingEvent, contentChanges: [
+        { rangeOffset: 2, rangeLength: 4, text: 'XX' },
+        { rangeOffset: 4, rangeLength: 2, text: 'YY' },
+      ] },
+      { ...matchingEvent, contentChanges: [
+        { rangeOffset: -1, rangeLength: 2, text: 'XX' },
+        { rangeOffset: 6, rangeLength: 2, text: 'YY' },
+      ] },
+      { ...matchingEvent, contentChanges: [
+        { rangeOffset: 2.5, rangeLength: 2, text: 'XX' },
+        { rangeOffset: 6, rangeLength: 2, text: 'YY' },
+      ] },
+      { ...matchingEvent, contentChanges: [
+        { rangeOffset: 2, rangeLength: 2, text: 'XX' },
+        { rangeOffset: 9, rangeLength: 2, text: 'YY' },
+      ] },
+      { ...matchingEvent, contentChanges: [
+        { rangeOffset: 2, rangeLength: 2, text: 'ZZ' },
+        { rangeOffset: 6, rangeLength: 2, text: 'YY' },
+      ] },
     ]) {
-      const edits = new PendingReviewEdits!();
+      const edits = new PendingReviewEdits();
       edits.begin(expectation);
       expect(edits.consume(mismatchedEvent)).toBe(false);
       expect(edits.consume(matchingEvent)).toBe(false);
     }
+  });
 
-    const edits = new PendingReviewEdits!();
-    edits.begin(expectation);
-    expect(edits.consume(matchingEvent)).toBe(true);
-    expect(edits.consume(matchingEvent)).toBe(false);
+  it('rejects a matching payload when the event document result differs', async () => {
+    const module = await import('../../src/extension');
+    const PendingReviewEdits = (module as unknown as {
+      PendingReviewEdits: new () => {
+        begin(expectation: Record<string, unknown>): () => void;
+        consume(event: Record<string, unknown>): boolean;
+      };
+    }).PendingReviewEdits;
+    const edits = new PendingReviewEdits();
+    edits.begin({
+      key: 'file:///workspace/file.ts',
+      startingVersion: 4,
+      originalText: 'aa11bb22cc',
+      resultingText: 'aaXXbbYYcc',
+    });
+
+    expect(edits.consume({
+      key: 'file:///workspace/file.ts',
+      documentVersion: 5,
+      resultingText: 'aaXXbbYYcc!',
+      contentChanges: [
+        { rangeOffset: 2, rangeLength: 2, text: 'XX' },
+        { rangeOffset: 6, rangeLength: 2, text: 'YY' },
+      ],
+    })).toBe(false);
+  });
+
+  it('invalidates only the malformed event token and preserves another file token', async () => {
+    const module = await import('../../src/extension');
+    const PendingReviewEdits = (module as unknown as {
+      PendingReviewEdits: new () => {
+        begin(expectation: Record<string, unknown>): () => void;
+        consume(event: Record<string, unknown>): boolean;
+      };
+    }).PendingReviewEdits;
+    const edits = new PendingReviewEdits();
+    edits.begin({
+      key: 'file:///workspace/first.ts',
+      startingVersion: 4,
+      originalText: 'aa11bb22cc',
+      resultingText: 'aaXXbbYYcc',
+    });
+    edits.begin({
+      key: 'file:///workspace/second.ts',
+      startingVersion: 8,
+      originalText: 'm1n',
+      resultingText: 'm2n',
+    });
+
+    expect(edits.consume({
+      key: 'file:///workspace/first.ts',
+      documentVersion: 5,
+      resultingText: 'aaXXbbYYcc',
+      contentChanges: [
+        { rangeOffset: 2, rangeLength: 4, text: 'XX' },
+        { rangeOffset: 4, rangeLength: 2, text: 'YY' },
+      ],
+    })).toBe(false);
+    expect(edits.consume({
+      key: 'file:///workspace/second.ts',
+      documentVersion: 9,
+      resultingText: 'm2n',
+      contentChanges: [{ rangeOffset: 1, rangeLength: 1, text: '2' }],
+    })).toBe(true);
   });
 
   it('keeps nested review-edit cleanup scoped to the token that registered it', async () => {
@@ -454,12 +573,10 @@ describe('stable review runtime boundaries', () => {
     const first = {
       key: 'file:///workspace/file.ts',
       startingVersion: 4,
-      rangeOffset: 0,
-      rangeLength: 1,
-      replacementText: 'a',
+      originalText: 'before',
       resultingText: 'after-one',
     };
-    const second = { ...first, startingVersion: 5, replacementText: 'b', resultingText: 'after-two' };
+    const second = { ...first, startingVersion: 5, resultingText: 'after-two' };
 
     const finishFirst = edits.begin(first);
     const finishSecond = edits.begin(second);
@@ -469,7 +586,7 @@ describe('stable review runtime boundaries', () => {
       key: second.key,
       documentVersion: 6,
       resultingText: second.resultingText,
-      contentChanges: [{ rangeOffset: 0, rangeLength: 1, text: 'b' }],
+      contentChanges: [{ rangeOffset: 0, rangeLength: 6, text: 'after-two' }],
     })).toBe(true);
     finishSecond();
   });
@@ -486,9 +603,7 @@ describe('stable review runtime boundaries', () => {
     const expectation = {
       key: 'file:///workspace/file.ts',
       startingVersion: 4,
-      rangeOffset: 0,
-      rangeLength: 6,
-      replacementText: 'before',
+      originalText: 'after\n',
       resultingText: 'before\n',
     };
     const finish = edits.begin(expectation);
@@ -499,7 +614,7 @@ describe('stable review runtime boundaries', () => {
       key: expectation.key,
       documentVersion: 5,
       resultingText: expectation.resultingText,
-      contentChanges: [{ rangeOffset: 0, rangeLength: 6, text: 'before' }],
+      contentChanges: [{ rangeOffset: 0, rangeLength: 5, text: 'before' }],
     })).toBe(false);
   });
 
@@ -580,9 +695,7 @@ describe('stable review runtime boundaries', () => {
     expect(begin).toHaveBeenNthCalledWith(1, {
       key: 'file:///workspace/file.ts',
       startingVersion: 4,
-      rangeOffset: 15,
-      rangeLength: 1,
-      replacementText: '0',
+      originalText: 'const value = 11;',
       resultingText: 'const value = 10;',
     });
     expect(finish).toHaveBeenCalledTimes(2);
@@ -951,6 +1064,42 @@ describe('stable review runtime boundaries', () => {
       expect(runtime.renderedComparisonCount).toBe(0);
 
       render.mockRestore();
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears review state when Reject All emits two separated content changes', async () => {
+    vi.useFakeTimers();
+    try {
+      const baseline = 'aa11bb22cc';
+      const modified = 'aaXXbbYYcc';
+      const fake = installRuntimeVscode(baseline);
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+
+      fake.setText(modified);
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await vi.runAllTimersAsync();
+      await Promise.resolve();
+      expect(runtime.comparisonCount).toBe(1);
+
+      await fake.commands.get('codexExtensionHelper.rejectAll')!(fake.uri);
+      await vi.runAllTimersAsync();
+      await Promise.resolve();
+
+      expect(fake.currentText()).toBe(baseline);
+      expect(runtime.comparisonCount).toBe(0);
+      expect(runtime.renderedComparisonCount).toBe(0);
       runtime.dispose();
     } finally {
       vi.useRealTimers();
