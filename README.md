@@ -1,6 +1,6 @@
 # Codex Extension Helper
 
-Codex Extension Helper is a personal VS Code Stable extension that shows qualifying external file writes directly in the normal editable editor. VS Code does not identify the process that changed a file, so the extension shows changes made by Codex **and by every other external writer** that meets the same eligibility rules.
+Codex Extension Helper is a personal VS Code Stable extension that shows qualifying external file writes directly in the normal editable editor. VS Code does not identify the process that changed a file, so the extension can show changes made by Codex and by other external writers that meet the same eligibility rules. Git operations that leave a file Git-clean are filtered out.
 
 This is an independent, unofficial project. It is not affiliated with,
 endorsed by, or sponsored by OpenAI.
@@ -8,6 +8,7 @@ endorsed by, or sponsored by OpenAI.
 ## What appears in the editor
 
 - Deleted content appears on dedicated translucent-red rows above the current changed lines, so removed and modified source is stacked vertically instead of overlapping.
+- A deleted empty source line appears as an empty red row. The extension does not insert a `(blank line)` label.
 - Added or replacement lines in the current document are highlighted in green and remain fully editable.
 - VS Code Quick Diff gutter markers provide the native inline diff peek for complete deletion blocks.
 - Each change has **Approve** and **Reject** CodeLens actions. The source already contains the external writer's latest text: Approve keeps that text and advances the comparison baseline without saving, while Reject edits the document back to the latest baseline and leaves that edit unsaved.
@@ -16,8 +17,18 @@ endorsed by, or sponsored by OpenAI.
 - Run **Codex Changes: Open Full Diff** from the Command Palette for a full comparison.
 - Saving accepts the current document as the new baseline and immediately clears its comparison UI and title actions.
 - A previously snapshotted background file keeps its pending comparison and renders it when opened.
+- Git reset, restore, or checkout activity that leaves the file Git-clean clears or suppresses the review instead of presenting it as a Codex change.
 
 VS Code Stable has no public editor-inset API. To create dedicated deleted rows, the extension temporarily inserts extension-owned blank lines into the live buffer and decorates those rows with the removed text. It removes those exact rows before save, Approve, Reject, disabling, or shutdown. The comparison model and review commands always use the canonical source without the temporary rows. Approve never saves; Reject applies an ordinary unsaved editor change so it can be reviewed before you save it.
+
+## Review behavior
+
+- **Approve** keeps the source already written by Codex or another external writer and accepts only the selected change in the in-memory comparison baseline.
+- **Reject** restores the selected change from the latest baseline and leaves the restoration as an ordinary unsaved editor edit.
+- **Approve All** keeps the complete current source without saving it.
+- **Reject All** restores the complete baseline; for a newly created file, rejection moves the file to the operating system trash.
+- Previous/next navigation and per-change actions use canonical source coordinates even while temporary deleted-line rows are visible.
+- Before every save or review mutation, the extension removes its exact temporary rows so they are never intentionally written as accepted source.
 
 ## Requirements
 
@@ -88,7 +99,7 @@ software remains subject to the licenses and notices in the included
 - The extension cannot identify Codex as the writer. It suppresses Git operations that leave a file Git-clean, but other qualifying external writers can still appear as Codex-style review changes.
 - Deleted content uses real temporary buffer rows because VS Code Stable does not expose `editorInsets`. These rows can briefly affect language services, formatters, dirty-state indicators, and autosave even though the extension removes them before writing the file.
 - A hard extension-host crash can strand temporary blank rows in the unsaved buffer. Review the document before saving after a crash.
-- `editor.codeLens` must remain enabled for all per-change Approve/Reject actions and deletion summaries to be visible.
+- `editor.codeLens` must remain enabled for per-change Approve/Reject actions to be visible.
 - Diff editors, custom editors, binary or undecodable files, oversized files, excluded paths, and non-file documents do not render inline comparisons.
 
 ## Troubleshooting
