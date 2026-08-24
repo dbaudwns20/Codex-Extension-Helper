@@ -170,7 +170,7 @@ export class ComparisonCoordinator {
       hunks: [],
       sourceRevision,
       pending: true,
-      createdFile: false,
+      createdFile: resolved.state.createdFile,
     });
 
     const hunks = await this.diffEngine.compute(baselineText, currentText);
@@ -206,6 +206,17 @@ export class ComparisonCoordinator {
       createdFile: resolved.state.createdFile,
     });
     await this.view.render(reference.key, hunks);
+    const rendered = this.snapshots.get(reference.key);
+    if (
+      this.disposed
+      || rendered?.sourceRevision !== sourceRevision
+      || rendered.baselineText !== baselineText
+      || rendered.currentText !== currentText
+      || rendered.hunks !== hunks
+    ) {
+      await this.synchronizeView(reference.key);
+      return 'stale';
+    }
     return 'approved';
   }
 
@@ -321,6 +332,7 @@ export class ComparisonCoordinator {
       hunks,
       comparisonActive,
       pending: hunks.length > 0,
+      createdFile: hunks.length > 0 ? current.createdFile : false,
     });
     if (hunks.length === 0) {
       this.view.clear(key);
@@ -328,6 +340,28 @@ export class ComparisonCoordinator {
     }
 
     await this.view.render(key, hunks);
+  }
+
+  private async synchronizeView(key: string): Promise<void> {
+    while (!this.disposed) {
+      const state = this.snapshots.get(key);
+      if (state === undefined || state.hunks.length === 0) {
+        this.view.clear(key);
+        return;
+      }
+
+      const { baselineText, currentText, hunks, sourceRevision } = state;
+      await this.view.render(key, hunks);
+      const current = this.snapshots.get(key);
+      if (
+        current?.sourceRevision === sourceRevision
+        && current.baselineText === baselineText
+        && current.currentText === currentText
+        && current.hunks === hunks
+      ) {
+        return;
+      }
+    }
   }
 
   private nextRevision(key: string): number {
