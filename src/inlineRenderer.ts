@@ -1,6 +1,7 @@
 import type * as vscode from 'vscode';
 import type { ComparisonView } from './coordinator';
 import type { ChangeHunk } from './types';
+import type { InstalledSpacerPresentation } from './temporaryLineSpacers';
 export { DeletedLinesCodeLensProvider } from './deletedLinesCodeLensProvider';
 
 interface InlineRendererApi {
@@ -68,6 +69,8 @@ export function buildDeletedLinesHtml(lines: readonly string[], originalStart: n
 
 export class InlineRenderer implements ComparisonView, vscode.Disposable {
   private readonly addedDecorationType: vscode.TextEditorDecorationType;
+  private readonly removedRowDecorationType: vscode.TextEditorDecorationType;
+  private readonly removedOverlayDecorationType: vscode.TextEditorDecorationType;
   private readonly resources = new Map<string, ViewResources[]>();
   private disposed = false;
 
@@ -84,9 +87,25 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
       overviewRulerColor: new api.ThemeColor('editorOverviewRuler.addedForeground'),
       overviewRulerLane: api.OverviewRulerLane.Full,
     });
+    this.removedRowDecorationType = api.window.createTextEditorDecorationType({
+      isWholeLine: true,
+      rangeBehavior: api.DecorationRangeBehavior.ClosedClosed,
+      backgroundColor: new api.ThemeColor('diffEditor.removedTextBackground'),
+      overviewRulerColor: new api.ThemeColor('editorOverviewRuler.deletedForeground'),
+      overviewRulerLane: api.OverviewRulerLane.Full,
+    });
+    this.removedOverlayDecorationType = api.window.createTextEditorDecorationType({
+      rangeBehavior: api.DecorationRangeBehavior.ClosedClosed,
+      overviewRulerColor: new api.ThemeColor('editorOverviewRuler.deletedForeground'),
+      overviewRulerLane: api.OverviewRulerLane.Full,
+    });
   }
 
-  async render(key: string, hunks: readonly ChangeHunk[]): Promise<void> {
+  async render(
+    key: string,
+    hunks: readonly ChangeHunk[],
+    presentation?: InstalledSpacerPresentation,
+  ): Promise<void> {
     if (this.disposed) {
       return;
     }
@@ -100,7 +119,15 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
     try {
       for (const editor of editors) {
         views.push({ editor });
-        editor.setDecorations(this.addedDecorationType, this.greenRanges(hunks));
+        editor.setDecorations(this.addedDecorationType, this.greenRanges(hunks, presentation));
+        editor.setDecorations(
+          this.removedRowDecorationType,
+          presentation === undefined ? [] : this.deletedSpacerRows(presentation),
+        );
+        editor.setDecorations(
+          this.removedOverlayDecorationType,
+          presentation === undefined ? this.deletedLineDecorations(editor, hunks) : [],
+        );
       }
       if (views.length > 0) {
         this.resources.set(key, views);
@@ -141,14 +168,66 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
     this.disposed = true;
     this.clearAll();
     this.cleanup('dispose added decoration type', () => this.addedDecorationType.dispose());
+    this.cleanup('dispose removed row decoration type', () => this.removedRowDecorationType.dispose());
+    this.cleanup('dispose removed overlay decoration type', () => this.removedOverlayDecorationType.dispose());
   }
 
-  private greenRanges(hunks: readonly ChangeHunk[]): vscode.Range[] {
-    return hunks.flatMap((hunk) => {
+  private greenRanges(
+    hunks: readonly ChangeHunk[],
+    presentation?: InstalledSpacerPresentation,
+  ): vscode.Range[] {
+    return hunks.flatMap((hunk, hunkIndex) => {
       if (hunk.kind === 'deletion' || hunk.modifiedEnd <= hunk.modifiedStart) {
         return [];
       }
-      return [new this.api.Range(hunk.modifiedStart, 0, hunk.modifiedEnd - 1, 0)];
+      const mapping = presentation?.plan.hunks[hunkIndex];
+      const start = mapping?.modifiedStart ?? hunk.modifiedStart;
+      const end = mapping?.modifiedEnd ?? hunk.modifiedEnd;
+      return [new this.api.Range(start, 0, end - 1, 0)];
+    });
+  }
+
+  private deletedSpacerRows(
+    presentation: InstalledSpacerPresentation,
+  ): vscode.DecorationOptions[] {
+    return presentation.plan.hunks.flatMap((mapping) => mapping.removedRows.map((row) => ({
+      range: new this.api.Range(row.line, 0, row.line, 0),
+      renderOptions: {
+        after: {
+          contentText: `\u2212 ${row.text || '(blank line)'}`,
+          color: new this.api.ThemeColor('editor.foreground'),
+          textDecoration: 'none; white-space: pre;',
+        },
+      },
+    })));
+  }
+
+  private deletedLineDecorations(
+    editor: vscode.TextEditor,
+    hunks: readonly ChangeHunk[],
+  ): vscode.DecorationOptions[] {
+    const finalLine = Math.max(0, editor.document.lineCount - 1);
+    return hunks.flatMap((hunk) => {
+      if (hunk.originalLines.length === 0) {
+        return [];
+      }
+
+      const atEndOfFile = hunk.modifiedStart >= editor.document.lineCount;
+      const anchorLine = Math.min(Math.max(0, hunk.modifiedStart), finalLine);
+      const anchorCharacter = atEndOfFile
+        ? editor.document.lineAt(anchorLine).range.end.character
+        : 0;
+      const attachment: vscode.ThemableDecorationAttachmentRenderOptions = {
+        contentText: hunk.originalLines.map((line) => `\u2212 ${line || '(blank line)'}`).join('\n'),
+        color: new this.api.ThemeColor('editor.foreground'),
+        backgroundColor: new this.api.ThemeColor('diffEditor.removedTextBackground'),
+        textDecoration: 'none; display: block; width: 100%; box-sizing: border-box; white-space: pre;',
+      };
+
+      return [{
+        range: new this.api.Range(anchorLine, anchorCharacter, anchorLine, anchorCharacter),
+        renderOptions: atEndOfFile ? { after: attachment } : { before: attachment },
+      }];
     });
   }
 
@@ -166,6 +245,8 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
 
   private clearEditor(editor: vscode.TextEditor): void {
     this.cleanup('clear added decorations', () => editor.setDecorations(this.addedDecorationType, []));
+    this.cleanup('clear removed row decorations', () => editor.setDecorations(this.removedRowDecorationType, []));
+    this.cleanup('clear removed overlay decorations', () => editor.setDecorations(this.removedOverlayDecorationType, []));
   }
 
   private cleanup(operation: string, cleanup: () => void): void {

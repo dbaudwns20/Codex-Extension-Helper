@@ -1,8 +1,14 @@
 import type { ComparisonView } from './coordinator';
 import type { ChangeHunk } from './types';
+import type { InstalledSpacerPresentation } from './temporaryLineSpacers';
 
 export interface RenderStatusView extends ComparisonView {
   hasRendered(key: string): boolean;
+  render(
+    key: string,
+    hunks: readonly ChangeHunk[],
+    presentation?: InstalledSpacerPresentation,
+  ): Promise<void>;
 }
 
 export class DiagnosticView implements ComparisonView {
@@ -14,8 +20,12 @@ export class DiagnosticView implements ComparisonView {
     return this.renderedKeys.size;
   }
 
-  async render(key: string, hunks: readonly ChangeHunk[]): Promise<void> {
-    await this.delegate.render(key, hunks);
+  async render(
+    key: string,
+    hunks: readonly ChangeHunk[],
+    presentation?: InstalledSpacerPresentation,
+  ): Promise<void> {
+    await this.delegate.render(key, hunks, presentation);
     if (hunks.length > 0 && this.delegate.hasRendered(key)) {
       this.renderedKeys.add(key);
     } else {

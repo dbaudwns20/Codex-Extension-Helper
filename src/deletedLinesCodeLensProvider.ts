@@ -11,6 +11,7 @@ export interface ReviewCodeLensState {
   readonly sourceRevision: number;
   readonly currentText: string;
   readonly hunks: readonly ChangeHunk[];
+  readonly actionLines?: readonly number[];
 }
 
 interface CodeLensApi {
@@ -93,20 +94,13 @@ export class DeletedLinesCodeLensProvider implements vscode.CodeLensProvider, vs
 
     const { state } = stored;
     return state.hunks.flatMap((hunk, hunkIndex) => {
-      const line = Math.min(Math.max(0, hunk.modifiedStart), finalLine);
-      const range = new this.api.Range(line, 0, line, 0);
+      const line = Math.min(
+        Math.max(0, state.actionLines?.[hunkIndex] ?? hunk.modifiedStart),
+        finalLine,
+      );
+      const character = document.lineAt(line).range.end.character;
+      const range = new this.api.Range(line, character, line, character);
       const lenses: vscode.CodeLens[] = [];
-
-      if (hunk.originalLines.length > 0) {
-        lenses.push(new this.api.CodeLens(
-          range,
-          {
-            title: this.title(hunk.originalLines),
-            command: OPEN_DIFF_COMMAND,
-            tooltip: this.tooltip(hunk.originalLines),
-          },
-        ));
-      }
 
       const reference: HunkReference = {
         key: state.key,
