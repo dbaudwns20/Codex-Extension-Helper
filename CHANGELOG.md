@@ -16,9 +16,14 @@ All notable changes to this personal extension are documented in this file.
 - Trash-backed Reject All behavior for newly created files.
 - VS Code Stable Extension Host coverage for Approve, Reject, all-file actions, save/delete cleanup, and created-file rejection.
 - Personal VSIX packaging and a VS Code Stable development launch configuration.
+- VS Code Stable deleted-line rows backed by temporary blank buffer lines, with translucent red removed content above green modified lines.
+- Exact temporary-row cleanup before save, Approve, Reject, extension disable, and extension shutdown.
+- Canonical/display line mapping for CodeLens actions and previous/next navigation.
+- Git-clean reset/restore suppression so Git cleanup does not appear as a new Codex review.
 
 ### Known limitations
 
 - VS Code cannot identify the process responsible for a filesystem write, so all qualifying external writers are shown rather than Codex alone.
 - Comparison state does not persist across restarts.
 - Visual appearance across themes, folded regions, split editor groups, long lines, tabs, Unicode, and syntax-like text requires manual acceptance in the packaged extension.
+- Temporary deleted-line rows can briefly affect dirty state, language services, formatters, and autosave; an extension-host crash can leave them in the unsaved buffer.

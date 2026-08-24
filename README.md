@@ -7,8 +7,7 @@ endorsed by, or sponsored by OpenAI.
 
 ## What appears in the editor
 
-- Deleted content appears in a dedicated CodeLens row above the current changed line.
-- A single deletion shows its original text; multiple deletions show a compact `N deleted lines` summary.
+- Deleted content appears on dedicated translucent-red rows above the current changed lines, so removed and modified source is stacked vertically instead of overlapping.
 - Added or replacement lines in the current document are highlighted in green and remain fully editable.
 - VS Code Quick Diff gutter markers provide the native inline diff peek for complete deletion blocks.
 - Each change has **Approve** and **Reject** CodeLens actions. The source already contains the external writer's latest text: Approve keeps that text and advances the comparison baseline without saving, while Reject edits the document back to the latest baseline and leaves that edit unsaved.
@@ -18,7 +17,7 @@ endorsed by, or sponsored by OpenAI.
 - Saving accepts the current document as the new baseline and immediately clears its comparison UI and title actions.
 - A previously snapshotted background file keeps its pending comparison and renders it when opened.
 
-Deletion rows are visual history only and are never inserted into the document. Approve never saves; Reject applies an ordinary unsaved editor change so it can be reviewed before you save it.
+VS Code Stable has no public editor-inset API. To create dedicated deleted rows, the extension temporarily inserts extension-owned blank lines into the live buffer and decorates those rows with the removed text. It removes those exact rows before save, Approve, Reject, disabling, or shutdown. The comparison model and review commands always use the canonical source without the temporary rows. Approve never saves; Reject applies an ordinary unsaved editor change so it can be reviewed before you save it.
 
 ## Requirements
 
@@ -86,13 +85,14 @@ software remains subject to the licenses and notices in the included
 ## Limitations
 
 - Comparison state is memory-only and does not persist across VS Code restarts.
-- The extension cannot distinguish Codex from formatters, scripts, generators, Git operations, or other external writers.
-- Deleted content uses CodeLens summaries and VS Code's native Quick Diff/full-diff views; added and replacement content uses Stable editor decorations.
+- The extension cannot identify Codex as the writer. It suppresses Git operations that leave a file Git-clean, but other qualifying external writers can still appear as Codex-style review changes.
+- Deleted content uses real temporary buffer rows because VS Code Stable does not expose `editorInsets`. These rows can briefly affect language services, formatters, dirty-state indicators, and autosave even though the extension removes them before writing the file.
+- A hard extension-host crash can strand temporary blank rows in the unsaved buffer. Review the document before saving after a crash.
 - `editor.codeLens` must remain enabled for all per-change Approve/Reject actions and deletion summaries to be visible.
 - Diff editors, custom editors, binary or undecodable files, oversized files, excluded paths, and non-file documents do not render inline comparisons.
 
 ## Troubleshooting
 
-Open **View → Output**, then choose **Codex Extension Helper** from the channel picker. File-read, eligibility, diff, and rendering failures are reported there and never cause the extension to modify the affected document.
+Open **View → Output**, then choose **Codex Extension Helper** from the channel picker. File-read, eligibility, diff, and rendering failures are reported there. Deleted-row presentation intentionally makes temporary, reversible edits to eligible live documents.
 
 If no UI appears, confirm that the setting is enabled and the file had an observed baseline before the external write. Review actions apply only to the active file. Use the gutter change marker for native Quick Diff or run **Codex Changes: Open Full Diff** from the Command Palette.
