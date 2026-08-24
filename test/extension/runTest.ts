@@ -1,18 +1,12 @@
-import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { downloadAndUnzipVSCode, runTests } from '@vscode/test-electron';
+import { resolveStableExecutable } from './stableExecutable';
 
 async function stableExecutable(): Promise<string> {
   const legacyPath = await downloadAndUnzipVSCode('stable');
-  try {
-    await access(legacyPath);
-    return legacyPath;
-  } catch {
-    const currentPath = path.join(path.dirname(legacyPath), 'Code');
-    await access(currentPath);
-    return currentPath;
-  }
+  return resolveStableExecutable(legacyPath);
 }
 
 async function main(): Promise<void> {

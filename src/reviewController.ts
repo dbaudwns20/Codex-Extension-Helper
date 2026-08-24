@@ -43,6 +43,7 @@ const REJECT_SCOPE = 'Reject Codex changes';
 const SYNCHRONIZE_SCOPE = 'Synchronize Codex review state';
 
 export class ReviewController implements vscode.Disposable {
+  private readonly rejectionTails = new Map<string, Promise<void>>();
   private disposed = false;
 
   constructor(
@@ -72,32 +73,34 @@ export class ReviewController implements vscode.Disposable {
       return;
     }
 
-    const current = this.resolveHunkAction(reference, initial.document.version);
-    if (current === undefined) {
-      return;
-    }
+    await this.serializeRejection(reference.key, async () => {
+      const current = this.resolveHunkAction(reference, initial.document.version);
+      if (current === undefined) {
+        return;
+      }
 
-    if (current.state.createdFile) {
-      try {
-        await this.host.deleteToTrash(current.document.uri);
-      } catch (error) {
-        this.reportRejectionFailure(error);
-        return;
-      }
-      this.finalizeCreatedFileRejection(reference.key);
-    } else {
-      try {
-        const replacement = rejectedHunkReplacement(current.document.text, current.hunk);
-        const applied = await this.host.applyReplacement(current.document, replacement);
-        if (!applied) {
-          throw new Error('VS Code did not apply the rejection edit.');
+      if (current.state.createdFile) {
+        try {
+          await this.host.deleteToTrash(current.document.uri);
+        } catch (error) {
+          this.reportRejectionFailure(error);
+          return;
         }
-      } catch (error) {
-        this.reportRejectionFailure(error);
-        return;
+        this.finalizeCreatedFileRejection(reference.key);
+      } else {
+        try {
+          const replacement = rejectedHunkReplacement(current.document.text, current.hunk);
+          const applied = await this.host.applyReplacement(current.document, replacement);
+          if (!applied) {
+            throw new Error('VS Code did not apply the rejection edit.');
+          }
+        } catch (error) {
+          this.reportRejectionFailure(error);
+          return;
+        }
       }
-    }
-    this.synchronize(reference.key);
+      this.synchronize(reference.key);
+    });
   }
 
   async approveAll(uri?: vscode.Uri): Promise<void> {
@@ -125,38 +128,40 @@ export class ReviewController implements vscode.Disposable {
       return;
     }
 
-    const current = this.resolveActiveState(
-      uri,
-      initial.document.version,
-      initial.state.sourceRevision,
-    );
-    if (current === undefined) {
-      return;
-    }
+    await this.serializeRejection(initial.document.key, async () => {
+      const current = this.resolveActiveState(
+        uri,
+        initial.document.version,
+        initial.state.sourceRevision,
+      );
+      if (current === undefined) {
+        return;
+      }
 
-    if (current.state.createdFile) {
-      try {
-        await this.host.deleteToTrash(current.document.uri);
-      } catch (error) {
-        this.reportRejectionFailure(error);
-        return;
-      }
-      this.finalizeCreatedFileRejection(current.document.key);
-    } else {
-      try {
-        const applied = await this.host.replaceAll(
-          current.document,
-          current.state.baselineText,
-        );
-        if (!applied) {
-          throw new Error('VS Code did not apply the rejection edit.');
+      if (current.state.createdFile) {
+        try {
+          await this.host.deleteToTrash(current.document.uri);
+        } catch (error) {
+          this.reportRejectionFailure(error);
+          return;
         }
-      } catch (error) {
-        this.reportRejectionFailure(error);
-        return;
+        this.finalizeCreatedFileRejection(current.document.key);
+      } else {
+        try {
+          const applied = await this.host.replaceAll(
+            current.document,
+            current.state.baselineText,
+          );
+          if (!applied) {
+            throw new Error('VS Code did not apply the rejection edit.');
+          }
+        } catch (error) {
+          this.reportRejectionFailure(error);
+          return;
+        }
       }
-    }
-    this.synchronize(current.document.key);
+      this.synchronize(current.document.key);
+    });
   }
 
   previousChange(uri?: vscode.Uri): void {
@@ -169,6 +174,7 @@ export class ReviewController implements vscode.Disposable {
 
   dispose(): void {
     this.disposed = true;
+    this.rejectionTails.clear();
   }
 
   private resolveHunkAction(
@@ -276,6 +282,20 @@ export class ReviewController implements vscode.Disposable {
       this.onStateChanged(key);
     } catch (error) {
       this.host.log(SYNCHRONIZE_SCOPE, error);
+    }
+  }
+
+  private async serializeRejection(key: string, operation: () => Promise<void>): Promise<void> {
+    const previous = this.rejectionTails.get(key);
+    const current = previous === undefined ? operation() : previous.then(operation);
+    const settled = current.catch(() => {});
+    this.rejectionTails.set(key, settled);
+    try {
+      await current;
+    } finally {
+      if (this.rejectionTails.get(key) === settled) {
+        this.rejectionTails.delete(key);
+      }
     }
   }
 

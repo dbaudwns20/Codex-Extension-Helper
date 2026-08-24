@@ -97,6 +97,31 @@ function reviewState(overrides: Partial<FileComparisonState> = {}): FileComparis
   };
 }
 
+function canonicalFakeChange(originalText: string, resultingText: string) {
+  let rangeOffset = 0;
+  while (
+    rangeOffset < originalText.length
+    && rangeOffset < resultingText.length
+    && originalText[rangeOffset] === resultingText[rangeOffset]
+  ) {
+    rangeOffset += 1;
+  }
+  let sharedSuffix = 0;
+  while (
+    sharedSuffix < originalText.length - rangeOffset
+    && sharedSuffix < resultingText.length - rangeOffset
+    && originalText[originalText.length - sharedSuffix - 1]
+      === resultingText[resultingText.length - sharedSuffix - 1]
+  ) {
+    sharedSuffix += 1;
+  }
+  return {
+    rangeOffset,
+    rangeLength: originalText.length - rangeOffset - sharedSuffix,
+    text: resultingText.slice(rangeOffset, resultingText.length - sharedSuffix),
+  };
+}
+
 function installRuntimeVscode(initialText = 'before\n') {
   const callbacks = new Map<string, (...args: any[]) => unknown>();
   const commands = new Map<string, (...args: any[]) => unknown>();
@@ -215,9 +240,14 @@ function installRuntimeVscode(initialText = 'before\n') {
       const range = replacement[1] as FakeRange;
       const startOffset = (range.start as { offset: number }).offset;
       const endOffset = (range.end as { offset: number }).offset;
-      text = text.slice(0, startOffset) + String(replacement[2]) + text.slice(endOffset);
+      const replacementText = String(replacement[2]);
+      const originalText = text;
+      text = originalText.slice(0, startOffset) + replacementText + originalText.slice(endOffset);
       version += 1;
-      callbacks.get('documentChange')?.({ document, contentChanges: [{}] });
+      callbacks.get('documentChange')?.({
+        document,
+        contentChanges: [canonicalFakeChange(originalText, text)],
+      });
       dirty = true;
       return true;
     }),
@@ -344,7 +374,7 @@ describe('packaged runtime', () => {
     }
   });
 
-  it('lists the bundled entry as the only packaged runtime JavaScript', () => {
+  it('lists exactly the runtime, manifest, license, and user documentation for packaging', () => {
     const executable = path.resolve(
       'node_modules',
       '.bin',
@@ -356,15 +386,123 @@ describe('packaged runtime', () => {
     });
 
     expect(result.status, result.stderr).toBe(0);
-    expect(
-      result.stdout
-        .split(/\r?\n/u)
-        .filter((entry) => entry.startsWith('out/src/') && entry.endsWith('.js')),
-    ).toEqual(['out/src/extension.js']);
+    expect(result.stdout.split(/\r?\n/u).filter(Boolean)).toEqual([
+      'package.json',
+      'README.md',
+      'LICENSE',
+      'CHANGELOG.md',
+      'out/src/extension.js',
+    ]);
   });
 });
 
 describe('stable review runtime boundaries', () => {
+  it('matches only the exact expected review edit and invalidates a token on any other event', async () => {
+    const module = await import('../../src/extension');
+    const PendingReviewEdits = (module as unknown as {
+      PendingReviewEdits?: new () => {
+        begin(expectation: Record<string, unknown>): () => void;
+        consume(event: Record<string, unknown>): boolean;
+      };
+    }).PendingReviewEdits;
+    expect(PendingReviewEdits).toBeTypeOf('function');
+
+    const expectation = {
+      key: 'file:///workspace/file.ts',
+      startingVersion: 4,
+      rangeOffset: 2,
+      rangeLength: 6,
+      replacementText: 'old',
+      resultingText: 'beoldfter\n',
+    };
+    const matchingEvent = {
+      key: expectation.key,
+      documentVersion: 5,
+      resultingText: expectation.resultingText,
+      contentChanges: [{ rangeOffset: 2, rangeLength: 6, text: 'old' }],
+    };
+
+    for (const mismatchedEvent of [
+      { ...matchingEvent, documentVersion: 6 },
+      { ...matchingEvent, resultingText: 'external refresh\n' },
+      { ...matchingEvent, contentChanges: [{ rangeOffset: 3, rangeLength: 6, text: 'old' }] },
+      { ...matchingEvent, contentChanges: [{ rangeOffset: 2, rangeLength: 5, text: 'old' }] },
+      { ...matchingEvent, contentChanges: [{ rangeOffset: 2, rangeLength: 6, text: 'external' }] },
+      { ...matchingEvent, contentChanges: [] },
+    ]) {
+      const edits = new PendingReviewEdits!();
+      edits.begin(expectation);
+      expect(edits.consume(mismatchedEvent)).toBe(false);
+      expect(edits.consume(matchingEvent)).toBe(false);
+    }
+
+    const edits = new PendingReviewEdits!();
+    edits.begin(expectation);
+    expect(edits.consume(matchingEvent)).toBe(true);
+    expect(edits.consume(matchingEvent)).toBe(false);
+  });
+
+  it('keeps nested review-edit cleanup scoped to the token that registered it', async () => {
+    const module = await import('../../src/extension');
+    const PendingReviewEdits = (module as unknown as {
+      PendingReviewEdits: new () => {
+        begin(expectation: Record<string, unknown>): () => void;
+        consume(event: Record<string, unknown>): boolean;
+      };
+    }).PendingReviewEdits;
+    const edits = new PendingReviewEdits();
+    const first = {
+      key: 'file:///workspace/file.ts',
+      startingVersion: 4,
+      rangeOffset: 0,
+      rangeLength: 1,
+      replacementText: 'a',
+      resultingText: 'after-one',
+    };
+    const second = { ...first, startingVersion: 5, replacementText: 'b', resultingText: 'after-two' };
+
+    const finishFirst = edits.begin(first);
+    const finishSecond = edits.begin(second);
+    finishFirst();
+
+    expect(edits.consume({
+      key: second.key,
+      documentVersion: 6,
+      resultingText: second.resultingText,
+      contentChanges: [{ rangeOffset: 0, rangeLength: 1, text: 'b' }],
+    })).toBe(true);
+    finishSecond();
+  });
+
+  it('does not classify a delayed event after an unconsumed token is finished', async () => {
+    const module = await import('../../src/extension');
+    const PendingReviewEdits = (module as unknown as {
+      PendingReviewEdits: new () => {
+        begin(expectation: Record<string, unknown>): () => void;
+        consume(event: Record<string, unknown>): boolean;
+      };
+    }).PendingReviewEdits;
+    const edits = new PendingReviewEdits();
+    const expectation = {
+      key: 'file:///workspace/file.ts',
+      startingVersion: 4,
+      rangeOffset: 0,
+      rangeLength: 6,
+      replacementText: 'before',
+      resultingText: 'before\n',
+    };
+    const finish = edits.begin(expectation);
+
+    finish();
+
+    expect(edits.consume({
+      key: expectation.key,
+      documentVersion: 5,
+      resultingText: expectation.resultingText,
+      contentChanges: [{ rangeOffset: 0, rangeLength: 6, text: 'before' }],
+    })).toBe(false);
+  });
+
   it('applies hunk and full-document replacements with positionAt-derived ranges', async () => {
     const { createReviewHost } = await import('../../src/extension');
     const document = reviewDocument();
@@ -405,6 +543,49 @@ describe('stable review runtime boundaries', () => {
       new FakeRange({ offset: 0 }, { offset: 13 }),
       'baseline',
     ]]);
+  });
+
+  it('registers an exact edit token immediately around applyEdit and cleans false and thrown calls', async () => {
+    const { createReviewHost } = await import('../../src/extension');
+    const document = reviewDocument('const value = 11;');
+    const editor = {
+      document,
+      selection: { active: { line: 1 } },
+      revealRange: vi.fn(),
+    };
+    const finish = vi.fn();
+    const begin = vi.fn(() => finish);
+    const applyEdit = vi.fn()
+      .mockResolvedValueOnce(false)
+      .mockRejectedValueOnce(new Error('apply failed'));
+    const api = {
+      window: { activeTextEditor: editor, showErrorMessage: vi.fn() },
+      workspace: { applyEdit, fs: { delete: vi.fn() } },
+      WorkspaceEdit: FakeWorkspaceEdit,
+      Range: FakeRange,
+      Selection: FakeSelection,
+      TextEditorRevealType: { InCenter: 9 },
+    };
+    const host = createReviewHost(
+      api as never,
+      { appendLine: vi.fn() },
+      (uri) => uri.toString(),
+      begin as never,
+    );
+    const active = host.activeDocument()!;
+
+    await expect(host.replaceAll(active, 'const value = 10;')).resolves.toBe(false);
+    await expect(host.replaceAll(active, 'const value = 10;')).rejects.toThrow('apply failed');
+
+    expect(begin).toHaveBeenNthCalledWith(1, {
+      key: 'file:///workspace/file.ts',
+      startingVersion: 4,
+      rangeOffset: 15,
+      rangeLength: 1,
+      replacementText: '0',
+      resultingText: 'const value = 10;',
+    });
+    expect(finish).toHaveBeenCalledTimes(2);
   });
 
   it('deletes through VS Code trash and reveals a collapsed centered active selection', async () => {
@@ -770,6 +951,71 @@ describe('stable review runtime boundaries', () => {
       expect(runtime.renderedComparisonCount).toBe(0);
 
       render.mockRestore();
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('routes an unrelated non-dirty event normally while a Reject edit is pending', async () => {
+    vi.useFakeTimers();
+    try {
+      const baseline = 'before\n';
+      const modified = 'after\n';
+      const unrelated = 'external refresh\n';
+      const fake = installRuntimeVscode(baseline);
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+      const coordinator = (runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator;
+
+      fake.setText(modified);
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await vi.runAllTimersAsync();
+      await Promise.resolve();
+
+      const beforeEvent = coordinator.state(fake.uri.toString());
+      expect(beforeEvent?.currentText).toBe(modified);
+      let finishApply!: (applied: boolean) => void;
+      const applyResult = new Promise<boolean>((resolve) => { finishApply = resolve; });
+      fake.workspace.applyEdit.mockImplementationOnce(async () => await applyResult);
+      const rejectLens = fake.codeLenses().find(
+        (lens) => lens.command?.command === 'codexExtensionHelper.rejectHunk',
+      );
+      expect(rejectLens).toBeDefined();
+
+      const rejection = fake.commands.get('codexExtensionHelper.rejectHunk')!(
+        ...rejectLens!.command!.arguments!,
+      );
+      expect(fake.workspace.applyEdit).toHaveBeenCalledOnce();
+
+      fake.setText(unrelated, false);
+      fake.callbacks.get('documentChange')!({
+        document: fake.document,
+        contentChanges: [{
+          rangeOffset: 0,
+          rangeLength: modified.length,
+          text: unrelated,
+        }],
+      });
+      await vi.runAllTimersAsync();
+
+      expect(coordinator.state(fake.uri.toString())).toMatchObject({
+        currentText: modified,
+        sourceRevision: beforeEvent!.sourceRevision,
+      });
+
+      finishApply(false);
+      await rejection;
       runtime.dispose();
     } finally {
       vi.useRealTimers();

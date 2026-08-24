@@ -473,6 +473,51 @@ describe('ReviewController rejection edits', () => {
     expect(changed).toEqual(['file:///workspace/inactive.ts']);
     expectNoHostMutation(host);
   });
+
+  it('serializes overlapping hunk and all-file rejections before revalidating the second action', async () => {
+    const { changed, controller, host, state } = setup();
+    const firstEdit = deferred<boolean>();
+    host.replacementResult = firstEdit.promise;
+
+    const first = controller.rejectHunk(reference(key, state));
+    const second = controller.rejectAll();
+    await Promise.resolve();
+
+    expect(host.replacementCalls).toHaveLength(1);
+    expect(host.replaceAllCalls).toEqual([]);
+
+    host.document = liveDocument(key, 'a\nold\nz\n', { version: 5 });
+    firstEdit.resolve(true);
+    await Promise.all([first, second]);
+
+    expect(host.replacementCalls).toHaveLength(1);
+    expect(host.replaceAllCalls).toEqual([]);
+    expect(changed).toEqual([key]);
+  });
+
+  it('releases the per-key rejection queue after a false or throwing host edit', async () => {
+    for (const failedResult of [false, new Error('apply failed')]) {
+      const { controller, host, state } = setup();
+      const firstEdit = deferred<boolean>();
+      host.replacementResult = firstEdit.promise;
+
+      const first = controller.rejectHunk(reference(key, state));
+      const second = controller.rejectHunk(reference(key, state));
+      await Promise.resolve();
+      expect(host.replacementCalls).toHaveLength(1);
+
+      host.replacementResult = true;
+      if (failedResult === false) {
+        firstEdit.resolve(false);
+      } else {
+        firstEdit.reject(failedResult);
+      }
+      await Promise.all([first, second]);
+
+      expect(host.replacementCalls).toHaveLength(2);
+      expect(host.errors).toEqual(['Could not reject Codex changes.']);
+    }
+  });
 });
 
 describe('ReviewController created-file rejection', () => {
@@ -556,6 +601,23 @@ describe('ReviewController created-file rejection', () => {
       scope: 'Synchronize Codex review state',
       error: failure,
     }]);
+  });
+
+  it('serializes overlapping created-file rejections through one trash operation', async () => {
+    const { controller, coordinator, host, state } = setupCreated();
+    const firstDelete = deferred<void>();
+    host.deleteResult = firstDelete.promise;
+
+    const first = controller.rejectHunk(reference(key, state));
+    const second = controller.rejectAll();
+    await Promise.resolve();
+
+    expect(host.deleteCalls).toHaveLength(1);
+    firstDelete.resolve();
+    await Promise.all([first, second]);
+
+    expect(host.deleteCalls).toHaveLength(1);
+    expect(coordinator.state(key)).toBeUndefined();
   });
 });
 

@@ -28,6 +28,7 @@ From the repository root:
 ```bash
 npm ci
 npm run package
+mv codex-extension-helper-0.0.1.vsix codex-extension-helper-0.0.1-stable.vsix
 code --install-extension ./codex-extension-helper-0.0.1-stable.vsix --force
 ```
 

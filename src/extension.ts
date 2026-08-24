@@ -69,7 +69,93 @@ interface StableReviewHostApi {
   readonly TextEditorRevealType: typeof vscode.TextEditorRevealType;
 }
 
-type BeginReviewEdit = (key: string) => () => void;
+export interface PendingReviewEditExpectation {
+  readonly key: string;
+  readonly startingVersion: number;
+  readonly rangeOffset: number;
+  readonly rangeLength: number;
+  readonly replacementText: string;
+  readonly resultingText: string;
+}
+
+interface ReviewEditEvent {
+  readonly key: string;
+  readonly documentVersion: number;
+  readonly resultingText: string;
+  readonly contentChanges: readonly {
+    readonly rangeOffset: number;
+    readonly rangeLength: number;
+    readonly text: string;
+  }[];
+}
+
+export class PendingReviewEdits {
+  private readonly pending = new Map<string, PendingReviewEditExpectation>();
+
+  begin(expectation: PendingReviewEditExpectation): () => void {
+    this.pending.set(expectation.key, expectation);
+    let finished = false;
+    return () => {
+      if (!finished && this.pending.get(expectation.key) === expectation) {
+        this.pending.delete(expectation.key);
+      }
+      finished = true;
+    };
+  }
+
+  consume(event: ReviewEditEvent): boolean {
+    const expectation = this.pending.get(event.key);
+    if (expectation === undefined) {
+      return false;
+    }
+    this.pending.delete(event.key);
+    if (event.contentChanges.length !== 1) {
+      return false;
+    }
+    const [change] = event.contentChanges;
+    return event.documentVersion === expectation.startingVersion + 1
+      && event.resultingText === expectation.resultingText
+      && change.rangeOffset === expectation.rangeOffset
+      && change.rangeLength === expectation.rangeLength
+      && change.text === expectation.replacementText;
+  }
+
+  clear(): void {
+    this.pending.clear();
+  }
+}
+
+type BeginReviewEdit = (expectation: PendingReviewEditExpectation) => () => void;
+
+function canonicalTextChange(
+  originalText: string,
+  resultingText: string,
+): Pick<PendingReviewEditExpectation, 'rangeOffset' | 'rangeLength' | 'replacementText'> {
+  let prefixLength = 0;
+  const sharedLength = Math.min(originalText.length, resultingText.length);
+  while (
+    prefixLength < sharedLength
+    && originalText[prefixLength] === resultingText[prefixLength]
+  ) {
+    prefixLength += 1;
+  }
+
+  let suffixLength = 0;
+  while (
+    suffixLength < originalText.length - prefixLength
+    && suffixLength < resultingText.length - prefixLength
+    && originalText[originalText.length - suffixLength - 1]
+      === resultingText[resultingText.length - suffixLength - 1]
+  ) {
+    suffixLength += 1;
+  }
+
+  return {
+    rangeOffset: prefixLength,
+    rangeLength: originalText.length - prefixLength - suffixLength,
+    replacementText: resultingText.slice(prefixLength, resultingText.length - suffixLength),
+  };
+}
 
 type ReviewCommandController = Pick<
   ReviewController,
@@ -159,7 +245,15 @@ export function createReviewHost(
       ),
       replacementText,
     );
-    const finishReviewEdit = beginReviewEdit(document.key);
+    const resultingText = document.text.slice(0, startOffset)
+      + replacementText
+      + document.text.slice(endOffset);
+    const finishReviewEdit = beginReviewEdit({
+      key: document.key,
+      startingVersion: document.version,
+      ...canonicalTextChange(document.text, resultingText),
+      resultingText,
+    });
     try {
       return await api.workspace.applyEdit(edit);
     } finally {
@@ -339,7 +433,7 @@ export class ExtensionRuntime implements vscode.Disposable {
   private readonly comparisonKeys = new Set<string>();
   private readonly documentFence = new DocumentChangeFence();
   private readonly externalCandidates = new Map<string, ExternalComparisonCandidate>();
-  private readonly reviewEditDepths = new Map<string, number>();
+  private readonly pendingReviewEdits = new PendingReviewEdits();
   private visibleKeys = new Set<string>();
   private disposed = false;
 
@@ -373,7 +467,7 @@ export class ExtensionRuntime implements vscode.Disposable {
           vscode,
           output,
           normalizeUriKey,
-          (key) => this.beginReviewEdit(key),
+          (expectation) => this.pendingReviewEdits.begin(expectation),
         ),
         (key) => this.syncComparison(key),
       ));
@@ -513,7 +607,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     this.comparisonKeys.clear();
     this.visibleKeys.clear();
     this.externalCandidates.clear();
-    this.reviewEditDepths.clear();
+    this.pendingReviewEdits.clear();
     this.documentFence.clear();
   }
 
@@ -558,7 +652,16 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
 
     const key = normalizeUriKey(event.document.uri);
-    const isReviewEdit = this.reviewEditDepths.has(key);
+    const isReviewEdit = this.pendingReviewEdits.consume({
+      key,
+      documentVersion: event.document.version,
+      resultingText: event.document.getText(),
+      contentChanges: event.contentChanges.map((change) => ({
+        rangeOffset: change.rangeOffset,
+        rangeLength: change.rangeLength,
+        text: change.text,
+      })),
+    });
     if (
       !isReviewEdit
       && !shouldInvalidateDocumentChange(event.contentChanges.length, event.document.isDirty)
@@ -859,23 +962,6 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
     const folderPath = folder.path.endsWith('/') ? folder.path : `${folder.path}/`;
     return uri.path === folder.path || uri.path.startsWith(folderPath);
-  }
-
-  private beginReviewEdit(key: string): () => void {
-    this.reviewEditDepths.set(key, (this.reviewEditDepths.get(key) ?? 0) + 1);
-    let finished = false;
-    return () => {
-      if (finished) {
-        return;
-      }
-      finished = true;
-      const remaining = (this.reviewEditDepths.get(key) ?? 1) - 1;
-      if (remaining === 0) {
-        this.reviewEditDepths.delete(key);
-      } else {
-        this.reviewEditDepths.set(key, remaining);
-      }
-    };
   }
 
   private async run(scope: string, operation: () => void | PromiseLike<void>): Promise<void> {
