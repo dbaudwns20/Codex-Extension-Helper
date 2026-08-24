@@ -40,10 +40,17 @@ const OUTPUT_CHANNEL_NAME = 'Codex Extension Helper';
 interface TestDiagnostics {
   readonly comparisonCount: number;
   readonly renderedComparisonCount: number;
+  readonly activeFileHasChanges: boolean;
 }
 
 interface TestExtensionApi {
   readonly testDiagnostics: TestDiagnostics;
+  simulateExternalChange(
+    uri: vscode.Uri,
+    baselineText: string,
+    currentText: string,
+    createdFile?: boolean,
+  ): Promise<void>;
 }
 
 interface ExternalComparisonCandidate {
@@ -61,6 +68,8 @@ interface StableReviewHostApi {
   readonly Selection: typeof vscode.Selection;
   readonly TextEditorRevealType: typeof vscode.TextEditorRevealType;
 }
+
+type BeginReviewEdit = (key: string) => () => void;
 
 type ReviewCommandController = Pick<
   ReviewController,
@@ -111,6 +120,7 @@ export function createReviewHost(
   api: StableReviewHostApi,
   output: Pick<vscode.OutputChannel, 'appendLine'>,
   uriKey: (uri: vscode.Uri) => string = (uri) => uri.toString(),
+  beginReviewEdit: BeginReviewEdit = () => () => {},
 ): ReviewHost {
   const currentEditor = (expected?: LiveReviewDocument): vscode.TextEditor | undefined => {
     const editor = api.window.activeTextEditor;
@@ -149,7 +159,12 @@ export function createReviewHost(
       ),
       replacementText,
     );
-    return api.workspace.applyEdit(edit);
+    const finishReviewEdit = beginReviewEdit(document.key);
+    try {
+      return await api.workspace.applyEdit(edit);
+    } finally {
+      finishReviewEdit();
+    }
   };
 
   return {
@@ -324,6 +339,7 @@ export class ExtensionRuntime implements vscode.Disposable {
   private readonly comparisonKeys = new Set<string>();
   private readonly documentFence = new DocumentChangeFence();
   private readonly externalCandidates = new Map<string, ExternalComparisonCandidate>();
+  private readonly reviewEditDepths = new Map<string, number>();
   private visibleKeys = new Set<string>();
   private disposed = false;
 
@@ -353,7 +369,12 @@ export class ExtensionRuntime implements vscode.Disposable {
       ));
       const reviewController = ownership.use(new ReviewController(
         coordinator,
-        createReviewHost(vscode, output, normalizeUriKey),
+        createReviewHost(
+          vscode,
+          output,
+          normalizeUriKey,
+          (key) => this.beginReviewEdit(key),
+        ),
         (key) => this.syncComparison(key),
       ));
       registerReviewCommands(
@@ -428,6 +449,35 @@ export class ExtensionRuntime implements vscode.Disposable {
     return this.view.renderedComparisonCount;
   }
 
+  get activeFileHasChanges(): boolean {
+    return this.activeReviewContext.activeFileHasChanges;
+  }
+
+  async simulateExternalChange(
+    uri: vscode.Uri,
+    baselineText: string,
+    currentText: string,
+    createdFile = false,
+  ): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
+
+    const key = normalizeUriKey(uri);
+    this.externalCandidates.delete(key);
+    this.documentFence.invalidate(key);
+    this.documentDebouncer.cancel(key);
+    this.detector.markRecentSave(uri);
+    this.trackedUris.set(key, uri);
+    this.coordinator.seed(key, baselineText);
+    if (createdFile) {
+      await this.coordinator.externalCreate(key, currentText);
+    } else {
+      await this.coordinator.externalChange(key, currentText);
+    }
+    this.syncComparison(key);
+  }
+
   async openActiveDiff(): Promise<void> {
     const resource = vscode.window.activeTextEditor?.document.uri;
     if (resource === undefined || !await this.quickDiff.openDiff(resource)) {
@@ -463,6 +513,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     this.comparisonKeys.clear();
     this.visibleKeys.clear();
     this.externalCandidates.clear();
+    this.reviewEditDepths.clear();
     this.documentFence.clear();
   }
 
@@ -507,7 +558,11 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
 
     const key = normalizeUriKey(event.document.uri);
-    if (!shouldInvalidateDocumentChange(event.contentChanges.length, event.document.isDirty)) {
+    const isReviewEdit = this.reviewEditDepths.has(key);
+    if (
+      !isReviewEdit
+      && !shouldInvalidateDocumentChange(event.contentChanges.length, event.document.isDirty)
+    ) {
       const candidate = this.externalCandidates.get(key);
       if (candidate !== undefined && candidate.text === event.document.getText()) {
         void this.run(
@@ -806,6 +861,23 @@ export class ExtensionRuntime implements vscode.Disposable {
     return uri.path === folder.path || uri.path.startsWith(folderPath);
   }
 
+  private beginReviewEdit(key: string): () => void {
+    this.reviewEditDepths.set(key, (this.reviewEditDepths.get(key) ?? 0) + 1);
+    let finished = false;
+    return () => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      const remaining = (this.reviewEditDepths.get(key) ?? 1) - 1;
+      if (remaining === 0) {
+        this.reviewEditDepths.delete(key);
+      } else {
+        this.reviewEditDepths.set(key, remaining);
+      }
+    };
+  }
+
   private async run(scope: string, operation: () => void | PromiseLike<void>): Promise<void> {
     try {
       await operation();
@@ -842,6 +914,19 @@ export class ExtensionController implements vscode.Disposable {
 
   get renderedComparisonCount(): number {
     return this.runtime?.renderedComparisonCount ?? 0;
+  }
+
+  get activeFileHasChanges(): boolean {
+    return this.runtime?.activeFileHasChanges ?? false;
+  }
+
+  async simulateExternalChange(
+    uri: vscode.Uri,
+    baselineText: string,
+    currentText: string,
+    createdFile = false,
+  ): Promise<void> {
+    await this.runtime?.simulateExternalChange(uri, baselineText, currentText, createdFile);
   }
 
   async openActiveDiff(): Promise<void> {
@@ -919,6 +1004,9 @@ export const testDiagnostics: TestDiagnostics = Object.freeze({
   get renderedComparisonCount(): number {
     return activeController?.renderedComparisonCount ?? 0;
   },
+  get activeFileHasChanges(): boolean {
+    return activeController?.activeFileHasChanges ?? false;
+  },
 });
 
 export function activate(context: vscode.ExtensionContext): TestExtensionApi | undefined {
@@ -932,7 +1020,14 @@ export function activate(context: vscode.ExtensionContext): TestExtensionApi | u
   ));
   controller.start();
 
-  return process.env.CODEX_EXTENSION_HELPER_TEST === '1' ? { testDiagnostics } : undefined;
+  return process.env.CODEX_EXTENSION_HELPER_TEST === '1'
+    ? {
+      testDiagnostics,
+      simulateExternalChange: (uri, baselineText, currentText, createdFile) => (
+        controller.simulateExternalChange(uri, baselineText, currentText, createdFile)
+      ),
+    }
+    : undefined;
 }
 
 export function deactivate(): void {

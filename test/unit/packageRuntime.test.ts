@@ -217,8 +217,8 @@ function installRuntimeVscode(initialText = 'before\n') {
       const endOffset = (range.end as { offset: number }).offset;
       text = text.slice(0, startOffset) + String(replacement[2]) + text.slice(endOffset);
       version += 1;
-      dirty = true;
       callbacks.get('documentChange')?.({ document, contentChanges: [{}] });
+      dirty = true;
       return true;
     }),
     createFileSystemWatcher: vi.fn(() => watcher),

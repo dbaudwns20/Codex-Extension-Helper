@@ -17,6 +17,10 @@ export class ActiveReviewContext {
 
   constructor(private readonly setContext: SetReviewContext) {}
 
+  get activeFileHasChanges(): boolean {
+    return this.appliedValue === true;
+  }
+
   update(
     activeKey: string | undefined,
     state: FileComparisonState | undefined,

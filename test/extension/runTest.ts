@@ -3,13 +3,13 @@ import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { downloadAndUnzipVSCode, runTests } from '@vscode/test-electron';
 
-async function insidersExecutable(): Promise<string> {
-  const legacyPath = await downloadAndUnzipVSCode('insiders');
+async function stableExecutable(): Promise<string> {
+  const legacyPath = await downloadAndUnzipVSCode('stable');
   try {
     await access(legacyPath);
     return legacyPath;
   } catch {
-    const currentPath = path.join(path.dirname(legacyPath), 'Code - Insiders');
+    const currentPath = path.join(path.dirname(legacyPath), 'Code');
     await access(currentPath);
     return currentPath;
   }
@@ -37,22 +37,22 @@ async function main(): Promise<void> {
       }),
       'utf8',
     );
-    await writeFile(path.join(workspacePath, 'smoke.ts'), 'const value = 1;\n', 'utf8');
-    await writeFile(
-      path.join(workspacePath, 'policy.ts'),
-      `export const payload = "${'x'.repeat(1_400)}";\n`,
-      'utf8',
-    );
+    await Promise.all([
+      ['approve.ts', 'const value = 1;'],
+      ['reject.ts', 'const value = 10;'],
+      ['approve-all.ts', 'const value = 20;'],
+      ['reject-all.ts', 'const value = 30;'],
+      ['save.ts', 'const value = 40;'],
+      ['delete.ts', 'const value = 50;'],
+    ].map(([name, text]) => writeFile(path.join(workspacePath, name), text, 'utf8')));
     await runTests({
-      vscodeExecutablePath: await insidersExecutable(),
+      vscodeExecutablePath: await stableExecutable(),
       extensionDevelopmentPath,
       extensionTestsPath,
       extensionTestsEnv: { CODEX_EXTENSION_HELPER_TEST: '1' },
       launchArgs: [
         workspacePath,
         '--disable-extensions',
-        '--enable-proposed-api',
-        'local.codex-extension-helper',
         `--user-data-dir=${userDataPath}`,
         `--extensions-dir=${extensionsPath}`,
       ],
