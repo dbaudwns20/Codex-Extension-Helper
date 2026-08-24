@@ -388,8 +388,18 @@ export class TemporaryLineSpacerManager {
       return undefined;
     }
 
-    const revision = this.nextRevision(request.key);
     const existing = this.presentations.get(request.key);
+    const existingDocument = this.host.document(request.key);
+    if (
+      existing !== undefined
+      && existingDocument?.version === existing.documentVersion
+      && existingDocument.text === existing.displayText
+      && this.matchesRequest(existing, request)
+    ) {
+      return existing;
+    }
+
+    const revision = this.nextRevision(request.key);
     if (existing !== undefined) {
       const removed = await this.removePresentation(existing, false);
       if (removed.status === 'unsafe' || !this.isCurrent(request.key, revision)) {
@@ -532,9 +542,26 @@ export class TemporaryLineSpacerManager {
     return this.presentations.get(key);
   }
 
+  abandon(key: string): void {
+    this.nextRevision(key);
+    this.presentations.delete(key);
+    this.fence.invalidate(key);
+  }
+
   displayLine(key: string, canonicalLine: number): number {
     return this.presentations.get(key)?.plan.displayLineForCanonical(canonicalLine)
       ?? canonicalLine;
+  }
+
+  canonicalLine(key: string, displayLine: number): number {
+    const presentation = this.presentations.get(key);
+    if (presentation === undefined) {
+      return displayLine;
+    }
+    const precedingSpacerRows = presentation.plan.spans.filter(
+      (span) => span.displayLine < displayLine,
+    ).length;
+    return Math.max(0, displayLine - precedingSpacerRows);
   }
 
   async clear(key: string): Promise<SpacerRemovalResult> {
@@ -635,6 +662,26 @@ export class TemporaryLineSpacerManager {
 
   private isCurrent(key: string, revision: number): boolean {
     return !this.disposed && this.revisions.get(key) === revision;
+  }
+
+  private matchesRequest(
+    presentation: InstalledSpacerPresentation,
+    request: SpacerInstallRequest,
+  ): boolean {
+    if (
+      presentation.canonicalText !== request.canonicalText
+      || presentation.plan.hunks.length !== request.hunks.length
+    ) {
+      return false;
+    }
+    return request.hunks.every((hunk, index) => {
+      const mapping = presentation.plan.hunks[index];
+      return mapping !== undefined
+        && mapping.removedRows.length === hunk.originalLines.length
+        && mapping.removedRows.every((row, rowIndex) => row.text === hunk.originalLines[rowIndex])
+        && mapping.modifiedStart === presentation.plan.displayLineForCanonical(hunk.modifiedStart)
+        && mapping.modifiedEnd === presentation.plan.displayLineForCanonical(hunk.modifiedEnd);
+    });
   }
 
   private log(scope: string, error: unknown): void {

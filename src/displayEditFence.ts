@@ -15,7 +15,7 @@ export interface DisplayEditExpectation {
 export interface DisplayEditEvent {
   readonly key: string;
   readonly documentVersion: number;
-  readonly originalText: string;
+  readonly originalText?: string;
   readonly resultingText: string;
   readonly changes: readonly DisplayEditChange[];
 }
@@ -53,7 +53,7 @@ export class DisplayEditFence {
     }
     this.pending.delete(event.key);
     return event.documentVersion === expectation.startingVersion + 1
-      && event.originalText === expectation.originalText
+      && (event.originalText === undefined || event.originalText === expectation.originalText)
       && event.resultingText === expectation.resultingText
       && sameChanges(event.changes, expectation.changes);
   }

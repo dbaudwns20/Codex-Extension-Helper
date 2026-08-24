@@ -50,10 +50,16 @@ export class ReviewController implements vscode.Disposable {
     private readonly coordinator: ReviewCoordinator,
     private readonly host: ReviewHost,
     private readonly onStateChanged: (key: string) => void = () => {},
+    private readonly prepareCanonicalDocument: (key: string) => Promise<boolean> = async () => true,
+    private readonly canonicalTextForDisplay: (key: string, text: string) => string = (_key, text) => text,
+    private readonly canonicalLineForDisplay: (key: string, line: number) => number = (_key, line) => line,
   ) {}
 
   async approveHunk(reference: HunkReference): Promise<void> {
     await this.serializeMutation(reference.key, async () => {
+      if (!await this.prepareCanonicalDocument(reference.key)) {
+        return;
+      }
       const initial = this.resolveHunkAction(reference);
       if (initial === undefined) {
         return;
@@ -71,6 +77,9 @@ export class ReviewController implements vscode.Disposable {
 
   async rejectHunk(reference: HunkReference): Promise<void> {
     await this.serializeMutation(reference.key, async () => {
+      if (!await this.prepareCanonicalDocument(reference.key)) {
+        return;
+      }
       const initial = this.resolveHunkAction(reference);
       if (initial === undefined) {
         return;
@@ -111,6 +120,9 @@ export class ReviewController implements vscode.Disposable {
     }
 
     await this.serializeMutation(key, async () => {
+      if (!await this.prepareCanonicalDocument(key)) {
+        return;
+      }
       const initial = this.resolveActiveState(uri);
       if (initial === undefined) {
         return;
@@ -141,6 +153,9 @@ export class ReviewController implements vscode.Disposable {
     }
 
     await this.serializeMutation(key, async () => {
+      if (!await this.prepareCanonicalDocument(key)) {
+        return;
+      }
       const initial = this.resolveActiveState(uri);
       if (initial === undefined) {
         return;
@@ -255,7 +270,7 @@ export class ReviewController implements vscode.Disposable {
       state === undefined
       || !state.pending
       || state.hunks.length === 0
-      || state.currentText !== document.text
+      || state.currentText !== this.canonicalTextForDisplay(document.key, document.text)
       || (expectedRevision !== undefined && state.sourceRevision !== expectedRevision)
     ) {
       this.synchronize(document.key);
@@ -282,12 +297,16 @@ export class ReviewController implements vscode.Disposable {
     if (
       state === undefined
       || !state.pending
-      || state.currentText !== document.text
+      || state.currentText !== this.canonicalTextForDisplay(document.key, document.text)
     ) {
       return;
     }
 
-    const index = targetReviewIndex(state.hunks, document.cursorLine, direction);
+    const index = targetReviewIndex(
+      state.hunks,
+      this.canonicalLineForDisplay(document.key, document.cursorLine),
+      direction,
+    );
     if (index === undefined) {
       return;
     }

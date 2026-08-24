@@ -20,6 +20,8 @@ import {
   normalizeUriKey,
   type ExternalChangeKind,
 } from './externalChangeDetector';
+import { GitChangeGuard } from './gitChangeGuard';
+import { DisplayEditFence } from './displayEditFence';
 import {
   createInlineRendererSessionState,
   InlineRenderer,
@@ -32,6 +34,11 @@ import {
   type ReviewHost,
 } from './reviewController';
 import { SnapshotStore } from './snapshotStore';
+import {
+  TemporaryLineSpacerManager,
+  type InstalledSpacerPresentation,
+  type SpacerDocument,
+} from './temporaryLineSpacers';
 import type { FileComparisonState, HunkReference } from './types';
 
 const CONFIGURATION_SECTION = 'codexExtensionHelper';
@@ -170,7 +177,11 @@ type RegisterCommand = (
 
 interface SynchronizedReviewViews {
   readonly renderer: {
-    render(key: string, hunks: FileComparisonState['hunks']): Promise<void>;
+    render(
+      key: string,
+      hunks: FileComparisonState['hunks'],
+      presentation?: InstalledSpacerPresentation,
+    ): Promise<void>;
     clear(key: string): void;
   };
   readonly deletedLines: {
@@ -182,6 +193,7 @@ interface SynchronizedReviewViews {
     clear(key: string, acceptedText?: string): void;
   };
   readonly activeContext: Pick<ActiveReviewContext, 'update'>;
+  readonly spacers?: Pick<TemporaryLineSpacerManager, 'install' | 'presentation' | 'clear'>;
 }
 
 interface SynchronizeReviewViewsOptions {
@@ -208,6 +220,7 @@ export function createReviewHost(
   output: Pick<vscode.OutputChannel, 'appendLine'>,
   uriKey: (uri: vscode.Uri) => string = (uri) => uri.toString(),
   beginReviewEdit: BeginReviewEdit = () => () => {},
+  displayLine: (key: string, canonicalLine: number) => number = (_key, line) => line,
 ): ReviewHost {
   const currentEditor = (expected?: LiveReviewDocument): vscode.TextEditor | undefined => {
     const editor = api.window.activeTextEditor;
@@ -298,7 +311,11 @@ export function createReviewHost(
       if (editor === undefined) {
         return;
       }
-      const range = new api.Range(line, 0, line, 0);
+      const mappedLine = Math.min(
+        Math.max(0, displayLine(document.key, line)),
+        Math.max(0, editor.document.lineCount - 1),
+      );
+      const range = new api.Range(mappedLine, 0, mappedLine, 0);
       editor.selection = new api.Selection(range.start, range.start);
       editor.revealRange(range, api.TextEditorRevealType.InCenter);
     },
@@ -379,12 +396,18 @@ export async function synchronizeReviewViews({
   const pending: PromiseLike<void>[] = [];
   if (key !== undefined) {
     if (state !== undefined && state.hunks.length > 0) {
-      pending.push(views.renderer.render(key, state.hunks));
+      const presentation = await views.spacers?.install({
+        key,
+        canonicalText: state.currentText,
+        hunks: state.hunks,
+      });
+      pending.push(views.renderer.render(key, state.hunks, presentation));
       views.deletedLines.update({
         key,
         sourceRevision: state.sourceRevision,
         currentText: state.currentText,
         hunks: state.hunks,
+        actionLines: presentation?.plan.hunks.map((hunk) => hunk.actionLine),
       });
       if (resource === undefined) {
         views.quickDiff.clear(key);
@@ -392,6 +415,7 @@ export async function synchronizeReviewViews({
         views.quickDiff.update(key, resource, state.baselineText);
       }
     } else {
+      await views.spacers?.clear(key);
       views.renderer.clear(key);
       views.deletedLines.clear(key);
       views.quickDiff.clear(key, state?.currentText);
@@ -427,16 +451,20 @@ export class ExtensionRuntime implements vscode.Disposable {
   private readonly quickDiff: QuickDiffBridge;
   private readonly deletedLines: DeletedLinesCodeLensProvider;
   private readonly activeReviewContext: ActiveReviewContext;
+  private readonly spacers: TemporaryLineSpacerManager;
   private readonly detector: ExternalChangeDetector;
+  private readonly gitChangeGuard = new GitChangeGuard();
   private readonly documentDebouncer: PerKeyDebouncer<string>;
   private readonly ownership: DisposableStore;
   private readonly trackedUris = new Map<string, vscode.Uri>();
   private readonly comparisonKeys = new Set<string>();
   private readonly documentFence = new DocumentChangeFence();
+  private readonly displayEditFence = new DisplayEditFence();
   private readonly externalCandidates = new Map<string, ExternalComparisonCandidate>();
   private readonly pendingReviewEdits = new PendingReviewEdits();
   private visibleKeys = new Set<string>();
   private disposed = false;
+  private shutdownPromise: Promise<void> | undefined;
 
   constructor(
     private settingsValue: ExtensionSettings,
@@ -462,6 +490,51 @@ export class ExtensionRuntime implements vscode.Disposable {
         snapshots,
         STATE_ONLY_COMPARISON_VIEW,
       ));
+      const spacers = ownership.use(new TemporaryLineSpacerManager({
+        document: (key): SpacerDocument | undefined => {
+          const document = vscode.workspace.textDocuments.find(
+            (candidate) => normalizeUriKey(candidate.uri) === key,
+          );
+          return document === undefined ? undefined : {
+            key,
+            text: document.getText(),
+            version: document.version,
+            isDirty: document.isDirty,
+            eol: document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n',
+          };
+        },
+        apply: async (document, edits, expectedText): Promise<boolean> => {
+          const live = vscode.workspace.textDocuments.find(
+            (candidate) => normalizeUriKey(candidate.uri) === document.key,
+          );
+          if (
+            live === undefined
+            || live.version !== document.version
+            || live.getText() !== document.text
+          ) {
+            return false;
+          }
+          const workspaceEdit = new vscode.WorkspaceEdit();
+          for (const edit of edits) {
+            workspaceEdit.replace(
+              live.uri,
+              new vscode.Range(
+                live.positionAt(edit.offset),
+                live.positionAt(edit.offset + edit.length),
+              ),
+              edit.text,
+            );
+          }
+          if (!await vscode.workspace.applyEdit(workspaceEdit)) {
+            return false;
+          }
+          const current = vscode.workspace.textDocuments.find(
+            (candidate) => normalizeUriKey(candidate.uri) === document.key,
+          );
+          return current?.getText() === expectedText;
+        },
+        log: (scope, error) => this.log(scope, error),
+      }, this.displayEditFence));
       const reviewController = ownership.use(new ReviewController(
         coordinator,
         createReviewHost(
@@ -469,8 +542,14 @@ export class ExtensionRuntime implements vscode.Disposable {
           output,
           normalizeUriKey,
           (expectation) => this.pendingReviewEdits.begin(expectation),
+          (key, line) => spacers.displayLine(key, line),
         ),
         (key) => this.syncComparison(key),
+        (key) => this.prepareCanonicalReviewDocument(spacers, coordinator, key),
+        (key, text) => spacers.presentation(key)?.displayText === text
+          ? spacers.presentation(key)?.canonicalText ?? text
+          : text,
+        (key, line) => spacers.canonicalLine(key, line),
       ));
       registerReviewCommands(
         ownership,
@@ -511,6 +590,7 @@ export class ExtensionRuntime implements vscode.Disposable {
         quickDiff,
         deletedLines,
         activeReviewContext,
+        spacers,
       };
     }, (error) => output.appendLine(`[ConstructionRollback] ${errorDetail(error)}`));
 
@@ -521,6 +601,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     this.quickDiff = construction.value.quickDiff;
     this.deletedLines = construction.value.deletedLines;
     this.activeReviewContext = construction.value.activeReviewContext;
+    this.spacers = construction.value.spacers;
     this.detector = construction.value.detector;
     this.documentDebouncer = construction.value.documentDebouncer;
 
@@ -594,22 +675,28 @@ export class ExtensionRuntime implements vscode.Disposable {
   }
 
   dispose(): void {
-    if (this.disposed) {
-      return;
-    }
+    void this.shutdown();
+  }
 
-    for (const key of [...this.trackedUris.keys()]) {
-      this.deleteKey(key);
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise !== undefined) {
+      return this.shutdownPromise;
     }
-    this.syncPresentation();
     this.disposed = true;
-    this.ownership.dispose();
-    this.trackedUris.clear();
-    this.comparisonKeys.clear();
-    this.visibleKeys.clear();
-    this.externalCandidates.clear();
-    this.pendingReviewEdits.clear();
-    this.documentFence.clear();
+    this.view.clearAll();
+    this.deletedLines.clearAll();
+    this.shutdownPromise = (async () => {
+      await this.spacers.clearAll();
+      this.ownership.dispose();
+      this.trackedUris.clear();
+      this.comparisonKeys.clear();
+      this.visibleKeys.clear();
+      this.externalCandidates.clear();
+      this.pendingReviewEdits.clear();
+      this.documentFence.clear();
+      this.displayEditFence.clear();
+    })();
+    return this.shutdownPromise;
   }
 
   private handleWatcherEvent(uri: vscode.Uri, kind: 'create' | 'change'): void {
@@ -653,15 +740,52 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
 
     const key = normalizeUriKey(event.document.uri);
+    const contentChanges = event.contentChanges.map((change) => ({
+      rangeOffset: change.rangeOffset,
+      rangeLength: change.rangeLength,
+      text: change.text,
+    })).sort((left, right) => left.rangeOffset - right.rangeOffset);
+    if (this.displayEditFence.consume({
+      key,
+      documentVersion: event.document.version,
+      resultingText: event.document.getText(),
+      changes: contentChanges,
+    })) {
+      return;
+    }
+
+    if (this.spacers.presentation(key) !== undefined && !event.document.isDirty) {
+      this.spacers.abandon(key);
+      this.view.clear(key);
+      this.deletedLines.clear(key);
+    }
+
+    if (this.spacers.presentation(key) !== undefined) {
+      void this.run('SpacerDocumentEdit', async () => {
+        const reconciled = await this.spacers.reconcileUnexpectedChange({
+          key,
+          documentVersion: event.document.version,
+          resultingText: event.document.getText(),
+          changes: contentChanges,
+        });
+        if (reconciled?.status === 'canonicalized') {
+          this.processCanonicalDocumentEdit(key, event.document.uri, reconciled.text);
+          return;
+        }
+        this.coordinator.save(key, event.document.getText());
+        this.syncComparison(key);
+        void vscode.window.showWarningMessage(
+          'Codex review display was cleared because a temporary deleted-line row changed unexpectedly.',
+        );
+      });
+      return;
+    }
+
     const isReviewEdit = this.pendingReviewEdits.consume({
       key,
       documentVersion: event.document.version,
       resultingText: event.document.getText(),
-      contentChanges: event.contentChanges.map((change) => ({
-        rangeOffset: change.rangeOffset,
-        rangeLength: change.rangeLength,
-        text: change.text,
-      })),
+      contentChanges,
     });
     if (
       !isReviewEdit
@@ -677,6 +801,10 @@ export class ExtensionRuntime implements vscode.Disposable {
       return;
     }
 
+    this.processCanonicalDocumentEdit(key, event.document.uri, event.document.getText());
+  }
+
+  private processCanonicalDocumentEdit(key: string, uri: vscode.Uri, text: string): void {
     this.externalCandidates.delete(key);
     this.documentFence.invalidate(key);
     this.detector.invalidate(key);
@@ -686,14 +814,13 @@ export class ExtensionRuntime implements vscode.Disposable {
     if (state === undefined || !state.comparisonActive) {
       return;
     }
-    if (!this.isEligible(event.document.uri, event.document.getText())) {
+    if (!this.isEligible(uri, text)) {
       this.deleteKey(key);
       return;
     }
 
     this.documentDebouncer.schedule(key, this.settingsValue.debounceMs, () => {
       void this.run('DocumentEdit', async () => {
-        const text = event.document.getText();
         const isCurrent = this.createDocumentGuard(key, text);
         if (isCurrent === undefined) {
           return;
@@ -705,8 +832,23 @@ export class ExtensionRuntime implements vscode.Disposable {
   }
 
   private handleWillSave(event: vscode.TextDocumentWillSaveEvent): void {
+    const key = normalizeUriKey(event.document.uri);
+    const spacerEdits = this.spacers.willSaveEdits({
+      key,
+      text: event.document.getText(),
+      version: event.document.version,
+      isDirty: event.document.isDirty,
+      eol: event.document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n',
+    });
+    event.waitUntil(Promise.resolve(spacerEdits.map((edit) => new vscode.TextEdit(
+      new vscode.Range(
+        event.document.positionAt(edit.offset),
+        event.document.positionAt(edit.offset + edit.length),
+      ),
+      edit.text,
+    ))));
+
     if (!this.disposed && this.isEligible(event.document.uri, event.document.getText())) {
-      const key = normalizeUriKey(event.document.uri);
       this.externalCandidates.delete(key);
       this.documentFence.invalidate(key);
       this.documentDebouncer.cancel(key);
@@ -850,8 +992,34 @@ export class ExtensionRuntime implements vscode.Disposable {
         deletedLines: this.deletedLines,
         quickDiff: this.quickDiff,
         activeContext: this.activeReviewContext,
+        spacers: this.spacers,
       },
     }));
+  }
+
+  private async prepareCanonicalReviewDocument(
+    spacers: TemporaryLineSpacerManager,
+    coordinator: ComparisonCoordinator,
+    key: string,
+  ): Promise<boolean> {
+    const removed = await spacers.remove(key);
+    if (removed.status === 'unsafe') {
+      void vscode.window.showErrorMessage(
+        'Could not safely remove temporary deleted-line rows before the review action.',
+      );
+      return false;
+    }
+    const document = this.liveDocument(key);
+    const state = coordinator.state(key);
+    const valid = document !== undefined
+      && state !== undefined
+      && document.getText() === state.currentText;
+    if (!valid) {
+      void vscode.window.showErrorMessage(
+        'The document changed before the Codex review action could be applied.',
+      );
+    }
+    return valid;
   }
 
   private async applyExternalComparison(
@@ -876,6 +1044,24 @@ export class ExtensionRuntime implements vscode.Disposable {
     if (document !== undefined && document.getText() !== candidate.text) {
       if (document.isDirty && this.externalCandidates.get(key) === candidate) {
         this.externalCandidates.delete(key);
+      }
+      return;
+    }
+
+    const resource = document?.uri ?? this.trackedUris.get(key);
+    if (
+      resource !== undefined
+      && await this.gitChangeGuard.resourceState(resource) === 'clean'
+    ) {
+      if (
+        !this.disposed
+        && this.externalCandidates.get(key) === candidate
+        && this.liveDocumentMatches(key, candidate.text)
+      ) {
+        this.externalCandidates.delete(key);
+        this.documentFence.invalidate(key);
+        this.coordinator.save(key, candidate.text);
+        this.syncComparison(key);
       }
       return;
     }
@@ -992,6 +1178,8 @@ export class ExtensionController implements vscode.Disposable {
   private runtime: ExtensionRuntime | undefined;
   private settings = normalizeSettings({ enabled: false });
   private disposed = false;
+  private refreshTail: Promise<void> = Promise.resolve();
+  private shutdownPromise: Promise<void> | undefined;
 
   constructor(private output: vscode.OutputChannel | undefined) {}
 
@@ -1027,28 +1215,43 @@ export class ExtensionController implements vscode.Disposable {
   start(): void {
     this.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration(CONFIGURATION_SECTION)) {
-        this.refreshConfiguration();
+        this.queueConfigurationRefresh();
       }
     }));
-    this.refreshConfiguration();
+    this.queueConfigurationRefresh();
   }
 
   dispose(): void {
-    if (this.disposed) {
-      return;
-    }
+    void this.shutdown();
+  }
 
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise !== undefined) {
+      return this.shutdownPromise;
+    }
     this.disposed = true;
     for (const subscription of this.subscriptions.splice(0).reverse()) {
       subscription.dispose();
     }
-    this.runtime?.dispose();
+    const runtime = this.runtime;
     this.runtime = undefined;
-    this.output?.dispose();
-    this.output = undefined;
+    this.shutdownPromise = (async () => {
+      await this.refreshTail;
+      await runtime?.shutdown();
+      this.output?.dispose();
+      this.output = undefined;
+    })();
+    return this.shutdownPromise;
   }
 
-  private refreshConfiguration(): void {
+  private queueConfigurationRefresh(): void {
+    this.refreshTail = this.refreshTail.then(() => this.refreshConfiguration()).catch((error) => {
+      this.output ??= vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
+      this.output.appendLine(`[Configuration] ${errorDetail(error)}`);
+    });
+  }
+
+  private async refreshConfiguration(): Promise<void> {
     if (this.disposed) {
       return;
     }
@@ -1060,8 +1263,11 @@ export class ExtensionController implements vscode.Disposable {
       this.settings = next;
 
       if (!next.enabled) {
-        this.runtime?.dispose();
+        await this.runtime?.shutdown();
         this.runtime = undefined;
+        if (this.disposed) {
+          return;
+        }
         this.output?.dispose();
         this.output = undefined;
         return;
@@ -1069,8 +1275,11 @@ export class ExtensionController implements vscode.Disposable {
 
       this.output ??= vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
       if (this.runtime === undefined || enabledChanged || excludeChanged) {
-        this.runtime?.dispose();
+        await this.runtime?.shutdown();
         this.runtime = undefined;
+        if (this.disposed) {
+          return;
+        }
         this.runtime = new ExtensionRuntime(next, this.output, this.rendererSessionState);
       } else {
         this.runtime.updateSettings(next);
@@ -1117,7 +1326,7 @@ export function activate(context: vscode.ExtensionContext): TestExtensionApi | u
     : undefined;
 }
 
-export function deactivate(): void {
-  activeController?.dispose();
+export async function deactivate(): Promise<void> {
+  await activeController?.shutdown();
   activeController = undefined;
 }
