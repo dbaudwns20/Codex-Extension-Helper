@@ -115,6 +115,8 @@
   "scripts": {
     "compile": "tsc -p . && node ./scripts/build-extension.mjs",
     "watch": "node ./scripts/watch-extension.mjs",
+    "patch:codex-drop": "node ./scripts/patch-codex-drop.mjs",
+    "unpatch:codex-drop": "node ./scripts/unpatch-codex-drop.mjs",
     "test": "vitest",
     "test:unit": "vitest run test/unit",
     "test:extension": "npm run compile && node ./out/test/extension/runTest.js",
