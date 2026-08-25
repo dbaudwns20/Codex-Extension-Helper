@@ -16,7 +16,15 @@ async function makeTemporaryDirectory() {
 async function makeInstallation(root: string, version: string, bundleNames = ['app-initial-current.js']) {
   const extensionDir = path.join(root, `openai.chatgpt-${version}-darwin-arm64`);
   await mkdir(path.join(extensionDir, 'webview/assets'), { recursive: true });
+  const indexSource = [
+    '<!doctype html><html><head>',
+    '<!-- PROD_CSP_TAG_HERE -->',
+    '<script type="module" crossorigin src="./assets/index-current.js"></script>',
+    '<link rel="modulepreload" crossorigin href="./assets/app-initial-current.js">',
+    '</head><body><div id="root"></div></body></html>',
+  ].join('\n');
   await writeFile(path.join(extensionDir, 'package.json'), JSON.stringify({ name: 'chatgpt', version }));
+  await writeFile(path.join(extensionDir, 'webview/index.html'), indexSource);
   await Promise.all(bundleNames.map((bundleName) => writeFile(
     path.join(extensionDir, 'webview/assets', bundleName),
 
@@ -119,7 +127,14 @@ describe('Codex drop installation lifecycle', () => {
 
     const first = await applyCodexDropPatch({ extensionDir });
     expect(first.status).toBe('patched');
-    expect(await readFile(first.metadataPath, 'utf8')).toContain('"patchVersion": 6');
+    expect(first.indexPath).toBe(path.join(extensionDir, 'webview/index.html'));
+    expect(first.bootstrapPath).toBe(path.join(extensionDir, 'webview/assets/codex-explorer-drop-cache-bootstrap-v1.js'));
+    const metadata = JSON.parse(await readFile(first.metadataPath, 'utf8'));
+    expect(metadata.metadataSchemaVersion).toBe(2);
+    expect(metadata.patchVersion).toBe(6);
+    expect(metadata.cacheBootstrapVersion).toBe(1);
+    expect(await readFile(first.indexPath, 'utf8')).toContain('codex-explorer-drop-cache-bootstrap-v1.js');
+    expect(await readFile(first.bootstrapPath, 'utf8')).toContain('./assets/index-current.js');
 
     const second = await applyCodexDropPatch({ extensionDir });
     expect(second.status).toBe('already-patched');
@@ -140,6 +155,38 @@ describe('Codex drop installation lifecycle', () => {
     expect(repatched.status).toBe('patched');
     expect(repatched.backupPath).toBe(first.backupPath);
     expect(await readFile(first.metadataPath, 'utf8')).toContain('"patchVersion": 6');
+  });
+
+  it('migrates a verified legacy v6 bundle patch to schema 2 without rewriting the bundle backup', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { applyCodexDropPatch, sha256 } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    const extensionsRoot = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(extensionsRoot, '26.818.61809');
+    const bundlePath = path.join(extensionDir, 'webview/assets/app-initial-current.js');
+    const backupPath = `${bundlePath}.codex-explorer-drop-chips.original`;
+    const metadataPath = `${bundlePath}.codex-explorer-drop-chips.json`;
+    const originalBundle = await readFile(bundlePath, 'utf8');
+    const patchedBundle = patchBundleSource(originalBundle).source;
+    await writeFile(bundlePath, patchedBundle);
+    await writeFile(backupPath, originalBundle);
+    await writeFile(metadataPath, `${JSON.stringify({
+      patchVersion: 6,
+      extensionVersion: '26.818.61809',
+      bundlePath,
+      backupPath,
+      originalSha256: sha256(originalBundle),
+      patchedSha256: sha256(patchedBundle),
+    }, null, 2)}\n`);
+    const bundleBeforeMigration = await readFile(bundlePath);
+    const backupBeforeMigration = await readFile(backupPath);
+
+    const migrated = await applyCodexDropPatch({ extensionDir });
+    expect(migrated.status).toBe('migrated');
+    expect(await readFile(bundlePath)).toEqual(bundleBeforeMigration);
+    expect(await readFile(backupPath)).toEqual(backupBeforeMigration);
+    expect(JSON.parse(await readFile(metadataPath, 'utf8')).metadataSchemaVersion).toBe(2);
   });
 
   it('refuses to restore a patched bundle changed after patching', async () => {
