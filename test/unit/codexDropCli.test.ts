@@ -19,7 +19,15 @@ async function makeTemporaryDirectory() {
 async function makeInstallation(root: string, version: string, source = `${composerContext}before;${composerAnchor}after;`) {
   const extensionDir = path.join(root, `openai.chatgpt-${version}-darwin-arm64`);
   await mkdir(path.join(extensionDir, 'webview/assets'), { recursive: true });
+  const indexSource = [
+    '<!doctype html><html><head>',
+    '<!-- PROD_CSP_TAG_HERE -->',
+    '<script type="module" crossorigin src="./assets/index-current.js"></script>',
+    '<link rel="modulepreload" crossorigin href="./assets/app-initial-current.js">',
+    '</head><body><div id="root"></div></body></html>',
+  ].join('\n');
   await writeFile(path.join(extensionDir, 'package.json'), JSON.stringify({ name: 'chatgpt', version }));
+  await writeFile(path.join(extensionDir, 'webview/index.html'), indexSource);
   await writeFile(path.join(extensionDir, 'webview/assets/app-initial-current.js'), source);
   return extensionDir;
 }
