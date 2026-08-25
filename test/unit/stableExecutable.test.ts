@@ -1,6 +1,9 @@
 import * as path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { resolveStableExecutable } from '../extension/stableExecutable';
+import {
+  resolveStableExecutable,
+  withElectronRunAsNodeDisabled,
+} from '../extension/stableExecutable';
 
 describe('Stable extension-host executable resolution', () => {
   it('uses an accessible launcher path unchanged', async () => {
@@ -39,5 +42,18 @@ describe('Stable extension-host executable resolution', () => {
 
     await expect(resolveStableExecutable(legacy, accessPath, 'darwin')).rejects.toBe(missing);
     expect(accessPath).toHaveBeenCalledOnce();
+  });
+});
+
+describe('Stable extension-host environment', () => {
+  it('removes the inherited Electron Node mode only while launching VS Code', async () => {
+    const environment: NodeJS.ProcessEnv = { ELECTRON_RUN_AS_NODE: '1', KEEP: 'yes' };
+    const observed = await withElectronRunAsNodeDisabled(environment, async () => ({
+      electronRunAsNode: environment.ELECTRON_RUN_AS_NODE,
+      keep: environment.KEEP,
+    }));
+
+    expect(observed).toEqual({ electronRunAsNode: undefined, keep: 'yes' });
+    expect(environment).toEqual({ ELECTRON_RUN_AS_NODE: '1', KEEP: 'yes' });
   });
 });

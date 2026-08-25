@@ -2,7 +2,10 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { downloadAndUnzipVSCode, runTests } from '@vscode/test-electron';
-import { resolveStableExecutable } from './stableExecutable';
+import {
+  resolveStableExecutable,
+  withElectronRunAsNodeDisabled,
+} from './stableExecutable';
 
 async function stableExecutable(): Promise<string> {
   const legacyPath = await downloadAndUnzipVSCode('stable');
@@ -41,18 +44,18 @@ async function main(): Promise<void> {
       ['eof-approve.ts', 'export const eofApprove = true;'],
       ['eof-reject.ts', 'export const first = 1;\r\nexport const eofReject = true;\r\n'],
     ].map(([name, text]) => writeFile(path.join(workspacePath, name), text, 'utf8')));
-    await runTests({
-      vscodeExecutablePath: await stableExecutable(),
-      extensionDevelopmentPath,
-      extensionTestsPath,
-      extensionTestsEnv: { CODEX_EXTENSION_HELPER_TEST: '1' },
-      launchArgs: [
-        workspacePath,
-        '--disable-extensions',
-        `--user-data-dir=${userDataPath}`,
-        `--extensions-dir=${extensionsPath}`,
-      ],
-    });
+    await withElectronRunAsNodeDisabled(process.env, async () => runTests({
+        vscodeExecutablePath: await stableExecutable(),
+        extensionDevelopmentPath,
+        extensionTestsPath,
+        extensionTestsEnv: { CODEX_EXTENSION_HELPER_TEST: '1' },
+        launchArgs: [
+          workspacePath,
+          '--disable-extensions',
+          `--user-data-dir=${userDataPath}`,
+          `--extensions-dir=${extensionsPath}`,
+        ],
+      }));
   } finally {
     await rm(temporaryPath, { recursive: true, force: true });
   }
