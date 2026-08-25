@@ -66,41 +66,53 @@ describe('Codex drop patch CLIs', () => {
   it('reports schema-2 patch, already-patched, restored, and already-restored statuses', async () => {
     const root = await makeTemporaryDirectory();
     const extensionDir = await makeInstallation(root, '26.818.61809');
+    const bundlePath = path.join(extensionDir, 'webview/assets/app-initial-current.js');
+    const indexPath = path.join(extensionDir, 'webview/index.html');
 
     const firstPatch = run(patchScript, '--extension-dir', extensionDir);
     expect(firstPatch.status).toBe(0);
     expect(firstPatch.stdout).toContain('Patched Codex 26.818.61809');
+    expect(firstPatch.stdout).toContain(`Bundle: ${bundlePath}`);
     expect(firstPatch.stdout).toContain('The first Codex webview load will refresh its cache once.');
     expect(firstPatch.stdout).toContain('Reload VS Code');
-    expect(firstPatch.stdout).toContain(`Index: ${path.join(extensionDir, 'webview/index.html')}`);
+    expect(firstPatch.stdout).toContain(`Index: ${indexPath}`);
     expect(firstPatch.stdout).toContain('Status: patched');
 
     const secondPatch = run(patchScript, '--extension-dir', extensionDir);
     expect(secondPatch.status).toBe(0);
     expect(secondPatch.stdout).toContain('already patched');
+    expect(secondPatch.stdout).toContain(`Bundle: ${bundlePath}`);
+    expect(secondPatch.stdout).toContain(`Index: ${indexPath}`);
     expect(secondPatch.stdout).toContain('Status: already-patched');
+    expect(secondPatch.stdout).not.toContain('Reload VS Code');
+    expect(secondPatch.stdout).not.toContain('The first Codex webview load will refresh its cache once.');
 
     const restore = run(restoreScript, '--extension-dir', extensionDir);
     expect(restore.status).toBe(0);
     expect(restore.stdout).toContain('Restored Codex 26.818.61809');
     expect(restore.stdout).toContain('Reload VS Code');
-    expect(restore.stdout).toContain(`Index: ${path.join(extensionDir, 'webview/index.html')}`);
+    expect(restore.stdout).toContain(`Index: ${indexPath}`);
     expect(restore.stdout).toContain('Status: restored');
 
     const secondRestore = run(restoreScript, '--extension-dir', extensionDir);
     expect(secondRestore.status).toBe(0);
     expect(secondRestore.stdout).toContain('already restored');
+    expect(secondRestore.stdout).toContain(`Bundle: ${bundlePath}`);
     expect(secondRestore.stdout).toContain('Status: already-restored');
+    expect(secondRestore.stdout).not.toContain('Reload VS Code');
+    expect(secondRestore.stdout).not.toContain('The first Codex webview load will refresh its cache once.');
   });
 
   it('reports legacy migration with cache refresh guidance', async () => {
     const root = await makeTemporaryDirectory();
     const extensionDir = await makeInstallation(root, '26.818.61809');
+    const bundlePath = path.join(extensionDir, 'webview/assets/app-initial-current.js');
     await makeLegacyBundlePatchFixture(extensionDir, '26.818.61809');
 
     const migratedPatch = run(patchScript, '--extension-dir', extensionDir);
     expect(migratedPatch.status).toBe(0);
     expect(migratedPatch.stdout).toContain('Migrated Codex 26.818.61809');
+    expect(migratedPatch.stdout).toContain(`Bundle: ${bundlePath}`);
     expect(migratedPatch.stdout).toContain('The first Codex webview load will refresh its cache once.');
     expect(migratedPatch.stdout).toContain('Reload VS Code');
     expect(migratedPatch.stdout).toContain(`Index: ${path.join(extensionDir, 'webview/index.html')}`);
