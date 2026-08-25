@@ -3,7 +3,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 
-import { PATCH_VERSION, patchBundleSource } from './codex-drop-source.mjs';
+import {
+  PATCH_VERSION,
+  PREVIOUS_PATCH_VERSION,
+  patchBundleSource,
+  unpatchBundleSourceVersion,
+} from './codex-drop-source.mjs';
 import {
   BOOTSTRAP_ASSET_NAME,
   CACHE_BOOTSTRAP_VERSION,
@@ -106,7 +111,10 @@ async function compatibleBundlePaths(extensionDir) {
       patchBundleSource(await readFile(bundlePath, 'utf8'));
       bundlePaths.push(bundlePath);
     } catch {
-      // An unrecognized bundle must never be selected.
+      const source = await readFile(bundlePath, 'utf8');
+      const hasPreviousPatch = source.includes(`codex-explorer-drop-chips:start:v${PREVIOUS_PATCH_VERSION}`)
+        && source.includes(`codex-explorer-drop-chips:end:v${PREVIOUS_PATCH_VERSION}`);
+      if (hasPreviousPatch && await fileExists(patchPaths(bundlePath).metadataPath)) bundlePaths.push(bundlePath);
     }
   }
   return bundlePaths;
@@ -169,13 +177,19 @@ function metadataFor(target, paths, hashes) {
   };
 }
 
-function assertSchema2MetadataShape(metadata, target, paths, bootstrapVersion = CACHE_BOOTSTRAP_VERSION) {
+function assertSchema2MetadataShape(
+  metadata,
+  target,
+  paths,
+  bootstrapVersion = CACHE_BOOTSTRAP_VERSION,
+  patchVersion = PATCH_VERSION,
+) {
   if (
     metadata === null
     || typeof metadata !== 'object'
     || Object.keys(metadata).sort().join('\0') !== SCHEMA2_METADATA_KEYS.join('\0')
     || metadata.metadataSchemaVersion !== METADATA_SCHEMA_VERSION
-    || metadata.patchVersion !== PATCH_VERSION
+    || metadata.patchVersion !== patchVersion
     || metadata.cacheBootstrapVersion !== bootstrapVersion
     || metadata.extensionVersion !== target.extensionVersion
     || metadata.bundlePath !== target.bundlePath
@@ -523,13 +537,86 @@ async function migrateSchema2V1Patch(target, paths, bundleSource, metadata, oper
   });
 }
 
+async function migratePreviousBundlePatch(target, paths, bundleSource, metadata, operations) {
+  assertSchema2MetadataShape(
+    metadata,
+    target,
+    paths,
+    CACHE_BOOTSTRAP_VERSION,
+    PREVIOUS_PATCH_VERSION,
+  );
+  if (sha256(bundleSource) !== metadata.patchedSha256) throw new Error('Current bundle hash does not match patch metadata');
+  const originalBundleSource = await readFile(paths.backupPath, 'utf8');
+  if (sha256(originalBundleSource) !== metadata.originalSha256) throw new Error('Backup hash does not match patch metadata');
+  const restoredBundle = unpatchBundleSourceVersion(bundleSource, PREVIOUS_PATCH_VERSION);
+  if (restoredBundle.status !== 'restored' || restoredBundle.source !== originalBundleSource) {
+    throw new Error('Codex drop patch metadata is invalid');
+  }
+  const bundleTransformed = patchBundleSource(originalBundleSource);
+  if (bundleTransformed.status !== 'patched') throw new Error('Codex drop patch metadata is invalid');
+
+  const currentIndexSource = await readFile(paths.indexPath, 'utf8');
+  if (sha256(currentIndexSource) !== metadata.patchedIndexSha256) throw new Error('Current index hash does not match patch metadata');
+  const originalIndexSource = await readFile(paths.indexBackupPath, 'utf8');
+  if (sha256(originalIndexSource) !== metadata.originalIndexSha256) throw new Error('Index backup hash does not match patch metadata');
+  const expectedIndex = patchIndexSource(originalIndexSource);
+  if (
+    expectedIndex.status !== 'patched'
+    || expectedIndex.source !== currentIndexSource
+    || expectedIndex.entrySource !== metadata.entrySource
+  ) {
+    throw new Error('Codex drop patch metadata is invalid');
+  }
+  const currentBootstrapSource = await readFile(paths.bootstrapPath, 'utf8');
+  const expectedBootstrapSource = createBootstrapSource(expectedIndex.entrySource);
+  if (
+    sha256(currentBootstrapSource) !== metadata.bootstrapSha256
+    || currentBootstrapSource !== expectedBootstrapSource
+  ) {
+    throw new Error('Codex drop patch metadata is invalid');
+  }
+
+  return installSchema2Patch({
+    target,
+    paths,
+    bundle: {
+      originalSource: originalBundleSource,
+      originalSha256: metadata.originalSha256,
+      patchedSource: bundleTransformed.source,
+      patchedSha256: sha256(bundleTransformed.source),
+      rollbackSource: bundleSource,
+    },
+    index: {
+      originalSource: originalIndexSource,
+      originalSha256: metadata.originalIndexSha256,
+      patchedSource: currentIndexSource,
+      patchedSha256: metadata.patchedIndexSha256,
+      entrySource: metadata.entrySource,
+      rollbackSource: currentIndexSource,
+    },
+    bootstrapSource: currentBootstrapSource,
+    backups: {
+      bundleExists: true,
+      indexExists: true,
+    },
+    operations,
+    status: 'migrated',
+  });
+}
+
 export async function applyCodexDropPatch(options = {}) {
   const operations = fileOperationsFor(options);
   const target = await resolveCodexTarget(options);
   const paths = patchPaths(target.bundlePath);
   const bundleSource = await readFile(target.bundlePath, 'utf8');
-  const bundleTransformed = patchBundleSource(bundleSource);
   const metadataExists = await fileExists(paths.metadataPath);
+  const hasPreviousPatch = bundleSource.includes(`codex-explorer-drop-chips:start:v${PREVIOUS_PATCH_VERSION}`)
+    && bundleSource.includes(`codex-explorer-drop-chips:end:v${PREVIOUS_PATCH_VERSION}`);
+  if (hasPreviousPatch && metadataExists) {
+    const metadata = await readParsedMetadata(paths);
+    return migratePreviousBundlePatch(target, paths, bundleSource, metadata, operations);
+  }
+  const bundleTransformed = patchBundleSource(bundleSource);
   if (bundleTransformed.status === 'already-patched' && metadataExists) {
     const metadata = await readParsedMetadata(paths);
     if (metadata?.metadataSchemaVersion === METADATA_SCHEMA_VERSION && metadata.cacheBootstrapVersion === 1) {

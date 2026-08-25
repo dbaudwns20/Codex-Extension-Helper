@@ -1,40 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
 describe('Codex drop source transformation', () => {
-  it('creates one descriptor for each file or directory URI', async () => {
-    // @ts-expect-error Script modules are intentionally JavaScript-only.
-    const { descriptorsFromUriList } = await import('../../scripts/lib/codex-drop-source.mjs');
-    expect(descriptorsFromUriList([
-      'file:///Users/me/project/src/Button.tsx',
-      'file:///Users/me/project/src/components',
-    ].join('\r\n'), 'posix')).toEqual([
-      { label: 'Button.tsx', path: '/Users/me/project/src/Button.tsx', fsPath: '/Users/me/project/src/Button.tsx' },
-      { label: 'components', path: '/Users/me/project/src/components', fsPath: '/Users/me/project/src/components' },
-    ]);
-  });
-
-  it('decodes spaces and Unicode while ignoring comments and non-file URIs', async () => {
-    // @ts-expect-error Script modules are intentionally JavaScript-only.
-    const { parseFileUriList } = await import('../../scripts/lib/codex-drop-source.mjs');
-    expect(parseFileUriList([
-      '# Explorer resources',
-      'file:///Users/me/My%20Project/%ED%95%9C%EA%B8%80.ts',
-      '',
-      'https://example.com/not-local',
-    ].join('\n'), 'posix')).toEqual(['/Users/me/My Project/한글.ts']);
-  });
-
-  it('normalizes Windows drive and UNC file URIs without expanding directories', async () => {
-    // @ts-expect-error Script modules are intentionally JavaScript-only.
-    const { parseFileUriList } = await import('../../scripts/lib/codex-drop-source.mjs');
-    expect(parseFileUriList('file:///C:/repo/src', 'win32')).toEqual(['C:\\repo\\src']);
-    expect(parseFileUriList('file://server/share/repo', 'win32')).toEqual(['\\\\server\\share\\repo']);
-  });
-
   const anchor = 'IR(`add-context-file`,it.view.dom,e=>{Ei(),bee([e.file])});';
   const composerContext = 'const cwd="/workspace";const isHome=cwd===`~`;';
 
-  it('injects a marked Markdown drop handler after one composer anchor', async () => {
+  it('injects a marked at-mention drop handler after one composer anchor', async () => {
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { PATCH_START_MARKER, patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
     const result = patchBundleSource(`${composerContext}before;${anchor}after;`);
@@ -42,25 +12,27 @@ describe('Codex drop source transformation', () => {
     expect(result.source).toContain(PATCH_START_MARKER);
   });
 
-  it('inserts dropped Explorer resources as visible workspace-relative Markdown links', async () => {
+  it('inserts dropped Explorer resources as Codex atMention nodes instead of Markdown text', async () => {
     // Removing anchor-relative insertion, or omitting its statement terminator, breaks this fixture.
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
     const original = [
       'globalThis.__codexDropFixture=()=>{',
-      'const window={addEventListener:()=>{}};',
-      'const listeners={},mentions=[];let nativeHandler;',
-      'let text="Review";const cwd="/workspace";const isHome=cwd===`~`;',
-      'const it={getText:()=>text,setText:(value)=>{text=`parsed:${value}`},appendText:(value)=>{const addition=value.trim();text+=text&&!/\\s$/u.test(text)?` ${addition}`:addition},view:{dom:{dataset:{},addEventListener:(type,handler)=>{listeners[type]=handler}}}};',
+      'const windowListeners={};const window={addEventListener:(type,handler)=>{windowListeners[type]=handler}};',
+      'const listeners={},mentions=[],insertedMentions=[];let nativeHandler;',
+      'const cwd="/workspace";const isHome=cwd===`~`;',
+      'const atMention={name:"atMention"};const state={selection:{from:7,to:7},schema:{nodes:{atMention}}};',
+      'const it={insertMentionNodeInRange:(type,attrs,from,to)=>{insertedMentions.push({type:type.name,attrs,from,to});state.selection={from:from+1,to:from+1}},view:{state,dom:{dataset:{},addEventListener:(type,handler)=>{listeners[type]=handler}}}};',
       'let focusCount=0;const Ei=()=>{focusCount+=1};const bee=(items)=>{mentions.push(...items)};const IR=(_type,_dom,handler)=>{nativeHandler=handler};',
       anchor,
-      'return {listeners,mentions,emitNative:()=>nativeHandler?.({file:{label:"native-card"}}),get text(){return text},get focusCount(){return focusCount}}};',
+      'return {listeners,mentions,insertedMentions,dispatchDrop:(event)=>{windowListeners.drop?.(event);if(!event.immediatePropagationStopped)mentions.push({label:"native-card"});if(!event.immediatePropagationStopped)listeners.drop?.(event)},emitNative:()=>nativeHandler?.({file:{label:"anchor-card"}}),get focusCount(){return focusCount}}};',
       '//# sourceMappingURL=app-initial.js.map',
     ].join('');
     const patched = patchBundleSource(original);
     const runFixture = new Function(`${patched.source}\nreturn globalThis.__codexDropFixture;`)();
     const fixture = runFixture();
     const event = {
+      immediatePropagationStopped: false,
       dataTransfer: {
         getData: (type: string) => type === 'text/uri-list'
           ? 'file:///workspace/scripts/lib'
@@ -72,13 +44,26 @@ describe('Codex drop source transformation', () => {
         dropEffect: 'none',
       },
       preventDefault() {},
-      stopImmediatePropagation() {},
+      stopImmediatePropagation() { this.immediatePropagationStopped = true; },
     };
 
-    fixture.listeners.drop(event);
+    fixture.dispatchDrop(event);
     fixture.emitNative();
 
-    expect(fixture.text).toBe('Review [lib](scripts/lib/) [Button.tsx](src/Button.tsx)');
+    expect(fixture.insertedMentions).toEqual([
+      {
+        type: 'atMention',
+        attrs: { label: 'lib', path: 'scripts/lib/', fsPath: '/workspace/scripts/lib' },
+        from: 7,
+        to: 7,
+      },
+      {
+        type: 'atMention',
+        attrs: { label: 'Button.tsx', path: 'src/Button.tsx', fsPath: '/workspace/src/Button.tsx' },
+        from: 8,
+        to: 8,
+      },
+    ]);
     expect(fixture.mentions).toEqual([]);
     expect(fixture.focusCount).toBe(1);
     delete (globalThis as typeof globalThis & { __codexDropFixture?: unknown }).__codexDropFixture;
@@ -89,21 +74,22 @@ describe('Codex drop source transformation', () => {
     const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
     const original = [
       'globalThis.__codexDropFixture=()=>{',
-      'const window={addEventListener:()=>{}};',
-      'const listeners={};let text="Review";',
+      'const windowListeners={};const window={addEventListener:(type,handler)=>{windowListeners[type]=handler}};',
+      'const listeners={},insertedMentions=[];',
       'const threadCwd="/different/thread";const isHome=threadCwd===`~`;',
       'const workspaceRoot=null;const workspace={activeWorkspaceRoot:workspaceRoot};',
       'const rootsData={roots:["/workspace"]};const workspaceRoots=rootsData?.roots??[];',
-      'const it={getText:()=>text,setText:(value)=>{text=value},appendText:(value)=>{text+=` ${value.trim()}`},view:{dom:{dataset:{},addEventListener:(type,handler)=>{listeners[type]=handler}}}};',
+      'const atMention={name:"atMention"};const state={selection:{from:1,to:1},schema:{nodes:{atMention}}};',
+      'const it={insertMentionNodeInRange:(type,attrs,from,to)=>{insertedMentions.push({type:type.name,attrs,from,to})},view:{state,dom:{dataset:{},addEventListener:(type,handler)=>{listeners[type]=handler}}}};',
       'const Ei=()=>{};const bee=()=>{};const IR=()=>{};',
       anchor,
-      'return {listeners,get text(){return text}}};',
+      'return {listeners,windowListeners,insertedMentions}};',
     ].join('');
     const patched = patchBundleSource(original);
     const runFixture = new Function(`${patched.source}\nreturn globalThis.__codexDropFixture;`)();
     const fixture = runFixture();
 
-    fixture.listeners.drop({
+    fixture.windowListeners.drop({
       dataTransfer: {
         getData: (type: string) => type === 'application/vnd.code.uri-list'
           ? 'file:///workspace/CHANGELOG.md'
@@ -115,7 +101,12 @@ describe('Codex drop source transformation', () => {
       stopImmediatePropagation() {},
     });
 
-    expect(fixture.text).toBe('Review [CHANGELOG.md](CHANGELOG.md)');
+    expect(fixture.insertedMentions).toEqual([{
+      type: 'atMention',
+      attrs: { label: 'CHANGELOG.md', path: 'CHANGELOG.md', fsPath: '/workspace/CHANGELOG.md' },
+      from: 1,
+      to: 1,
+    }]);
     delete (globalThis as typeof globalThis & { __codexDropFixture?: unknown }).__codexDropFixture;
   });
 

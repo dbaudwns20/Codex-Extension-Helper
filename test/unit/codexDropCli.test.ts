@@ -45,7 +45,7 @@ async function makeLegacyBundlePatchFixture(extensionDir: string, version: strin
   await writeFile(bundlePath, patchedBundle);
   await writeFile(backupPath, originalBundle);
   await writeFile(metadataPath, `${JSON.stringify({
-    patchVersion: 6,
+    patchVersion: 8,
     extensionVersion: version,
     bundlePath,
     backupPath,

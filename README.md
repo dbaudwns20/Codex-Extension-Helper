@@ -41,13 +41,25 @@ From the repository root:
 ```bash
 npm ci
 npm run package
-mv codex-extension-helper-0.0.1.vsix codex-extension-helper-0.0.1-stable.vsix
-code --install-extension ./codex-extension-helper-0.0.1-stable.vsix --force
+code --install-extension ./codex-extension-helper-0.0.2.vsix --force
 ```
+
+## Insert Explorer paths into Codex chat
+
+On macOS, right-click one or more files or folders in Explorer and choose
+**Codex: Add as @ Mention**. The extension focuses the Codex sidebar and
+automates the same `@` path search and selection used by the composer. It
+presses Enter only to choose each autocomplete result; it does not send the
+message.
+
+The first use may require permission under **System Settings → Privacy &
+Security → Accessibility** for Visual Studio Code. This command avoids
+Explorer drag-and-drop and therefore does not require Shift.
 
 ## Codex Explorer drop chips
 
-The optional patch below adds Explorer file and folder drops to the Codex
+The older optional patch below modifies an installed Codex bundle to add
+Explorer file and folder drops to the Codex
 composer. Apply it after installing or whenever Codex has updated:
 
 ```bash
@@ -58,7 +70,8 @@ npm run unpatch:codex-drop
 # Reload VS Code again after restoring.
 ```
 
-Each dropped file or folder becomes one chip; directories are not expanded.
+Each dropped file or folder becomes one inline mention without a separate
+attachment card; directories are not expanded.
 In automatic mode, the patch command chooses the numerically newest installed
 `openai.chatgpt-*` version first and fails closed if that installation's bundle
 layout is unsupported; it does not fall back to an older installation. To

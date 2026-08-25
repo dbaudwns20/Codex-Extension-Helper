@@ -53,7 +53,7 @@ async function makeLegacyBundlePatchFixture(extensionDir: string) {
   await writeFile(bundlePath, patchedBundle);
   await writeFile(backupPath, originalBundle);
   await writeFile(metadataPath, `${JSON.stringify({
-    patchVersion: 6,
+    patchVersion: 8,
     extensionVersion: '26.818.61809',
     bundlePath,
     backupPath,
@@ -127,7 +127,7 @@ async function makeSchema2V1PatchFixture(extensionDir: string) {
   const bootstrapSource = createCacheBootstrapV1Source(patchedIndex.entrySource);
   const metadata = {
     metadataSchemaVersion: 2,
-    patchVersion: 6,
+    patchVersion: 8,
     cacheBootstrapVersion: 1,
     extensionVersion: '26.818.61809',
     bundlePath,
@@ -260,7 +260,7 @@ describe('Codex drop installation lifecycle', () => {
     expect(first.bootstrapPath).toBe(path.join(extensionDir, 'webview/assets/codex-explorer-drop-cache-bootstrap-v2.js'));
     const metadata = JSON.parse(await readFile(first.metadataPath, 'utf8'));
     expect(metadata.metadataSchemaVersion).toBe(2);
-    expect(metadata.patchVersion).toBe(6);
+    expect(metadata.patchVersion).toBe(8);
     expect(metadata.cacheBootstrapVersion).toBe(2);
     expect(await readFile(first.indexPath, 'utf8')).toContain('codex-explorer-drop-cache-bootstrap-v2.js');
     expect(await readFile(first.bootstrapPath, 'utf8')).toContain('./assets/index-current.js');
@@ -287,7 +287,7 @@ describe('Codex drop installation lifecycle', () => {
     expect(await readFile(first.metadataPath, 'utf8')).toBe(corruptedMetadataSource);
   });
 
-  it('migrates a verified legacy v6 bundle patch to schema 2 without rewriting the bundle backup', async () => {
+  it('migrates a verified legacy v8 bundle patch to schema 2 without rewriting the bundle backup', async () => {
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { applyCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
     const extensionsRoot = await makeTemporaryDirectory();
@@ -301,6 +301,29 @@ describe('Codex drop installation lifecycle', () => {
     expect(await readFile(bundlePath)).toEqual(bundleBeforeMigration);
     expect(await readFile(backupPath)).toEqual(backupBeforeMigration);
     expect(JSON.parse(await readFile(metadataPath, 'utf8')).metadataSchemaVersion).toBe(2);
+  });
+
+  it('upgrades a verified schema-2 v7 bundle patch to v8', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { applyCodexDropPatch, sha256 } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    const extensionsRoot = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(extensionsRoot, '26.818.61809');
+    const first = await applyCodexDropPatch({ extensionDir });
+    const v8Bundle = await readFile(first.bundlePath, 'utf8');
+    const v7Bundle = v8Bundle
+      .replace('codex-explorer-drop-chips:start:v8', 'codex-explorer-drop-chips:start:v7')
+      .replace('codex-explorer-drop-chips:end:v8', 'codex-explorer-drop-chips:end:v7');
+    const metadata = JSON.parse(await readFile(first.metadataPath, 'utf8'));
+    metadata.patchVersion = 7;
+    metadata.patchedSha256 = sha256(v7Bundle);
+    await writeFile(first.bundlePath, v7Bundle);
+    await writeFile(first.metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
+
+    const migrated = await applyCodexDropPatch({ extensionDir });
+
+    expect(migrated.status).toBe('migrated');
+    expect(await readFile(first.bundlePath, 'utf8')).toContain('codex-explorer-drop-chips:start:v8');
+    expect(JSON.parse(await readFile(first.metadataPath, 'utf8')).patchVersion).toBe(8);
   });
 
   it('migrates a verified schema-2 bootstrap-v1 install to bootstrap v2', async () => {

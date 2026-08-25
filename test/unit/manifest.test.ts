@@ -37,6 +37,21 @@ describe('extension manifest', () => {
       'codexExtensionHelper.nextChange',
       'codexExtensionHelper.approveAll',
       'codexExtensionHelper.rejectAll',
+      'codexExtensionHelper.insertExplorerPathIntoCodex',
+    ]);
+  });
+
+  it('offers Codex @ mention insertion from the Explorer context menu on macOS', () => {
+    expect(manifest.contributes.commands).toContainEqual(expect.objectContaining({
+      command: 'codexExtensionHelper.insertExplorerPathIntoCodex',
+      title: 'Codex: Add as @ Mention',
+    }));
+    expect(manifest.contributes.menus['explorer/context']).toEqual([
+      {
+        command: 'codexExtensionHelper.insertExplorerPathIntoCodex',
+        when: 'resourceScheme == file && isMac',
+        group: 'codex@1',
+      },
     ]);
   });
 

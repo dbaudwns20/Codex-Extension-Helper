@@ -1,7 +1,14 @@
+import { execFile } from 'node:child_process';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ActiveReviewContext } from './activeReviewContext';
 import { PerKeyDebouncer } from './changePolicy';
 import { ComparisonCoordinator, type ComparisonView } from './coordinator';
+import {
+  formatExplorerResourcesAsMentionQueries,
+  insertMentionsIntoCodex,
+  type ExplorerMentionResource,
+} from './codexChatInsert';
 import {
   DeletedLinesCodeLensProvider,
   type ReviewCodeLensState,
@@ -43,6 +50,20 @@ import type { FileComparisonState, HunkReference } from './types';
 
 const CONFIGURATION_SECTION = 'codexExtensionHelper';
 const OUTPUT_CHANNEL_NAME = 'Codex Extension Helper';
+const CODEX_CHAT_FOCUS_DELAY_MS = 350;
+const MACOS_MENTION_PICKER_SCRIPT = [
+  'on run argv',
+  'set the clipboard to item 1 of argv',
+  'tell application "System Events"',
+  'keystroke "@"',
+  'delay 0.15',
+  'keystroke "v" using command down',
+  'delay 0.65',
+  'key code 36',
+  'delay 0.15',
+  'end tell',
+  'end run',
+].join('\n');
 
 interface TestDiagnostics {
   readonly comparisonCount: number;
@@ -1313,6 +1334,64 @@ export function activate(context: vscode.ExtensionContext): TestExtensionApi | u
   context.subscriptions.push(vscode.commands.registerCommand(
     'codexExtensionHelper.openDiff',
     () => controller.openActiveDiff(),
+  ));
+  context.subscriptions.push(vscode.commands.registerCommand(
+    'codexExtensionHelper.insertExplorerPathIntoCodex',
+    async (resource?: vscode.Uri, selectedResources?: readonly vscode.Uri[]) => {
+      try {
+        if (process.platform !== 'darwin') {
+          throw new Error('Automatic Codex paste is supported only on macOS.');
+        }
+        const resources = selectedResources !== undefined && selectedResources.length > 0
+          ? selectedResources
+          : resource === undefined
+            ? []
+            : [resource];
+        const uniqueResources = [...new Map(resources.map((item) => [item.toString(), item])).values()];
+        if (uniqueResources.length === 0) {
+          throw new Error('Select a file or folder in Explorer first.');
+        }
+
+        const mentionResources: ExplorerMentionResource[] = [];
+        for (const item of uniqueResources) {
+          const workspaceFolder = vscode.workspace.getWorkspaceFolder(item);
+          if (item.scheme !== 'file' || workspaceFolder === undefined) {
+            throw new Error('Only files and folders inside the current workspace are supported.');
+          }
+          const relativePath = path.relative(workspaceFolder.uri.fsPath, item.fsPath);
+          const stat = await vscode.workspace.fs.stat(item);
+          mentionResources.push({
+            relativePath,
+            directory: (stat.type & vscode.FileType.Directory) !== 0,
+          });
+        }
+
+        const queries = formatExplorerResourcesAsMentionQueries(mentionResources);
+        await insertMentionsIntoCodex(queries, {
+          openCodexSidebar: async () => {
+            await vscode.commands.executeCommand('chatgpt.openSidebar');
+          },
+          waitForFocus: () => new Promise((resolve) => {
+            setTimeout(resolve, CODEX_CHAT_FOCUS_DELAY_MS);
+          }),
+          chooseMention: (query) => new Promise((resolve, reject) => {
+            execFile('/usr/bin/osascript', ['-e', MACOS_MENTION_PICKER_SCRIPT, query], (error) => {
+              if (error === null) {
+                resolve();
+              } else {
+                reject(error);
+              }
+            });
+          }),
+        });
+      } catch (error) {
+        output.appendLine(`[Codex chat insert] ${errorDetail(error)}`);
+        void vscode.window.showErrorMessage(
+          'Codex @ 멘션 자동화에 실패했습니다. macOS 시스템 설정 → 개인정보 보호 및 보안 → '
+          + '손쉬운 사용에서 Visual Studio Code 권한을 허용해야 합니다.',
+        );
+      }
+    },
   ));
   controller.start();
 

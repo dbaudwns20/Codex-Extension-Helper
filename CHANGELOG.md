@@ -2,6 +2,19 @@
 
 All notable changes to this personal extension are documented in this file.
 
+## 0.0.2 - 2026-08-25
+
+### Added
+
+- A macOS Explorer context-menu command that drives the composer's `@` path
+  picker for one or more selected workspace files or folders without sending.
+
+### Fixed
+
+- Explorer drops insert Codex `atMention` nodes and are intercepted before
+  attachment handling so no separate file card remains.
+- Verified v7 Codex bundle patches migrate safely to v8.
+
 ## 0.0.1 - 2026-08-24
 
 ### Added

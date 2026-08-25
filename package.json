@@ -49,6 +49,11 @@
         "command": "codexExtensionHelper.rejectAll",
         "title": "Codex Changes: Reject All",
         "icon": "$(discard)"
+      },
+      {
+        "command": "codexExtensionHelper.insertExplorerPathIntoCodex",
+        "title": "Codex: Add as @ Mention",
+        "enablement": "isMac"
       }
     ],
     "menus": {
@@ -72,6 +77,13 @@
           "command": "codexExtensionHelper.rejectAll",
           "when": "resourceScheme == file && codexExtensionHelper.activeFileHasChanges",
           "group": "navigation@21"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "codexExtensionHelper.insertExplorerPathIntoCodex",
+          "when": "resourceScheme == file && isMac",
+          "group": "codex@1"
         }
       ]
     },
