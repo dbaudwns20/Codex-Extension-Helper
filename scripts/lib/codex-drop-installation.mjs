@@ -227,6 +227,12 @@ async function readSchema2Metadata(target, paths) {
   return metadata;
 }
 
+function assertCurrentMatches(currentSha256, originalSha256, patchedSha256, label) {
+  if (currentSha256 !== originalSha256 && currentSha256 !== patchedSha256) {
+    throw new Error(`Current ${label} hash does not match patch metadata`);
+  }
+}
+
 async function fileExists(filePath) {
   try {
     await readFile(filePath);
@@ -487,31 +493,53 @@ export async function applyCodexDropPatch(options = {}) {
 export async function restoreCodexDropPatch(options = {}) {
   const target = await findRestoreTarget(options);
   const paths = patchPaths(target.bundlePath);
-  const metadata = await readSchema2Metadata(target, paths);
+  const metadata = await readParsedMetadata(paths);
+  if (metadata?.metadataSchemaVersion === undefined) {
+    assertLegacyMetadataShape(metadata, target, paths);
+    return restoreLegacyBundlePatch(target, paths, metadata);
+  }
+  assertSchema2MetadataShape(metadata, target, paths);
+  return restoreSchema2Patch(target, paths, metadata);
+}
+
+async function restoreLegacyBundlePatch(target, paths, metadata) {
   const currentBundleSource = await readFile(target.bundlePath);
   const currentBundleSha256 = sha256(currentBundleSource);
-  if (currentBundleSha256 !== metadata.patchedSha256 && currentBundleSha256 !== metadata.originalSha256) {
-    throw new Error('Current bundle hash does not match patch metadata');
+  assertCurrentMatches(currentBundleSha256, metadata.originalSha256, metadata.patchedSha256, 'bundle');
+  const originalBundleSource = await readFile(paths.backupPath);
+  if (sha256(originalBundleSource) !== metadata.originalSha256) throw new Error('Backup hash does not match patch metadata');
+  if (currentBundleSha256 === metadata.originalSha256) return { status: 'already-restored', ...target, ...paths };
+
+  const bundleTempPath = await writeTemporary(target.bundlePath, originalBundleSource);
+  try {
+    await rename(bundleTempPath, target.bundlePath);
+  } catch (error) {
+    throw new Error(`Could not restore Codex drop patch: ${error.message}`);
+  } finally {
+    await rm(bundleTempPath, { force: true });
   }
+  return { status: 'restored', ...target, ...paths };
+}
+
+async function restoreSchema2Patch(target, paths, metadata) {
+  const currentBundleSource = await readFile(target.bundlePath);
+  const currentBundleSha256 = sha256(currentBundleSource);
+  assertCurrentMatches(currentBundleSha256, metadata.originalSha256, metadata.patchedSha256, 'bundle');
   const originalBundleSource = await readFile(paths.backupPath);
   if (sha256(originalBundleSource) !== metadata.originalSha256) throw new Error('Backup hash does not match patch metadata');
   const currentIndexSource = await readFile(paths.indexPath, 'utf8');
   const currentIndexSha256 = sha256(currentIndexSource);
-  if (currentIndexSha256 !== metadata.patchedIndexSha256 && currentIndexSha256 !== metadata.originalIndexSha256) {
-    throw new Error('Current index hash does not match patch metadata');
-  }
+  assertCurrentMatches(currentIndexSha256, metadata.originalIndexSha256, metadata.patchedIndexSha256, 'index');
   const originalIndexSource = await readFile(paths.indexBackupPath, 'utf8');
   if (sha256(originalIndexSource) !== metadata.originalIndexSha256) throw new Error('Index backup hash does not match patch metadata');
   const bootstrapExists = await fileExists(paths.bootstrapPath);
   if (bootstrapExists) {
     if (sha256(await readFile(paths.bootstrapPath)) !== metadata.bootstrapSha256) {
-      throw new Error('Current bootstrap hash does not match patch metadata');
+      throw new Error('Bootstrap hash does not match patch metadata');
     }
-  }
-  if (currentIndexSha256 === metadata.patchedIndexSha256 && !bootstrapExists) {
-    throw new Error('Current bootstrap hash does not match patch metadata');
-  }
-  if (currentBundleSha256 === metadata.originalSha256 && currentIndexSha256 === metadata.originalIndexSha256 && !bootstrapExists) {
+  } else if (currentBundleSha256 !== metadata.originalSha256 || currentIndexSha256 !== metadata.originalIndexSha256) {
+    throw new Error('Current install is partially restored without managed bootstrap');
+  } else {
     return { status: 'already-restored', ...target, ...paths };
   }
 
@@ -519,7 +547,12 @@ export async function restoreCodexDropPatch(options = {}) {
   const indexTempPath = await writeTemporary(paths.indexPath, originalIndexSource);
   try {
     await rename(indexTempPath, paths.indexPath);
-    await rename(bundleTempPath, target.bundlePath);
+    try {
+      await rename(bundleTempPath, target.bundlePath);
+    } catch (error) {
+      await restoreFromBackup(paths.indexPath, currentIndexSource);
+      throw error;
+    }
     await removeBootstrapIfMatches(paths.bootstrapPath, metadata.bootstrapSha256);
   } catch (error) {
     throw new Error(`Could not restore Codex drop patch: ${error.message}`);

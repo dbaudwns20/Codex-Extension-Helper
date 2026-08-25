@@ -6,6 +6,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 const composerAnchor = 'IR(`add-context-file`,it.view.dom,e=>{Ei(),bee([e.file])});';
 const composerContext = 'const cwd="/workspace";const isHome=cwd===`~`;';
 const temporaryDirectories: string[] = [];
+type PatchResultPaths = {
+  backupPath: string;
+  bootstrapPath: string;
+  bundlePath: string;
+  indexBackupPath: string;
+  indexPath: string;
+};
 
 async function makeTemporaryDirectory() {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'codex-drop-installation-'));
@@ -31,6 +38,35 @@ async function makeInstallation(root: string, version: string, bundleNames = ['a
     `${composerContext}before;${composerAnchor}after;`,
   )));
   return extensionDir;
+}
+
+async function makeLegacyBundlePatchFixture(extensionDir: string) {
+  // @ts-expect-error Script modules are intentionally JavaScript-only.
+  const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
+  // @ts-expect-error Script modules are intentionally JavaScript-only.
+  const { sha256 } = await import('../../scripts/lib/codex-drop-installation.mjs');
+  const bundlePath = path.join(extensionDir, 'webview/assets/app-initial-current.js');
+  const backupPath = `${bundlePath}.codex-explorer-drop-chips.original`;
+  const metadataPath = `${bundlePath}.codex-explorer-drop-chips.json`;
+  const originalBundle = await readFile(bundlePath, 'utf8');
+  const patchedBundle = patchBundleSource(originalBundle).source;
+  await writeFile(bundlePath, patchedBundle);
+  await writeFile(backupPath, originalBundle);
+  await writeFile(metadataPath, `${JSON.stringify({
+    patchVersion: 6,
+    extensionVersion: '26.818.61809',
+    bundlePath,
+    backupPath,
+    originalSha256: sha256(originalBundle),
+    patchedSha256: sha256(patchedBundle),
+  }, null, 2)}\n`);
+  return {
+    backupPath,
+    bundlePath,
+    metadataPath,
+    originalBundle,
+    patchedBundle,
+  };
 }
 
 afterEach(async () => {
@@ -123,11 +159,13 @@ describe('Codex drop installation lifecycle', () => {
     const extensionsRoot = await makeTemporaryDirectory();
     const extensionDir = await makeInstallation(extensionsRoot, '26.818.61809');
     const bundlePath = path.join(extensionDir, 'webview/assets/app-initial-current.js');
-    const originalSource = await readFile(bundlePath, 'utf8');
+    const indexPath = path.join(extensionDir, 'webview/index.html');
+    const originalBundle = await readFile(bundlePath);
+    const originalIndex = await readFile(indexPath);
 
     const first = await applyCodexDropPatch({ extensionDir });
     expect(first.status).toBe('patched');
-    expect(first.indexPath).toBe(path.join(extensionDir, 'webview/index.html'));
+    expect(first.indexPath).toBe(indexPath);
     expect(first.bootstrapPath).toBe(path.join(extensionDir, 'webview/assets/codex-explorer-drop-cache-bootstrap-v1.js'));
     const metadata = JSON.parse(await readFile(first.metadataPath, 'utf8'));
     expect(metadata.metadataSchemaVersion).toBe(2);
@@ -141,7 +179,9 @@ describe('Codex drop installation lifecycle', () => {
 
     const restored = await restoreCodexDropPatch({ extensionDir });
     expect(restored.status).toBe('restored');
-    expect(await readFile(bundlePath, 'utf8')).toBe(originalSource);
+    expect(await readFile(bundlePath)).toEqual(originalBundle);
+    expect(await readFile(indexPath)).toEqual(originalIndex);
+    await expect(readFile(first.bootstrapPath)).rejects.toMatchObject({ code: 'ENOENT' });
 
     const secondRestore = await restoreCodexDropPatch({ extensionDir });
     expect(secondRestore.status).toBe('already-restored');
@@ -158,26 +198,10 @@ describe('Codex drop installation lifecycle', () => {
 
   it('migrates a verified legacy v6 bundle patch to schema 2 without rewriting the bundle backup', async () => {
     // @ts-expect-error Script modules are intentionally JavaScript-only.
-    const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
-    // @ts-expect-error Script modules are intentionally JavaScript-only.
-    const { applyCodexDropPatch, sha256 } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    const { applyCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
     const extensionsRoot = await makeTemporaryDirectory();
     const extensionDir = await makeInstallation(extensionsRoot, '26.818.61809');
-    const bundlePath = path.join(extensionDir, 'webview/assets/app-initial-current.js');
-    const backupPath = `${bundlePath}.codex-explorer-drop-chips.original`;
-    const metadataPath = `${bundlePath}.codex-explorer-drop-chips.json`;
-    const originalBundle = await readFile(bundlePath, 'utf8');
-    const patchedBundle = patchBundleSource(originalBundle).source;
-    await writeFile(bundlePath, patchedBundle);
-    await writeFile(backupPath, originalBundle);
-    await writeFile(metadataPath, `${JSON.stringify({
-      patchVersion: 6,
-      extensionVersion: '26.818.61809',
-      bundlePath,
-      backupPath,
-      originalSha256: sha256(originalBundle),
-      patchedSha256: sha256(patchedBundle),
-    }, null, 2)}\n`);
+    const { backupPath, bundlePath, metadataPath } = await makeLegacyBundlePatchFixture(extensionDir);
     const bundleBeforeMigration = await readFile(bundlePath);
     const backupBeforeMigration = await readFile(backupPath);
 
@@ -188,26 +212,41 @@ describe('Codex drop installation lifecycle', () => {
     expect(JSON.parse(await readFile(metadataPath, 'utf8')).metadataSchemaVersion).toBe(2);
   });
 
-  it('refuses to restore a patched bundle changed after patching', async () => {
+  it.each([
+    ['bundle', (result: PatchResultPaths) => result.bundlePath, 'Current bundle hash does not match patch metadata'],
+    ['index', (result: PatchResultPaths) => result.indexPath, 'Current index hash does not match patch metadata'],
+    ['bundle backup', (result: PatchResultPaths) => result.backupPath, 'Backup hash does not match patch metadata'],
+    ['index backup', (result: PatchResultPaths) => result.indexBackupPath, 'Index backup hash does not match patch metadata'],
+    ['bootstrap', (result: PatchResultPaths) => result.bootstrapPath, 'Bootstrap hash does not match patch metadata'],
+  ])('refuses restore after %s changes', async (_name, selectPath, expected) => {
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { applyCodexDropPatch, restoreCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
     const extensionsRoot = await makeTemporaryDirectory();
     const extensionDir = await makeInstallation(extensionsRoot, '26.818.61809');
-    const first = await applyCodexDropPatch({ extensionDir });
-    await writeFile(first.bundlePath, 'modified after patching');
+    const result = await applyCodexDropPatch({ extensionDir });
+    await writeFile(selectPath(result), 'modified after patching');
+    const bundleBeforeRestore = await readFile(result.bundlePath);
+    const indexBeforeRestore = await readFile(result.indexPath);
 
-    await expect(restoreCodexDropPatch({ extensionDir })).rejects.toThrow('Current bundle hash does not match patch metadata');
+    await expect(restoreCodexDropPatch({ extensionDir })).rejects.toThrow(expected);
+    expect(await readFile(result.bundlePath)).toEqual(bundleBeforeRestore);
+    expect(await readFile(result.indexPath)).toEqual(indexBeforeRestore);
   });
 
-  it('refuses to restore when the original backup has changed', async () => {
+  it('restores a legacy metadata bundle patch without touching index.html or bootstrap assets', async () => {
     // @ts-expect-error Script modules are intentionally JavaScript-only.
-    const { applyCodexDropPatch, restoreCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    const { restoreCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
     const extensionsRoot = await makeTemporaryDirectory();
     const extensionDir = await makeInstallation(extensionsRoot, '26.818.61809');
-    const first = await applyCodexDropPatch({ extensionDir });
-    await writeFile(first.backupPath, 'modified backup');
+    const indexPath = path.join(extensionDir, 'webview/index.html');
+    const originalIndex = await readFile(indexPath);
+    const { bundlePath, originalBundle } = await makeLegacyBundlePatchFixture(extensionDir);
 
-    await expect(restoreCodexDropPatch({ extensionDir })).rejects.toThrow('Backup hash does not match patch metadata');
+    const restored = await restoreCodexDropPatch({ extensionDir });
+    expect(restored.status).toBe('restored');
+    expect(await readFile(bundlePath, 'utf8')).toBe(originalBundle);
+    expect(await readFile(indexPath)).toEqual(originalIndex);
+    await expect(readFile(path.join(extensionDir, 'webview/assets/codex-explorer-drop-cache-bootstrap-v1.js'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('refuses to restore from already-restored files when the managed bootstrap artifact is tampered', async () => {
@@ -221,7 +260,7 @@ describe('Codex drop installation lifecycle', () => {
     const indexBeforeRetry = await readFile(first.indexPath);
     await writeFile(first.bootstrapPath, 'tampered bootstrap');
 
-    await expect(restoreCodexDropPatch({ extensionDir })).rejects.toThrow('Current bootstrap hash does not match patch metadata');
+    await expect(restoreCodexDropPatch({ extensionDir })).rejects.toThrow('Bootstrap hash does not match patch metadata');
     expect(await readFile(first.bundlePath)).toEqual(bundleBeforeRetry);
     expect(await readFile(first.indexPath)).toEqual(indexBeforeRetry);
     expect(await readFile(first.bootstrapPath, 'utf8')).toBe('tampered bootstrap');
