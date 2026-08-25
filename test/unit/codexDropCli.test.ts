@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 const composerAnchor = 'IR(`add-context-file`,it.view.dom,e=>{Ei(),bee([e.file])});';
+const composerContext = 'const cwd="/workspace";const isHome=cwd===`~`;';
 const temporaryDirectories: string[] = [];
 const patchScript = path.resolve('scripts/patch-codex-drop.mjs');
 const restoreScript = path.resolve('scripts/unpatch-codex-drop.mjs');
@@ -15,7 +16,7 @@ async function makeTemporaryDirectory() {
   return directory;
 }
 
-async function makeInstallation(root: string, version: string, source = `before;${composerAnchor}after;`) {
+async function makeInstallation(root: string, version: string, source = `${composerContext}before;${composerAnchor}after;`) {
   const extensionDir = path.join(root, `openai.chatgpt-${version}-darwin-arm64`);
   await mkdir(path.join(extensionDir, 'webview/assets'), { recursive: true });
   await writeFile(path.join(extensionDir, 'package.json'), JSON.stringify({ name: 'chatgpt', version }));

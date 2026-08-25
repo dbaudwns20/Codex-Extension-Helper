@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 const composerAnchor = 'IR(`add-context-file`,it.view.dom,e=>{Ei(),bee([e.file])});';
+const composerContext = 'const cwd="/workspace";const isHome=cwd===`~`;';
 const temporaryDirectories: string[] = [];
 
 async function makeTemporaryDirectory() {
@@ -18,7 +19,8 @@ async function makeInstallation(root: string, version: string, bundleNames = ['a
   await writeFile(path.join(extensionDir, 'package.json'), JSON.stringify({ name: 'chatgpt', version }));
   await Promise.all(bundleNames.map((bundleName) => writeFile(
     path.join(extensionDir, 'webview/assets', bundleName),
-    `before;${composerAnchor}after;`,
+
+    `${composerContext}before;${composerAnchor}after;`,
   )));
   return extensionDir;
 }
@@ -117,7 +119,7 @@ describe('Codex drop installation lifecycle', () => {
 
     const first = await applyCodexDropPatch({ extensionDir });
     expect(first.status).toBe('patched');
-    expect(await readFile(first.metadataPath, 'utf8')).toContain('"patchVersion": 2');
+    expect(await readFile(first.metadataPath, 'utf8')).toContain('"patchVersion": 6');
 
     const second = await applyCodexDropPatch({ extensionDir });
     expect(second.status).toBe('already-patched');
@@ -137,7 +139,7 @@ describe('Codex drop installation lifecycle', () => {
     const repatched = await applyCodexDropPatch({ extensionDir });
     expect(repatched.status).toBe('patched');
     expect(repatched.backupPath).toBe(first.backupPath);
-    expect(await readFile(first.metadataPath, 'utf8')).toContain('"patchVersion": 2');
+    expect(await readFile(first.metadataPath, 'utf8')).toContain('"patchVersion": 6');
   });
 
   it('refuses to restore a patched bundle changed after patching', async () => {
