@@ -18,6 +18,7 @@ try {
     console.log(`Codex ${result.extensionVersion} is already restored`);
   }
   console.log(`Bundle: ${result.bundlePath}`);
+  if (result.indexPath !== undefined) console.log(`Index: ${result.indexPath}`);
   console.log(`Status: ${result.status}`);
   if (result.status === 'restored') console.log('Reload VS Code to use the updated Codex webview.');
 } catch (error) {

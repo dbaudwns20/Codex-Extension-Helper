@@ -12,14 +12,16 @@ function optionsFromArguments(arguments_) {
 
 try {
   const result = await applyCodexDropPatch(optionsFromArguments(process.argv.slice(2)));
-  if (result.status === 'patched') {
-    console.log(`Patched Codex ${result.extensionVersion}`);
-  } else {
-    console.log(`Codex ${result.extensionVersion} is already patched`);
-  }
+  if (result.status === 'patched') console.log(`Patched Codex ${result.extensionVersion}`);
+  else if (result.status === 'migrated') console.log(`Migrated Codex ${result.extensionVersion}`);
+  else console.log(`Codex ${result.extensionVersion} is already patched`);
   console.log(`Bundle: ${result.bundlePath}`);
+  console.log(`Index: ${result.indexPath}`);
   console.log(`Status: ${result.status}`);
-  if (result.status === 'patched') console.log('Reload VS Code to use the updated Codex webview.');
+  if (result.status !== 'already-patched') {
+    console.log('Reload VS Code to use the updated Codex webview.');
+    console.log('The first Codex webview load will refresh its cache once.');
+  }
 } catch (error) {
   console.error(`Codex drop patch failed: ${error.message}`);
   process.exitCode = 1;

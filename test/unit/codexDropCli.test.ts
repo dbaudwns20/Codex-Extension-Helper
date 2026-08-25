@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -32,6 +32,28 @@ async function makeInstallation(root: string, version: string, source = `${compo
   return extensionDir;
 }
 
+async function makeLegacyBundlePatchFixture(extensionDir: string, version: string) {
+  // @ts-expect-error Script modules are intentionally JavaScript-only.
+  const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
+  // @ts-expect-error Script modules are intentionally JavaScript-only.
+  const { sha256 } = await import('../../scripts/lib/codex-drop-installation.mjs');
+  const bundlePath = path.join(extensionDir, 'webview/assets/app-initial-current.js');
+  const backupPath = `${bundlePath}.codex-explorer-drop-chips.original`;
+  const metadataPath = `${bundlePath}.codex-explorer-drop-chips.json`;
+  const originalBundle = await readFile(bundlePath, 'utf8');
+  const patchedBundle = patchBundleSource(originalBundle).source;
+  await writeFile(bundlePath, patchedBundle);
+  await writeFile(backupPath, originalBundle);
+  await writeFile(metadataPath, `${JSON.stringify({
+    patchVersion: 6,
+    extensionVersion: version,
+    bundlePath,
+    backupPath,
+    originalSha256: sha256(originalBundle),
+    patchedSha256: sha256(patchedBundle),
+  }, null, 2)}\n`);
+}
+
 function run(scriptPath: string, ...arguments_: string[]) {
   return spawnSync(process.execPath, [scriptPath, ...arguments_], { encoding: 'utf8' });
 }
@@ -41,21 +63,64 @@ afterEach(async () => {
 });
 
 describe('Codex drop patch CLIs', () => {
-  it('patches, reports an existing patch, and restores an explicit installation', async () => {
+  it('reports schema-2 patch, already-patched, restored, and already-restored statuses', async () => {
     const root = await makeTemporaryDirectory();
     const extensionDir = await makeInstallation(root, '26.818.61809');
 
     const firstPatch = run(patchScript, '--extension-dir', extensionDir);
     expect(firstPatch.status).toBe(0);
     expect(firstPatch.stdout).toContain('Patched Codex 26.818.61809');
+    expect(firstPatch.stdout).toContain('The first Codex webview load will refresh its cache once.');
+    expect(firstPatch.stdout).toContain('Reload VS Code');
+    expect(firstPatch.stdout).toContain(`Index: ${path.join(extensionDir, 'webview/index.html')}`);
+    expect(firstPatch.stdout).toContain('Status: patched');
 
     const secondPatch = run(patchScript, '--extension-dir', extensionDir);
     expect(secondPatch.status).toBe(0);
     expect(secondPatch.stdout).toContain('already patched');
+    expect(secondPatch.stdout).toContain('Status: already-patched');
 
     const restore = run(restoreScript, '--extension-dir', extensionDir);
     expect(restore.status).toBe(0);
     expect(restore.stdout).toContain('Restored Codex 26.818.61809');
+    expect(restore.stdout).toContain('Reload VS Code');
+    expect(restore.stdout).toContain(`Index: ${path.join(extensionDir, 'webview/index.html')}`);
+    expect(restore.stdout).toContain('Status: restored');
+
+    const secondRestore = run(restoreScript, '--extension-dir', extensionDir);
+    expect(secondRestore.status).toBe(0);
+    expect(secondRestore.stdout).toContain('already restored');
+    expect(secondRestore.stdout).toContain('Status: already-restored');
+  });
+
+  it('reports legacy migration with cache refresh guidance', async () => {
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.818.61809');
+    await makeLegacyBundlePatchFixture(extensionDir, '26.818.61809');
+
+    const migratedPatch = run(patchScript, '--extension-dir', extensionDir);
+    expect(migratedPatch.status).toBe(0);
+    expect(migratedPatch.stdout).toContain('Migrated Codex 26.818.61809');
+    expect(migratedPatch.stdout).toContain('The first Codex webview load will refresh its cache once.');
+    expect(migratedPatch.stdout).toContain('Reload VS Code');
+    expect(migratedPatch.stdout).toContain(`Index: ${path.join(extensionDir, 'webview/index.html')}`);
+    expect(migratedPatch.stdout).toContain('Status: migrated');
+  });
+
+  it('restores a legacy bundle-only patch under the current lifecycle contract', async () => {
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.818.61809');
+    await makeLegacyBundlePatchFixture(extensionDir, '26.818.61809');
+
+    const restore = run(restoreScript, '--extension-dir', extensionDir);
+    expect(restore.status).toBe(0);
+    expect(restore.stdout).toContain('Restored Codex 26.818.61809');
+    expect(restore.stdout).toContain('Reload VS Code');
+    expect(restore.stdout).toContain(`Bundle: ${path.join(extensionDir, 'webview/assets/app-initial-current.js')}`);
+    expect(restore.stdout).toContain('Status: restored');
+    if (restore.stdout.includes('Index:')) {
+      expect(restore.stdout).toContain(`Index: ${path.join(extensionDir, 'webview/index.html')}`);
+    }
   });
 
   it('prints concise errors for malformed arguments and incompatible installations', async () => {
