@@ -147,4 +147,13 @@ describe('Codex webview cache source', () => {
     const malformed = '<!-- codex-explorer-drop-cache:start:v1 --><!-- codex-explorer-drop-cache:end:v1 -->';
     expect(() => unpatchIndexSource(malformed)).toThrow(/missing its original entry module/u);
   });
+
+  it('rejects a valid marker block when an extra production entry remains outside it', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { patchIndexSource, unpatchIndexSource } = await import('../../scripts/lib/codex-webview-cache-source.mjs');
+    const patched = patchIndexSource(indexSource);
+    const malformed = `${patched.source}\n${entryTag}`;
+    expect(() => patchIndexSource(malformed)).toThrow(/exactly one Codex webview entry module/u);
+    expect(() => unpatchIndexSource(malformed)).toThrow(/exactly one Codex webview entry module/u);
+  });
 });

@@ -49,6 +49,9 @@ export function patchIndexSource(source) {
   assertSupportedMarkers(source);
   const pair = markerPair(source);
   if (pair !== undefined) {
+    if ([...source.matchAll(ENTRY_MODULE)].length !== 0) {
+      throw new Error('Expected exactly one Codex webview entry module');
+    }
     const block = source.slice(pair.start, pair.end);
     const originalTag = originalTagFromBlock(block);
     const match = originalTag.match(ENTRY_MODULE_EXACT);
@@ -71,6 +74,9 @@ export function unpatchIndexSource(source) {
   assertSupportedMarkers(source);
   const pair = markerPair(source);
   if (pair === undefined) return { status: 'not-patched', source };
+  if ([...source.matchAll(ENTRY_MODULE)].length !== 0) {
+    throw new Error('Expected exactly one Codex webview entry module');
+  }
   const block = source.slice(pair.start, pair.end);
   const originalTag = originalTagFromBlock(block);
   return { status: 'restored', source: source.slice(0, pair.start) + originalTag + source.slice(pair.end) };
