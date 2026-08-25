@@ -146,15 +146,14 @@ describe('Codex drop installation lifecycle', () => {
     const secondRestore = await restoreCodexDropPatch({ extensionDir });
     expect(secondRestore.status).toBe('already-restored');
 
-    const legacyMetadata = JSON.parse(await readFile(first.metadataPath, 'utf8'));
-    legacyMetadata.patchVersion = 1;
-    legacyMetadata.patchedSha256 = '0'.repeat(64);
-    await writeFile(first.metadataPath, `${JSON.stringify(legacyMetadata, null, 2)}\n`);
+    const corruptedMetadata = JSON.parse(await readFile(first.metadataPath, 'utf8'));
+    corruptedMetadata.patchVersion = 1;
+    corruptedMetadata.patchedSha256 = '0'.repeat(64);
+    const corruptedMetadataSource = `${JSON.stringify(corruptedMetadata, null, 2)}\n`;
+    await writeFile(first.metadataPath, corruptedMetadataSource);
 
-    const repatched = await applyCodexDropPatch({ extensionDir });
-    expect(repatched.status).toBe('patched');
-    expect(repatched.backupPath).toBe(first.backupPath);
-    expect(await readFile(first.metadataPath, 'utf8')).toContain('"patchVersion": 6');
+    await expect(applyCodexDropPatch({ extensionDir })).rejects.toThrow('Codex drop patch metadata is invalid');
+    expect(await readFile(first.metadataPath, 'utf8')).toBe(corruptedMetadataSource);
   });
 
   it('migrates a verified legacy v6 bundle patch to schema 2 without rewriting the bundle backup', async () => {
@@ -209,6 +208,50 @@ describe('Codex drop installation lifecycle', () => {
     await writeFile(first.backupPath, 'modified backup');
 
     await expect(restoreCodexDropPatch({ extensionDir })).rejects.toThrow('Backup hash does not match patch metadata');
+  });
+
+  it('refuses to restore from already-restored files when the managed bootstrap artifact is tampered', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { applyCodexDropPatch, restoreCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    const extensionsRoot = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(extensionsRoot, '26.818.61809');
+    const first = await applyCodexDropPatch({ extensionDir });
+    await restoreCodexDropPatch({ extensionDir });
+    const bundleBeforeRetry = await readFile(first.bundlePath);
+    const indexBeforeRetry = await readFile(first.indexPath);
+    await writeFile(first.bootstrapPath, 'tampered bootstrap');
+
+    await expect(restoreCodexDropPatch({ extensionDir })).rejects.toThrow('Current bootstrap hash does not match patch metadata');
+    expect(await readFile(first.bundlePath)).toEqual(bundleBeforeRetry);
+    expect(await readFile(first.indexPath)).toEqual(indexBeforeRetry);
+    expect(await readFile(first.bootstrapPath, 'utf8')).toBe('tampered bootstrap');
+  });
+
+  it('refuses to reapply from restored files when schema-2 metadata fields are independently corrupted', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { applyCodexDropPatch, restoreCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    const corruptions = [
+      { field: 'patchVersion', value: 5 },
+      { field: 'cacheBootstrapVersion', value: 9 },
+      { field: 'patchedSha256', value: '1'.repeat(64) },
+      { field: 'patchedIndexSha256', value: '2'.repeat(64) },
+      { field: 'bootstrapSha256', value: '3'.repeat(64) },
+      { field: 'entrySource', value: './assets/index-corrupted.js' },
+    ] as const;
+
+    for (const corruption of corruptions) {
+      const extensionsRoot = await makeTemporaryDirectory();
+      const extensionDir = await makeInstallation(extensionsRoot, '26.818.61809');
+      const first = await applyCodexDropPatch({ extensionDir });
+      await restoreCodexDropPatch({ extensionDir });
+      const metadata = JSON.parse(await readFile(first.metadataPath, 'utf8'));
+      metadata[corruption.field] = corruption.value;
+      const corruptedMetadata = `${JSON.stringify(metadata, null, 2)}\n`;
+      await writeFile(first.metadataPath, corruptedMetadata);
+
+      await expect(applyCodexDropPatch({ extensionDir })).rejects.toThrow();
+      expect(await readFile(first.metadataPath, 'utf8')).toBe(corruptedMetadata);
+    }
   });
 
   it('refuses to overwrite stale metadata that has no original backup', async () => {

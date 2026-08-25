@@ -206,15 +206,7 @@ function assertReusableMetadataShape(metadata, target, paths) {
     || 'originalIndexSha256' in metadata
     || 'bootstrapPath' in metadata
   ) {
-    if (
-      metadata.indexPath !== paths.indexPath
-      || metadata.indexBackupPath !== paths.indexBackupPath
-      || typeof metadata.originalIndexSha256 !== 'string'
-      || !/^[a-f0-9]{64}$/u.test(metadata.originalIndexSha256)
-      || metadata.bootstrapPath !== paths.bootstrapPath
-    ) {
-      throw new Error('Codex drop patch metadata is invalid');
-    }
+    assertSchema2MetadataShape(metadata, target, paths);
   }
 }
 
@@ -463,6 +455,16 @@ export async function applyCodexDropPatch(options = {}) {
       ) {
         throw new Error('Existing Codex drop backup does not match the current original bundle');
       }
+      if (metadata.metadataSchemaVersion === METADATA_SCHEMA_VERSION) {
+        if (
+          metadata.patchedSha256 !== bundle.patchedSha256
+          || metadata.patchedIndexSha256 !== index.patchedSha256
+          || metadata.bootstrapSha256 !== sha256(bootstrapSource)
+          || metadata.entrySource !== index.entrySource
+        ) {
+          throw new Error('Codex drop patch metadata is invalid');
+        }
+      }
       if (bootstrapExists) throw new Error('Current index is already patched without valid schema-2 metadata');
     }
   } else if (metadataExists) {
@@ -501,11 +503,13 @@ export async function restoreCodexDropPatch(options = {}) {
   const originalIndexSource = await readFile(paths.indexBackupPath, 'utf8');
   if (sha256(originalIndexSource) !== metadata.originalIndexSha256) throw new Error('Index backup hash does not match patch metadata');
   const bootstrapExists = await fileExists(paths.bootstrapPath);
-  if (currentIndexSha256 === metadata.patchedIndexSha256) {
-    if (!bootstrapExists) throw new Error('Current bootstrap hash does not match patch metadata');
+  if (bootstrapExists) {
     if (sha256(await readFile(paths.bootstrapPath)) !== metadata.bootstrapSha256) {
       throw new Error('Current bootstrap hash does not match patch metadata');
     }
+  }
+  if (currentIndexSha256 === metadata.patchedIndexSha256 && !bootstrapExists) {
+    throw new Error('Current bootstrap hash does not match patch metadata');
   }
   if (currentBundleSha256 === metadata.originalSha256 && currentIndexSha256 === metadata.originalIndexSha256 && !bootstrapExists) {
     return { status: 'already-restored', ...target, ...paths };
