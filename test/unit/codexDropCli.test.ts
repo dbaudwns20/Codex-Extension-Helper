@@ -98,6 +98,7 @@ describe('Codex drop patch CLIs', () => {
     expect(secondRestore.status).toBe(0);
     expect(secondRestore.stdout).toContain('already restored');
     expect(secondRestore.stdout).toContain(`Bundle: ${bundlePath}`);
+    expect(secondRestore.stdout).toContain(`Index: ${indexPath}`);
     expect(secondRestore.stdout).toContain('Status: already-restored');
     expect(secondRestore.stdout).not.toContain('Reload VS Code');
     expect(secondRestore.stdout).not.toContain('The first Codex webview load will refresh its cache once.');
@@ -130,9 +131,7 @@ describe('Codex drop patch CLIs', () => {
     expect(restore.stdout).toContain('Reload VS Code');
     expect(restore.stdout).toContain(`Bundle: ${path.join(extensionDir, 'webview/assets/app-initial-current.js')}`);
     expect(restore.stdout).toContain('Status: restored');
-    if (restore.stdout.includes('Index:')) {
-      expect(restore.stdout).toContain(`Index: ${path.join(extensionDir, 'webview/index.html')}`);
-    }
+    expect(restore.stdout).not.toContain('Index:');
   });
 
   it('prints concise errors for malformed arguments and incompatible installations', async () => {

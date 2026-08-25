@@ -8,11 +8,37 @@ import {
   BOOTSTRAP_ASSET_NAME,
   CACHE_BOOTSTRAP_VERSION,
   createBootstrapSource,
+  matchesCacheBootstrapV1Artifacts,
   patchIndexSource,
 } from './codex-webview-cache-source.mjs';
 
 const VERSION_COMPARATOR = new Intl.Collator('en', { numeric: true });
 const METADATA_SCHEMA_VERSION = 2;
+const LEGACY_METADATA_KEYS = [
+  'backupPath',
+  'bundlePath',
+  'extensionVersion',
+  'originalSha256',
+  'patchedSha256',
+  'patchVersion',
+].sort();
+const SCHEMA2_METADATA_KEYS = [
+  'backupPath',
+  'bootstrapPath',
+  'bootstrapSha256',
+  'bundlePath',
+  'cacheBootstrapVersion',
+  'entrySource',
+  'extensionVersion',
+  'indexBackupPath',
+  'indexPath',
+  'metadataSchemaVersion',
+  'originalIndexSha256',
+  'originalSha256',
+  'patchedIndexSha256',
+  'patchedSha256',
+  'patchVersion',
+].sort();
 
 function defaultRoots() {
   return [
@@ -115,6 +141,10 @@ function patchPaths(bundlePath) {
   };
 }
 
+function bootstrapPathForVersion(bundlePath, version) {
+  return path.join(path.dirname(bundlePath), `codex-explorer-drop-cache-bootstrap-v${version}.js`);
+}
+
 function temporaryPath(filePath) {
   return `${filePath}.tmp-${process.pid}-${randomUUID()}`;
 }
@@ -139,13 +169,14 @@ function metadataFor(target, paths, hashes) {
   };
 }
 
-function assertSchema2MetadataShape(metadata, target, paths) {
+function assertSchema2MetadataShape(metadata, target, paths, bootstrapVersion = CACHE_BOOTSTRAP_VERSION) {
   if (
     metadata === null
     || typeof metadata !== 'object'
+    || Object.keys(metadata).sort().join('\0') !== SCHEMA2_METADATA_KEYS.join('\0')
     || metadata.metadataSchemaVersion !== METADATA_SCHEMA_VERSION
     || metadata.patchVersion !== PATCH_VERSION
-    || metadata.cacheBootstrapVersion !== CACHE_BOOTSTRAP_VERSION
+    || metadata.cacheBootstrapVersion !== bootstrapVersion
     || metadata.extensionVersion !== target.extensionVersion
     || metadata.bundlePath !== target.bundlePath
     || metadata.backupPath !== paths.backupPath
@@ -159,13 +190,21 @@ function assertSchema2MetadataShape(metadata, target, paths) {
     || !/^[a-f0-9]{64}$/u.test(metadata.originalIndexSha256)
     || typeof metadata.patchedIndexSha256 !== 'string'
     || !/^[a-f0-9]{64}$/u.test(metadata.patchedIndexSha256)
-    || metadata.bootstrapPath !== paths.bootstrapPath
+    || metadata.bootstrapPath !== bootstrapPathForVersion(target.bundlePath, bootstrapVersion)
     || typeof metadata.bootstrapSha256 !== 'string'
     || !/^[a-f0-9]{64}$/u.test(metadata.bootstrapSha256)
     || typeof metadata.entrySource !== 'string'
+    || !/^\.\/assets\/index-[^"]+\.js$/u.test(metadata.entrySource)
   ) {
     throw new Error('Codex drop patch metadata is invalid');
   }
+}
+
+function assertSupportedSchema2MetadataShape(metadata, target, paths) {
+  if (metadata?.cacheBootstrapVersion !== 1 && metadata?.cacheBootstrapVersion !== CACHE_BOOTSTRAP_VERSION) {
+    throw new Error('Codex drop patch metadata is invalid');
+  }
+  assertSchema2MetadataShape(metadata, target, paths, metadata.cacheBootstrapVersion);
 }
 
 function assertLegacyMetadataShape(metadata, target, paths) {
@@ -173,6 +212,7 @@ function assertLegacyMetadataShape(metadata, target, paths) {
     metadata === null
     || typeof metadata !== 'object'
     || 'metadataSchemaVersion' in metadata
+    || Object.keys(metadata).sort().join('\0') !== LEGACY_METADATA_KEYS.join('\0')
     || metadata.patchVersion !== PATCH_VERSION
     || metadata.extensionVersion !== target.extensionVersion
     || metadata.bundlePath !== target.bundlePath
@@ -187,27 +227,8 @@ function assertLegacyMetadataShape(metadata, target, paths) {
 }
 
 function assertReusableMetadataShape(metadata, target, paths) {
-  if (
-    metadata === null
-    || typeof metadata !== 'object'
-    || metadata.extensionVersion !== target.extensionVersion
-    || metadata.bundlePath !== target.bundlePath
-    || metadata.backupPath !== paths.backupPath
-    || typeof metadata.originalSha256 !== 'string'
-    || !/^[a-f0-9]{64}$/u.test(metadata.originalSha256)
-  ) {
-    throw new Error('Codex drop patch metadata is invalid');
-  }
-
-  if (
-    metadata.metadataSchemaVersion === METADATA_SCHEMA_VERSION
-    || 'indexPath' in metadata
-    || 'indexBackupPath' in metadata
-    || 'originalIndexSha256' in metadata
-    || 'bootstrapPath' in metadata
-  ) {
-    assertSchema2MetadataShape(metadata, target, paths);
-  }
+  if (metadata?.metadataSchemaVersion === undefined) assertLegacyMetadataShape(metadata, target, paths);
+  else assertSupportedSchema2MetadataShape(metadata, target, paths);
 }
 
 async function readParsedMetadata(paths) {
@@ -252,17 +273,45 @@ async function writeTemporary(filePath, data) {
 async function removeBootstrapIfMatches(bootstrapPath, expectedSha256) {
   try {
     const currentSource = await readFile(bootstrapPath);
-    if (sha256(currentSource) === expectedSha256) await rm(bootstrapPath, { force: true });
+    if (sha256(currentSource) !== expectedSha256) return false;
+    await rm(bootstrapPath, { force: true });
+    return true;
   } catch (error) {
-    if (error?.code === 'ENOENT') return;
+    if (error?.code === 'ENOENT') return false;
     throw error;
   }
 }
 
-async function restoreFromBackup(targetPath, source) {
+function fileOperationsFor(options) {
+  return {
+    rename: options?.__testFileOperations?.rename ?? rename,
+  };
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function attemptRollbackActions(actions) {
+  const results = await Promise.allSettled(actions.map(({ run }) => Promise.resolve().then(run)));
+  return results.flatMap((result, index) => (
+    result.status === 'rejected'
+      ? [{ label: actions[index].label, message: errorMessage(result.reason) }]
+      : []
+  ));
+}
+
+function transactionError(prefix, error, rollbackFailures) {
+  const rollbackSuffix = rollbackFailures.length === 0
+    ? ''
+    : `; rollback failures: ${rollbackFailures.map(({ label, message }) => `${label}: ${message}`).join('; ')}`;
+  return new Error(`${prefix}: ${errorMessage(error)}${rollbackSuffix}`);
+}
+
+async function restoreFromBackup(targetPath, source, operations) {
   const tempPath = await writeTemporary(targetPath, source);
   try {
-    await rename(tempPath, targetPath);
+    await operations.rename(tempPath, targetPath);
   } finally {
     await rm(tempPath, { force: true });
   }
@@ -276,6 +325,8 @@ async function installSchema2Patch({
   bootstrapSource,
   backups,
   status,
+  obsoleteBootstrap,
+  operations = fileOperationsFor(),
 }) {
   const metadata = metadataFor(target, paths, {
     originalSha256: bundle.originalSha256,
@@ -286,7 +337,7 @@ async function installSchema2Patch({
     entrySource: index.entrySource,
   });
   const tempPaths = {};
-  const createdBackups = [];
+  let preserveObsoleteBootstrapTemp = false;
   try {
     tempPaths.bootstrap = await writeTemporary(paths.bootstrapPath, bootstrapSource);
     tempPaths.index = await writeTemporary(paths.indexPath, index.patchedSource);
@@ -295,48 +346,92 @@ async function installSchema2Patch({
 
     if (!backups.bundleExists) {
       await writeFile(paths.backupPath, bundle.originalSource, { flag: 'wx' });
-      createdBackups.push(paths.backupPath);
     }
     if (!backups.indexExists) {
       await writeFile(paths.indexBackupPath, index.originalSource, { flag: 'wx' });
-      createdBackups.push(paths.indexBackupPath);
     }
 
     const renamed = [];
     try {
-      await rename(tempPaths.bootstrap, paths.bootstrapPath);
+      await operations.rename(tempPaths.bootstrap, paths.bootstrapPath);
       tempPaths.bootstrap = undefined;
       renamed.push('bootstrap');
 
-      await rename(tempPaths.index, paths.indexPath);
+      await operations.rename(tempPaths.index, paths.indexPath);
       tempPaths.index = undefined;
       renamed.push('index');
 
       if (tempPaths.bundle !== undefined) {
-        await rename(tempPaths.bundle, target.bundlePath);
+        await operations.rename(tempPaths.bundle, target.bundlePath);
         tempPaths.bundle = undefined;
         renamed.push('bundle');
       }
 
-      await rename(tempPaths.metadata, paths.metadataPath);
+      if (obsoleteBootstrap !== undefined) {
+        if (sha256(await readFile(obsoleteBootstrap.path)) !== obsoleteBootstrap.sha256) {
+          throw new Error('Obsolete bootstrap hash changed during installation');
+        }
+        tempPaths.obsoleteBootstrap = temporaryPath(obsoleteBootstrap.path);
+        await operations.rename(obsoleteBootstrap.path, tempPaths.obsoleteBootstrap);
+        renamed.push('obsolete-bootstrap');
+      }
+
+      await operations.rename(tempPaths.metadata, paths.metadataPath);
       tempPaths.metadata = undefined;
+      if (tempPaths.obsoleteBootstrap !== undefined) {
+        try {
+          await rm(tempPaths.obsoleteBootstrap, { force: true });
+          tempPaths.obsoleteBootstrap = undefined;
+        } catch {
+          // The v1 path is already retired and v2 metadata is committed; cleanup retries below.
+        }
+      }
     } catch (error) {
-      if (renamed.includes('bundle')) await restoreFromBackup(target.bundlePath, bundle.originalSource);
-      if (renamed.includes('index')) await restoreFromBackup(paths.indexPath, index.originalSource);
-      if (renamed.includes('bootstrap')) await removeBootstrapIfMatches(paths.bootstrapPath, metadata.bootstrapSha256);
-      throw new Error(`Could not install Codex drop patch; original bundle remains intact and backup is at ${paths.backupPath}: ${error.message}`);
+      const rollbackActions = [];
+      if (renamed.includes('bundle')) {
+        rollbackActions.push({
+          label: 'bundle',
+          run: () => restoreFromBackup(target.bundlePath, bundle.rollbackSource ?? bundle.originalSource, operations),
+        });
+      }
+      if (renamed.includes('index')) {
+        rollbackActions.push({
+          label: 'index',
+          run: () => restoreFromBackup(paths.indexPath, index.rollbackSource ?? index.originalSource, operations),
+        });
+      }
+      if (renamed.includes('bootstrap')) {
+        rollbackActions.push({
+          label: 'bootstrap',
+          run: () => removeBootstrapIfMatches(paths.bootstrapPath, metadata.bootstrapSha256),
+        });
+      }
+      if (renamed.includes('obsolete-bootstrap') && tempPaths.obsoleteBootstrap !== undefined) {
+        rollbackActions.push({
+          label: `obsolete bootstrap preserved at ${tempPaths.obsoleteBootstrap}`,
+          run: async () => {
+            await operations.rename(tempPaths.obsoleteBootstrap, obsoleteBootstrap.path);
+            tempPaths.obsoleteBootstrap = undefined;
+          },
+        });
+      }
+      const rollbackFailures = await attemptRollbackActions(rollbackActions);
+      preserveObsoleteBootstrapTemp = rollbackFailures.some(({ label }) => label.startsWith('obsolete bootstrap preserved at '));
+      throw transactionError(
+        `Could not install Codex drop patch; recovery backups are ${paths.backupPath} and ${paths.indexBackupPath}`,
+        error,
+        rollbackFailures,
+      );
     }
-  } catch (error) {
-    if (createdBackups.length !== 0) {
-      await Promise.all(createdBackups.map((filePath) => rm(filePath, { force: true })));
-    }
-    throw error;
   } finally {
-    await Promise.all([
+    await Promise.allSettled([
       tempPaths.bootstrap === undefined ? undefined : rm(tempPaths.bootstrap, { force: true }),
       tempPaths.index === undefined ? undefined : rm(tempPaths.index, { force: true }),
       tempPaths.bundle === undefined ? undefined : rm(tempPaths.bundle, { force: true }),
       tempPaths.metadata === undefined ? undefined : rm(tempPaths.metadata, { force: true }),
+      tempPaths.obsoleteBootstrap === undefined || preserveObsoleteBootstrapTemp
+        ? undefined
+        : rm(tempPaths.obsoleteBootstrap, { force: true }),
     ]);
   }
 
@@ -367,11 +462,80 @@ async function findRestoreTarget(options) {
   throw new Error('No Codex drop patch metadata found');
 }
 
+async function migrateSchema2V1Patch(target, paths, bundleSource, metadata, operations) {
+  assertSchema2MetadataShape(metadata, target, paths, 1);
+  if (sha256(bundleSource) !== metadata.patchedSha256) throw new Error('Current bundle hash does not match patch metadata');
+  const originalBundleSource = await readFile(paths.backupPath, 'utf8');
+  if (sha256(originalBundleSource) !== metadata.originalSha256) throw new Error('Backup hash does not match patch metadata');
+  const expectedBundle = patchBundleSource(originalBundleSource);
+  if (expectedBundle.status !== 'patched' || sha256(expectedBundle.source) !== metadata.patchedSha256) {
+    throw new Error('Codex drop patch metadata is invalid');
+  }
+
+  const currentIndexSource = await readFile(paths.indexPath, 'utf8');
+  if (sha256(currentIndexSource) !== metadata.patchedIndexSha256) throw new Error('Current index hash does not match patch metadata');
+  const originalIndexSource = await readFile(paths.indexBackupPath, 'utf8');
+  if (sha256(originalIndexSource) !== metadata.originalIndexSha256) throw new Error('Index backup hash does not match patch metadata');
+  const currentBootstrapSource = await readFile(metadata.bootstrapPath, 'utf8');
+  if (sha256(currentBootstrapSource) !== metadata.bootstrapSha256) throw new Error('Current bootstrap hash does not match patch metadata');
+  if (!matchesCacheBootstrapV1Artifacts({
+    originalIndexSource,
+    patchedIndexSource: currentIndexSource,
+    bootstrapSource: currentBootstrapSource,
+    entrySource: metadata.entrySource,
+  })) {
+    throw new Error('Codex drop patch metadata is invalid');
+  }
+  if (await fileExists(paths.bootstrapPath)) throw new Error('Current install contains unexpected bootstrap-v2 state');
+
+  const indexTransformed = patchIndexSource(originalIndexSource);
+  if (indexTransformed.status !== 'patched' || indexTransformed.entrySource !== metadata.entrySource) {
+    throw new Error('Codex drop patch metadata is invalid');
+  }
+  return installSchema2Patch({
+    target,
+    paths,
+    bundle: {
+      originalSource: originalBundleSource,
+      originalSha256: metadata.originalSha256,
+      patchedSource: undefined,
+      patchedSha256: metadata.patchedSha256,
+    },
+    index: {
+      originalSource: originalIndexSource,
+      originalSha256: metadata.originalIndexSha256,
+      patchedSource: indexTransformed.source,
+      patchedSha256: sha256(indexTransformed.source),
+      entrySource: indexTransformed.entrySource,
+      rollbackSource: currentIndexSource,
+    },
+    bootstrapSource: createBootstrapSource(indexTransformed.entrySource),
+    backups: {
+      bundleExists: true,
+      indexExists: true,
+    },
+    obsoleteBootstrap: {
+      path: metadata.bootstrapPath,
+      sha256: metadata.bootstrapSha256,
+    },
+    operations,
+    status: 'migrated',
+  });
+}
+
 export async function applyCodexDropPatch(options = {}) {
+  const operations = fileOperationsFor(options);
   const target = await resolveCodexTarget(options);
   const paths = patchPaths(target.bundlePath);
   const bundleSource = await readFile(target.bundlePath, 'utf8');
   const bundleTransformed = patchBundleSource(bundleSource);
+  const metadataExists = await fileExists(paths.metadataPath);
+  if (bundleTransformed.status === 'already-patched' && metadataExists) {
+    const metadata = await readParsedMetadata(paths);
+    if (metadata?.metadataSchemaVersion === METADATA_SCHEMA_VERSION && metadata.cacheBootstrapVersion === 1) {
+      return migrateSchema2V1Patch(target, paths, bundleSource, metadata, operations);
+    }
+  }
   const indexSource = await readFile(paths.indexPath, 'utf8');
   const indexTransformed = patchIndexSource(indexSource);
   const indexBackupExists = await fileExists(paths.indexBackupPath);
@@ -410,6 +574,7 @@ export async function applyCodexDropPatch(options = {}) {
           bundleExists: true,
           indexExists: false,
         },
+        operations,
         status: 'migrated',
       });
     }
@@ -441,12 +606,13 @@ export async function applyCodexDropPatch(options = {}) {
     bundleExists: await fileExists(paths.backupPath),
     indexExists: indexBackupExists,
   };
-  const metadataExists = await fileExists(paths.metadataPath);
-
   if (backups.bundleExists) {
     if (!metadataExists) throw new Error('Existing Codex drop backup does not match the current original bundle');
     const metadata = await readParsedMetadata(paths);
     assertReusableMetadataShape(metadata, target, paths);
+    if (metadata.metadataSchemaVersion === undefined && metadata.patchedSha256 !== bundle.patchedSha256) {
+      throw new Error('Codex drop patch metadata is invalid');
+    }
     if (
       metadata.originalSha256 !== bundle.originalSha256
       || sha256(await readFile(paths.backupPath)) !== bundle.originalSha256
@@ -486,42 +652,60 @@ export async function applyCodexDropPatch(options = {}) {
     index,
     bootstrapSource,
     backups,
+    operations,
     status: 'patched',
   });
 }
 
 export async function restoreCodexDropPatch(options = {}) {
+  const operations = fileOperationsFor(options);
   const target = await findRestoreTarget(options);
   const paths = patchPaths(target.bundlePath);
   const metadata = await readParsedMetadata(paths);
   if (metadata?.metadataSchemaVersion === undefined) {
     assertLegacyMetadataShape(metadata, target, paths);
-    return restoreLegacyBundlePatch(target, paths, metadata);
+    return restoreLegacyBundlePatch(target, paths, metadata, operations);
   }
-  assertSchema2MetadataShape(metadata, target, paths);
-  return restoreSchema2Patch(target, paths, metadata);
+  assertSupportedSchema2MetadataShape(metadata, target, paths);
+  const schemaPaths = {
+    ...paths,
+    bootstrapPath: metadata.bootstrapPath,
+  };
+  return restoreSchema2Patch(target, schemaPaths, metadata, operations);
 }
 
-async function restoreLegacyBundlePatch(target, paths, metadata) {
+async function restoreLegacyBundlePatch(target, paths, metadata, operations) {
   const currentBundleSource = await readFile(target.bundlePath);
   const currentBundleSha256 = sha256(currentBundleSource);
   assertCurrentMatches(currentBundleSha256, metadata.originalSha256, metadata.patchedSha256, 'bundle');
   const originalBundleSource = await readFile(paths.backupPath);
   if (sha256(originalBundleSource) !== metadata.originalSha256) throw new Error('Backup hash does not match patch metadata');
-  if (currentBundleSha256 === metadata.originalSha256) return { status: 'already-restored', ...target, ...paths };
+  if (currentBundleSha256 === metadata.originalSha256) {
+    return {
+      status: 'already-restored',
+      ...target,
+      backupPath: paths.backupPath,
+      metadataPath: paths.metadataPath,
+    };
+  }
 
   const bundleTempPath = await writeTemporary(target.bundlePath, originalBundleSource);
   try {
-    await rename(bundleTempPath, target.bundlePath);
+    await operations.rename(bundleTempPath, target.bundlePath);
   } catch (error) {
     throw new Error(`Could not restore Codex drop patch: ${error.message}`);
   } finally {
     await rm(bundleTempPath, { force: true });
   }
-  return { status: 'restored', ...target, ...paths };
+  return {
+    status: 'restored',
+    ...target,
+    backupPath: paths.backupPath,
+    metadataPath: paths.metadataPath,
+  };
 }
 
-async function restoreSchema2Patch(target, paths, metadata) {
+async function restoreSchema2Patch(target, paths, metadata, operations) {
   const currentBundleSource = await readFile(target.bundlePath);
   const currentBundleSha256 = sha256(currentBundleSource);
   assertCurrentMatches(currentBundleSha256, metadata.originalSha256, metadata.patchedSha256, 'bundle');
@@ -545,19 +729,34 @@ async function restoreSchema2Patch(target, paths, metadata) {
 
   const bundleTempPath = await writeTemporary(target.bundlePath, originalBundleSource);
   const indexTempPath = await writeTemporary(paths.indexPath, originalIndexSource);
+  let bundleRenamed = false;
+  let indexRenamed = false;
   try {
-    await rename(indexTempPath, paths.indexPath);
-    try {
-      await rename(bundleTempPath, target.bundlePath);
-    } catch (error) {
-      await restoreFromBackup(paths.indexPath, currentIndexSource);
-      throw error;
+    await operations.rename(indexTempPath, paths.indexPath);
+    indexRenamed = true;
+    await operations.rename(bundleTempPath, target.bundlePath);
+    bundleRenamed = true;
+    if (!await removeBootstrapIfMatches(paths.bootstrapPath, metadata.bootstrapSha256)) {
+      throw new Error('Managed bootstrap changed during restore');
     }
-    await removeBootstrapIfMatches(paths.bootstrapPath, metadata.bootstrapSha256);
   } catch (error) {
-    throw new Error(`Could not restore Codex drop patch: ${error.message}`);
+    const rollbackActions = [];
+    if (bundleRenamed) {
+      rollbackActions.push({
+        label: 'bundle',
+        run: () => restoreFromBackup(target.bundlePath, currentBundleSource, operations),
+      });
+    }
+    if (indexRenamed) {
+      rollbackActions.push({
+        label: 'index',
+        run: () => restoreFromBackup(paths.indexPath, currentIndexSource, operations),
+      });
+    }
+    const rollbackFailures = await attemptRollbackActions(rollbackActions);
+    throw transactionError('Could not restore Codex drop patch', error, rollbackFailures);
   } finally {
-    await Promise.all([
+    await Promise.allSettled([
       rm(bundleTempPath, { force: true }),
       rm(indexTempPath, { force: true }),
     ]);
