@@ -2,7 +2,7 @@
   "name": "codex-extension-helper",
   "displayName": "Codex Extension Helper",
   "description": "Show external file changes inline in VS Code editors.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "private": true,
   "license": "SEE LICENSE IN LICENSE",
   "publisher": "local",
