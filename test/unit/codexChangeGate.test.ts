@@ -5,7 +5,10 @@ import {
   type CodexChangeGateOptions,
   type FileSystemCandidate,
 } from '../../src/codexChangeGate';
-import type { ProvenanceFileState } from '../../src/codexProvenanceLedger';
+import {
+  CodexProvenanceLedger,
+  type ProvenanceFileState,
+} from '../../src/codexProvenanceLedger';
 import type { CodexFileUpdateChange } from '../../src/codexProvenanceProtocol';
 
 function fakeUri(path: string): vscode.Uri {
@@ -223,6 +226,110 @@ describe('CodexChangeGate', () => {
       expect(unproven.filter((value) => value === laterCandidate)).toHaveLength(1);
     },
   );
+
+  it.each(['notification-first', 'candidate-first'] as const)(
+    'rejects and never reuses accepted-undefined evidence in %s order',
+    async (order) => {
+      const initialCandidate = present('workspace-a.txt', 'new\n');
+      const acceptedState: ProvenanceFileState = {
+        uri: initialCandidate.uri,
+        exists: true,
+        text: 'old\n',
+      };
+      let currentAccepted: ProvenanceFileState | undefined;
+      const { gate, proven, unproven } = setup({}, {
+        resolveAcceptedPath: () => currentAccepted,
+        resolveWorkspacePath: () => initialCandidate.uri,
+      });
+      const notification = completed([update('file.txt', 'old', 'new')]);
+
+      if (order === 'candidate-first') await gate.handleCandidate(initialCandidate);
+      await gate.handleNotification(notification);
+      if (order === 'notification-first') await gate.handleCandidate(initialCandidate);
+
+      expect(proven).toEqual([]);
+      expect(unproven).toEqual(order === 'candidate-first' ? [initialCandidate] : []);
+
+      currentAccepted = acceptedState;
+      const laterCandidate = order === 'candidate-first'
+        ? present('workspace-a.txt', 'new\n')
+        : initialCandidate;
+      if (order === 'candidate-first') await gate.handleCandidate(laterCandidate);
+      await gate.handleNotification(notification);
+
+      expect(proven).toEqual([]);
+      expect(unproven.filter((value) => value === initialCandidate)).toHaveLength(1);
+      expect(unproven.filter((value) => value === laterCandidate)).toHaveLength(1);
+    },
+  );
+
+  it('retires previously valid evidence before accepted-undefined refresh can clear its index', async () => {
+    const candidate = present('workspace-a.txt', 'new\n');
+    const acceptedState: ProvenanceFileState = {
+      uri: candidate.uri,
+      exists: true,
+      text: 'old\n',
+    };
+    let currentAccepted: ProvenanceFileState | undefined = acceptedState;
+    const { clock, gate, proven, unproven, flush } = setup({}, {
+      resolveAcceptedPath: () => currentAccepted,
+      resolveWorkspacePath: () => candidate.uri,
+    });
+    const notification = completed([update('file.txt', 'old', 'new')]);
+
+    await gate.handleNotification(notification);
+    currentAccepted = undefined;
+    await gate.handleNotification(notification);
+    currentAccepted = acceptedState;
+    await gate.handleNotification(notification);
+    await gate.handleCandidate(candidate);
+    clock.advance(100);
+    await flush();
+
+    expect(proven).toEqual([]);
+    expect(unproven).toEqual([candidate]);
+  });
+
+  it('does not reconstruct a rejected item after ledger indexes were already cleared', async () => {
+    const candidate = present('workspace-a.txt', 'new\n');
+    const acceptedState: ProvenanceFileState = {
+      uri: candidate.uri,
+      exists: true,
+      text: 'old\n',
+    };
+    const otherState = state('other.txt', true, 'old-other\n');
+    let acceptedAvailable = true;
+    const ledger = new CodexProvenanceLedger();
+    const { clock, gate, proven, unproven, flush } = setup({}, {
+      ledger,
+      resolveAcceptedPath: (path) => (
+        path === 'file.txt'
+          ? (acceptedAvailable ? acceptedState : undefined)
+          : otherState
+      ),
+      resolveWorkspacePath: (path) => (
+        path === 'file.txt' ? candidate.uri : otherState.uri
+      ),
+    });
+    const rejectedNotification = completed([
+      update('file.txt', 'old', 'new'),
+    ], 'rejected-item');
+
+    await gate.handleNotification(rejectedNotification);
+    ledger.completedTransitions(() => undefined);
+    acceptedAvailable = false;
+    await gate.handleNotification(rejectedNotification);
+    acceptedAvailable = true;
+    await gate.handleNotification(completed([
+      update('other.txt', 'old-other', 'new-other'),
+    ], 'unrelated-item'));
+    await gate.handleCandidate(candidate);
+    clock.advance(100);
+    await flush();
+
+    expect(proven).toEqual([]);
+    expect(unproven).toEqual([candidate]);
+  });
 
   it('invalidates prior evidence under the workspace side of a disagreement', async () => {
     const workspaceCandidate = present('workspace-a.txt', 'new\n');

@@ -74,6 +74,13 @@ function changesOf(notification: CodexProvenanceNotification) {
     : notification.params.changes;
 }
 
+function notificationItemKey(notification: CodexProvenanceNotification): string {
+  const itemId = notification.method === 'item/completed'
+    ? notification.params.item.id
+    : notification.params.itemId;
+  return `${notification.params.threadId}\0${notification.params.turnId}\0${itemId}`;
+}
+
 function candidateExists(candidate: FileSystemCandidate): boolean {
   return candidate.kind === 'present';
 }
@@ -98,6 +105,7 @@ function transitionIdentity(transition: ExactCodexTransition): string {
 export class CodexChangeGate implements vscode.Disposable {
   private readonly pendingCandidates = new Map<string, PendingCandidate>();
   private readonly eligibleTransitions = new Map<string, EligibleTransition>();
+  private readonly rejectedItems = new Set<string>();
   private readonly quarantineMs: number;
   private readonly transitionLifetimeMs: number;
   private readonly maxPendingCandidates: number;
@@ -148,14 +156,29 @@ export class CodexChangeGate implements vscode.Disposable {
       } catch (error) {
         firstError = error;
       }
+      const resolution = this.resolveNotificationKeys(notification);
+      const itemKey = notificationItemKey(notification);
+      if (resolution.rejectedKeys.size > 0 || this.rejectedItems.has(itemKey)) {
+        this.rejectedItems.add(itemKey);
+        for (const key of resolution.relevantKeys) {
+          this.eligibleTransitions.delete(key);
+          this.ledger.invalidate(key);
+        }
+        for (const key of resolution.relevantKeys) {
+          try {
+            await this.match(key, true);
+          } catch (error) {
+            firstError ??= error;
+          }
+        }
+        this.armTimer();
+        if (firstError !== undefined) throw firstError;
+        return;
+      }
+
       const previouslyEligible = new Set(this.eligibleTransitions.keys());
       this.ledger.record(notification);
-      const resolution = this.resolveNotificationKeys(notification);
       this.refreshEligibleTransitions(this.now());
-      for (const key of resolution.rejectedKeys) {
-        this.eligibleTransitions.delete(key);
-        this.ledger.invalidate(key);
-      }
 
       for (const key of resolution.relevantKeys) {
         const terminal = notification.method === 'item/completed';
@@ -222,6 +245,7 @@ export class CodexChangeGate implements vscode.Disposable {
       const pending = [...this.pendingCandidates.values()];
       this.pendingCandidates.clear();
       this.eligibleTransitions.clear();
+      this.rejectedItems.clear();
       let firstError: unknown;
       for (const { candidate } of pending) {
         try {
@@ -263,6 +287,13 @@ export class CodexChangeGate implements vscode.Disposable {
     const previous = new Map(this.eligibleTransitions);
     const refreshed = new Map<string, EligibleTransition>();
     for (const transition of this.ledger.completedTransitions(this.options.resolveAcceptedPath)) {
+      const rejected = transition.provenance.itemIds.some((itemId) => this.rejectedItems.has(
+        `${transition.provenance.threadId}\0${transition.provenance.turnId}\0${itemId}`,
+      ));
+      if (rejected) {
+        this.ledger.invalidate(transition.key);
+        continue;
+      }
       const identity = transitionIdentity(transition);
       const existing = previous.get(transition.key);
       refreshed.set(transition.key, existing?.identity === identity
