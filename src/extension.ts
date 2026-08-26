@@ -48,7 +48,12 @@ import {
   type InstalledSpacerPresentation,
   type SpacerDocument,
 } from './temporaryLineSpacers';
-import type { FileComparisonState, FileLifecycle, HunkReference } from './types';
+import type {
+  ExactCodexProvenance,
+  FileComparisonState,
+  FileLifecycle,
+  HunkReference,
+} from './types';
 
 const CONFIGURATION_SECTION = 'codexExtensionHelper';
 const OUTPUT_CHANNEL_NAME = 'Codex Extension Helper';
@@ -230,12 +235,20 @@ interface SynchronizeReviewViewsOptions {
   readonly activeKey: string | undefined;
   readonly activeState: FileComparisonState | undefined;
   readonly views: SynchronizedReviewViews;
+  readonly isCurrent?: () => boolean;
 }
 
 const STATE_ONLY_COMPARISON_VIEW: ComparisonView = Object.freeze({
   async render(): Promise<void> {},
   clear(): void {},
   clearAll(): void {},
+});
+
+const SIMULATED_EXACT_PROVENANCE: ExactCodexProvenance = Object.freeze({
+  confidence: 'exact',
+  threadId: 'extension-test',
+  turnId: 'simulated-change',
+  itemIds: Object.freeze(['simulated-file-change']),
 });
 
 function errorDetail(error: unknown): string {
@@ -486,6 +499,7 @@ export async function synchronizeReviewViews({
   activeKey,
   activeState,
   views,
+  isCurrent = () => true,
 }: SynchronizeReviewViewsOptions): Promise<void> {
   const pending: PromiseLike<void>[] = [];
   if (key !== undefined) {
@@ -495,6 +509,15 @@ export async function synchronizeReviewViews({
         canonicalText: state.currentText,
         hunks: state.hunks,
       });
+      if (!isCurrent()) {
+        if (
+          presentation !== undefined
+          && views.spacers?.presentation(key) === presentation
+        ) {
+          await views.spacers.clear(key);
+        }
+        return;
+      }
       pending.push(views.renderer.render(key, state.hunks, presentation));
       views.deletedLines.update({
         key,
@@ -742,12 +765,18 @@ export class ExtensionRuntime implements vscode.Disposable {
     this.documentDebouncer.cancel(key);
     this.detector.markRecentSave(uri);
     this.trackedUris.set(key, uri);
-    this.coordinator.seed(key, baselineText);
     if (lifecycle === 'created') {
-      await this.coordinator.externalCreate(key, currentText);
+      await this.coordinator.acceptExternalState(key, undefined);
     } else {
-      await this.coordinator.externalChange(key, currentText);
+      this.coordinator.seed(key, baselineText);
     }
+    await this.coordinator.provenChange(
+      key,
+      baselineText,
+      currentText,
+      lifecycle,
+      SIMULATED_EXACT_PROVENANCE,
+    );
     this.syncComparison(key);
   }
 
@@ -1099,6 +1128,10 @@ export class ExtensionRuntime implements vscode.Disposable {
         activeContext: this.activeReviewContext,
         spacers: this.spacers,
       },
+      isCurrent: () => (
+        !this.disposed
+        && (key === undefined || this.snapshots.get(key) === state)
+      ),
     }));
   }
 

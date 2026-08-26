@@ -185,6 +185,66 @@ describe('ComparisonCoordinator', () => {
     });
   });
 
+  it('reviews empty-file deletion and creation as lifecycle changes with no text hunks', async () => {
+    const { coordinator, engine, store, view } = setup();
+    coordinator.seed(key, '');
+    engine.queue([], []);
+
+    await coordinator.provenChange(key, '', '', 'deleted', provenance);
+
+    expect(store.get(key)).toMatchObject({
+      baselineText: '',
+      currentText: '',
+      hunks: [],
+      lifecycle: 'deleted',
+      provenance,
+      comparisonActive: true,
+      pending: true,
+    });
+    expect(view.renderStarts).toEqual([]);
+    expect(coordinator.approveAll(key, '')).toBe('approved');
+    expect(store.get(key)).toBeUndefined();
+    expect(store.acceptedText(key)).toBeUndefined();
+
+    await coordinator.provenChange(key, '', '', 'created', provenance);
+
+    expect(store.get(key)).toMatchObject({
+      baselineText: '',
+      currentText: '',
+      hunks: [],
+      lifecycle: 'created',
+      provenance,
+      comparisonActive: true,
+      pending: true,
+    });
+  });
+
+  it('accepts non-empty deletion as absence after approving its final hunk', async () => {
+    const { coordinator, engine, store } = setup();
+    const deletedHunk: ChangeHunk = {
+      kind: 'deletion',
+      originalStart: 0,
+      originalEnd: 1,
+      modifiedStart: 0,
+      modifiedEnd: 0,
+      originalLines: ['before'],
+      modifiedLines: [],
+    };
+    coordinator.seed(key, 'before\n');
+    engine.queue([deletedHunk], []);
+    await coordinator.provenChange(key, 'before\n', '', 'deleted', provenance);
+    const state = store.get(key)!;
+
+    expect(await coordinator.approveHunk({
+      key,
+      sourceRevision: state.sourceRevision,
+      hunkIndex: 0,
+      expectedText: state.currentText,
+    })).toBe('approved');
+    expect(store.get(key)).toBeUndefined();
+    expect(store.acceptedText(key)).toBeUndefined();
+  });
+
   it.each([
     { name: 'update from absence', accepted: undefined, before: 'before', after: 'after', lifecycle: 'existing' as const },
     { name: 'update from the wrong pre-image', accepted: 'accepted', before: 'wrong', after: 'after', lifecycle: 'existing' as const },
@@ -291,6 +351,81 @@ describe('ComparisonCoordinator', () => {
     });
     expect(view.renderedHunks.get(key)).toBeUndefined();
   });
+
+  it('clears stale document-edit rendering after an unknown state is accepted', async () => {
+    const { coordinator, engine, store, view } = setup();
+    const render = deferred<void>();
+    coordinator.seed(key, 'baseline');
+    engine.queue(olderHunks, newerHunks);
+    await coordinator.provenChange(key, 'baseline', 'old-result', 'existing', provenance);
+    view.visible.add(key);
+    view.queueRender(render.promise);
+
+    const run = coordinator.documentEdit(key, 'new-result');
+    await Promise.resolve();
+    expect(view.renderStarts.at(-1)).toEqual({ key, hunks: newerHunks });
+
+    await coordinator.acceptExternalState(key, 'unknown');
+    render.resolve();
+    await run;
+
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'unknown',
+      currentText: 'unknown',
+      lifecycle: 'existing',
+      provenance: undefined,
+    });
+    expect(view.renderedHunks.get(key)).toBeUndefined();
+  });
+
+  it('clears stale show rendering after an unknown state is accepted', async () => {
+    const { coordinator, engine, store, view } = setup();
+    const render = deferred<void>();
+    coordinator.seed(key, 'baseline');
+    engine.queue(newerHunks);
+    await coordinator.provenChange(key, 'baseline', 'new-result', 'existing', provenance);
+    view.visible.add(key);
+    view.queueRender(render.promise);
+
+    const run = coordinator.show(key);
+    await Promise.resolve();
+    await coordinator.acceptExternalState(key, 'unknown');
+    render.resolve();
+    await run;
+
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'unknown',
+      currentText: 'unknown',
+      lifecycle: 'existing',
+      provenance: undefined,
+    });
+    expect(view.renderedHunks.get(key)).toBeUndefined();
+  });
+
+  it.each(['externalChange', 'externalCreate'] as const)(
+    'routes legacy %s over an exact comparison to a clean accepted baseline',
+    async (method) => {
+      const { coordinator, engine, store, view } = setup();
+      coordinator.seed(key, 'baseline');
+      engine.queue(newerHunks);
+      await coordinator.provenChange(key, 'baseline', 'new-result', 'existing', provenance);
+
+      await coordinator[method](key, 'unknown');
+
+      expect(engine.calls).toEqual([{ original: 'baseline', modified: 'new-result' }]);
+      expect(store.acceptedText(key)).toBe('unknown');
+      expect(store.get(key)).toMatchObject({
+        baselineText: 'unknown',
+        currentText: 'unknown',
+        hunks: [],
+        lifecycle: 'existing',
+        provenance: undefined,
+        comparisonActive: false,
+        pending: false,
+      });
+      expect(view.clear).toHaveBeenCalledWith(key);
+    },
+  );
 
   it('routes legacy unknown writes to a clean accepted baseline', async () => {
     const { coordinator, engine, store, view } = setup();

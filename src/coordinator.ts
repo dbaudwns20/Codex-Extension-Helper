@@ -54,12 +54,7 @@ export class ComparisonCoordinator {
       return;
     }
 
-    if (this.snapshots.get(key) === undefined) {
-      this.seed(key, text);
-      return;
-    }
-
-    await this.compare(key, text, isCurrent);
+    await this.acceptExternalState(key, text);
   }
 
   async externalCreate(
@@ -71,19 +66,7 @@ export class ComparisonCoordinator {
       return;
     }
 
-    this.debouncer.cancel(key);
-    this.snapshots.deleteAcceptedText(key);
-    this.snapshots.setComparison(key, {
-      baselineText: '',
-      currentText: '',
-      hunks: [],
-      sourceRevision: this.nextRevision(key),
-      comparisonActive: false,
-      pending: false,
-      lifecycle: 'created',
-      provenance: undefined,
-    });
-    await this.compare(key, text, isCurrent);
+    await this.acceptExternalState(key, text);
   }
 
   async provenChange(
@@ -131,7 +114,7 @@ export class ComparisonCoordinator {
       return;
     }
 
-    if (hunks.length === 0) {
+    if (hunks.length === 0 && lifecycle === 'existing') {
       this.snapshots.setAcceptedText(key, currentText);
       this.snapshots.setComparison(key, this.inactiveExistingState(currentText, sourceRevision));
       this.view.clear(key);
@@ -144,6 +127,9 @@ export class ComparisonCoordinator {
       comparisonActive: true,
       pending: true,
     });
+    if (hunks.length === 0) {
+      return;
+    }
     await this.view.render(key, hunks);
     const rendered = this.snapshots.get(key);
     if (
@@ -255,11 +241,15 @@ export class ComparisonCoordinator {
     }
 
     if (hunks.length === 0) {
-      this.snapshots.setAcceptedText(reference.key, currentText);
-      this.snapshots.setComparison(
-        reference.key,
-        this.inactiveExistingState(currentText, sourceRevision),
-      );
+      if (current.lifecycle === 'deleted') {
+        this.snapshots.delete(reference.key);
+      } else {
+        this.snapshots.setAcceptedText(reference.key, currentText);
+        this.snapshots.setComparison(
+          reference.key,
+          this.inactiveExistingState(currentText, sourceRevision),
+        );
+      }
       this.view.clear(reference.key);
       return 'approved';
     }
@@ -295,8 +285,12 @@ export class ComparisonCoordinator {
     }
 
     const sourceRevision = this.nextRevision(key);
-    this.snapshots.setAcceptedText(key, expectedText);
-    this.snapshots.setComparison(key, this.inactiveExistingState(expectedText, sourceRevision));
+    if (state.lifecycle === 'deleted') {
+      this.snapshots.delete(key);
+    } else {
+      this.snapshots.setAcceptedText(key, expectedText);
+      this.snapshots.setComparison(key, this.inactiveExistingState(expectedText, sourceRevision));
+    }
     this.view.clear(key);
     return 'approved';
   }
@@ -336,6 +330,7 @@ export class ComparisonCoordinator {
       || current.hunks !== hunks
       || !isCurrent(currentText)
     ) {
+      await this.synchronizeView(key);
       return;
     }
 
@@ -401,6 +396,17 @@ export class ComparisonCoordinator {
     });
 
     await this.view.render(key, hunks);
+    const rendered = this.snapshots.get(key);
+    if (
+      this.disposed
+      || rendered?.sourceRevision !== sourceRevision
+      || rendered.baselineText !== state.baselineText
+      || rendered.currentText !== text
+      || rendered.hunks !== hunks
+      || !isCurrent()
+    ) {
+      await this.synchronizeView(key);
+    }
   }
 
   private acceptExternalStateNow(key: string, currentText: string | undefined): void {

@@ -33,10 +33,6 @@ export class SnapshotStore {
     this.acceptedTexts.set(key, text);
   }
 
-  deleteAcceptedText(key: string): void {
-    this.acceptedTexts.delete(key);
-  }
-
   delete(key: string): void {
     this.acceptedTexts.delete(key);
     this.states.delete(key);

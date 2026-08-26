@@ -195,7 +195,7 @@ describe('ExternalChangeDetector', () => {
     expect(onComparison).not.toHaveBeenCalled();
   });
 
-  it('renders unseen created content as an addition from an empty baseline', async () => {
+  it('accepts unseen created content silently through the legacy coordinator path', async () => {
     vi.useFakeTimers();
     const file = uri('unseen.ts');
     const store = new SnapshotStore();
@@ -204,16 +204,7 @@ describe('ExternalChangeDetector', () => {
       clear: vi.fn(),
       clearAll: vi.fn(),
     };
-    const createdHunk = {
-      kind: 'addition' as const,
-      originalStart: 0,
-      originalEnd: 0,
-      modifiedStart: 0,
-      modifiedEnd: 1,
-      originalLines: [],
-      modifiedLines: ['changed'],
-    };
-    const diffEngine = { compute: vi.fn(() => [createdHunk]) };
+    const diffEngine = { compute: vi.fn(() => []) };
     const coordinator = new ComparisonCoordinator(diffEngine, store, view);
     const { instance } = detector({
       onComparison: (key, text, kind) => kind === 'create'
@@ -225,13 +216,15 @@ describe('ExternalChangeDetector', () => {
     await vi.advanceTimersByTimeAsync(100);
 
     expect(store.get(file.toString())).toMatchObject({
-      baselineText: '',
+      baselineText: 'changed',
       currentText: 'changed',
-      hunks: [createdHunk],
-      comparisonActive: true,
+      hunks: [],
+      lifecycle: 'existing',
+      provenance: undefined,
+      comparisonActive: false,
     });
-    expect(diffEngine.compute).toHaveBeenCalledWith('', 'changed');
-    expect(view.render).toHaveBeenCalledWith(file.toString(), [createdHunk]);
+    expect(diffEngine.compute).not.toHaveBeenCalled();
+    expect(view.render).not.toHaveBeenCalled();
   });
 
   it('cancels a pending read and clears coordinator state on delete', async () => {

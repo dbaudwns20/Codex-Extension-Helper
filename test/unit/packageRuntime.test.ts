@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { diffChars } from 'diff';
 import { describe, expect, it, vi } from 'vitest';
+import { ComparisonCoordinator } from '../../src/coordinator';
 import { DisposableStore } from '../../src/disposableStore';
+import { SnapshotStore } from '../../src/snapshotStore';
 import type { ChangeHunk, FileComparisonState, HunkReference } from '../../src/types';
 
 const vscodeMock = vi.hoisted(() => ({} as Record<string, unknown>));
@@ -431,7 +433,7 @@ describe('packaged runtime', () => {
       });
 
       fake.setText(modified);
-      fake.callbacks.get('watcherChange')!(fake.uri);
+      await runtime.simulateExternalChange(fake.uri as never, 'old line\nkeep\n', modified);
       await settleRuntime();
 
       expect(runtime.renderedComparisonCount).toBe(1);
@@ -462,7 +464,7 @@ describe('packaged runtime', () => {
       expect(fake.createSourceControl).not.toHaveBeenCalled();
 
       fake.setText('after\n');
-      fake.callbacks.get('watcherChange')!(fake.uri);
+      await runtime.simulateExternalChange(fake.uri as never, 'before\n', 'after\n');
       await settleRuntime();
 
       expect(fake.createSourceControl).toHaveBeenCalledTimes(1);
@@ -495,7 +497,7 @@ describe('packaged runtime', () => {
       });
 
       fake.setText('after\n');
-      fake.callbacks.get('watcherChange')!(fake.uri);
+      await runtime.simulateExternalChange(fake.uri as never, 'before\n', 'after\n');
       await settleRuntime();
 
       expect(fake.changesGroup.resourceStates).toEqual([
@@ -550,7 +552,7 @@ describe('packaged runtime', () => {
       });
 
       fake.setText('after\n');
-      fake.callbacks.get('watcherChange')!(fake.uri);
+      await runtime.simulateExternalChange(fake.uri as never, 'before\n', 'after\n');
       await settleRuntime();
       expect(runtime.comparisonCount).toBe(1);
 
@@ -581,7 +583,11 @@ describe('packaged runtime', () => {
       });
 
       fake.setText('before\nafter\n');
-      fake.callbacks.get('watcherChange')!(fake.uri);
+      await runtime.simulateExternalChange(
+        fake.uri as never,
+        'before\n',
+        'before\nafter\n',
+      );
       await settleRuntime();
       fake.workspace.textDocuments.length = 0;
       fake.window.activeTextEditor = fake.secondEditor;
@@ -612,7 +618,11 @@ describe('packaged runtime', () => {
       });
 
       fake.setText('before\nafter\n');
-      fake.callbacks.get('watcherChange')!(fake.uri);
+      await runtime.simulateExternalChange(
+        fake.uri as never,
+        'before\n',
+        'before\nafter\n',
+      );
       await settleRuntime();
       fake.window.activeTextEditor = fake.secondEditor;
 
@@ -1338,6 +1348,64 @@ describe('stable review runtime boundaries', () => {
     );
   });
 
+  it('does not repaint stale review views after external acceptance during spacer installation', async () => {
+    const { synchronizeReviewViews } = await import('../../src/extension');
+    const key = 'file:///workspace/file.ts';
+    const state = reviewState();
+    const store = new SnapshotStore();
+    store.seed(key, state.baselineText);
+    store.setComparison(key, state);
+    const coordinator = new ComparisonCoordinator(
+      { compute: () => [] },
+      store,
+      { render: async () => {}, clear: () => {}, clearAll: () => {} },
+    );
+    const presentation = { key } as never;
+    let currentPresentation: unknown;
+    let resolveInstall!: (installed: typeof presentation) => void;
+    const install = new Promise<typeof presentation>((resolve) => {
+      resolveInstall = resolve;
+    });
+    const views = {
+      renderer: { render: vi.fn().mockResolvedValue(undefined), clear: vi.fn() },
+      deletedLines: { update: vi.fn(), clear: vi.fn() },
+      quickDiff: { update: vi.fn(), clear: vi.fn() },
+      activeContext: { update: vi.fn().mockResolvedValue(undefined) },
+      spacers: {
+        install: vi.fn(async () => {
+          currentPresentation = await install;
+          return currentPresentation as typeof presentation;
+        }),
+        presentation: vi.fn(() => currentPresentation as never),
+        clear: vi.fn(async () => {
+          currentPresentation = undefined;
+          return { status: 'absent' as const };
+        }),
+      },
+    };
+
+    const run = synchronizeReviewViews({
+      key,
+      state,
+      resource: { toString: () => key } as never,
+      activeKey: key,
+      activeState: state,
+      views,
+      isCurrent: () => coordinator.state(key) === state,
+    });
+    await Promise.resolve();
+    await coordinator.acceptExternalState(key, 'unknown');
+    resolveInstall(presentation);
+    await run;
+
+    expect(views.renderer.render).not.toHaveBeenCalled();
+    expect(views.deletedLines.update).not.toHaveBeenCalled();
+    expect(views.quickDiff.update).not.toHaveBeenCalled();
+    expect(views.activeContext.update).not.toHaveBeenCalled();
+    expect(views.spacers.clear).toHaveBeenCalledWith(key);
+    expect(currentPresentation).toBeUndefined();
+  });
+
   it('clears file views while deriving title context from the unchanged active file', async () => {
     const { synchronizeReviewViews } = await import('../../src/extension');
     const state = reviewState({
@@ -1432,7 +1500,7 @@ describe('stable review runtime boundaries', () => {
       ]);
 
       fake.setText('after\n');
-      fake.callbacks.get('watcherChange')!(fake.uri);
+      await runtime.simulateExternalChange(fake.uri as never, 'before\n', 'after\n');
       await settleRuntime();
       expect(fake.executeCommand).toHaveBeenLastCalledWith(
         'setContext',
@@ -1496,7 +1564,7 @@ describe('stable review runtime boundaries', () => {
       const render = vi.spyOn(view, 'render');
 
       fake.setText(modified);
-      fake.callbacks.get('watcherChange')!(fake.uri);
+      await runtime.simulateExternalChange(fake.uri as never, baseline, modified);
       await settleRuntime();
 
       expect(fake.output.appendLine.mock.calls).toEqual([]);
@@ -1561,7 +1629,7 @@ describe('stable review runtime boundaries', () => {
       });
 
       fake.setText(modified);
-      fake.callbacks.get('watcherChange')!(fake.uri);
+      await runtime.simulateExternalChange(fake.uri as never, baseline, modified);
       await settleRuntime();
 
       const rejectLenses = fake.codeLenses().filter(
@@ -1602,7 +1670,7 @@ describe('stable review runtime boundaries', () => {
       });
 
       fake.setText(modified);
-      fake.callbacks.get('watcherChange')!(fake.uri);
+      await runtime.simulateExternalChange(fake.uri as never, baseline, modified);
       await vi.runAllTimersAsync();
       await Promise.resolve();
       expect(runtime.comparisonCount).toBe(1);
@@ -1636,7 +1704,7 @@ describe('stable review runtime boundaries', () => {
           warningShown: false,
         });
         fake.setText('after\n');
-        fake.callbacks.get('watcherChange')!(fake.uri);
+        await runtime.simulateExternalChange(fake.uri as never, 'before\n', 'after\n');
         await settleRuntime();
         const view = (runtime as unknown as { view: { clear(key: string): void } }).view;
         return { fake, runtime, clear: vi.spyOn(view, 'clear') };
@@ -1676,7 +1744,7 @@ describe('stable review runtime boundaries', () => {
         warningShown: false,
       });
       fake.setText('after\n');
-      fake.callbacks.get('watcherChange')!(fake.uri);
+      await runtime.simulateExternalChange(fake.uri as never, 'before\n', 'after\n');
       await settleRuntime();
       const view = (runtime as unknown as {
         view: { render(key: string, hunks: readonly ChangeHunk[]): Promise<void> };
