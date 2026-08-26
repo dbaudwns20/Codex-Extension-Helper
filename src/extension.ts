@@ -82,7 +82,10 @@ interface ExternalComparisonCandidate {
 
 interface StableReviewHostApi {
   readonly window: Pick<typeof vscode.window, 'activeTextEditor' | 'showErrorMessage'>;
-  readonly workspace: Pick<typeof vscode.workspace, 'applyEdit'> & {
+  readonly workspace: Pick<
+    typeof vscode.workspace,
+    'applyEdit' | 'openTextDocument' | 'textDocuments'
+  > & {
     readonly fs: Pick<typeof vscode.workspace.fs, 'delete'>;
   };
   readonly WorkspaceEdit: typeof vscode.WorkspaceEdit;
@@ -182,7 +185,16 @@ function applyContentChanges(
 
 type ReviewCommandController = Pick<
   ReviewController,
-  'approveHunk' | 'rejectHunk' | 'previousChange' | 'nextChange' | 'approveAll' | 'rejectAll'
+  | 'approveHunk'
+  | 'rejectHunk'
+  | 'previousChange'
+  | 'nextChange'
+  | 'approveAll'
+  | 'rejectAll'
+  | 'approveFile'
+  | 'rejectFile'
+  | 'approveAllFiles'
+  | 'rejectAllFiles'
 >;
 
 type RegisterCommand = (
@@ -237,6 +249,18 @@ export function createReviewHost(
   beginReviewEdit: BeginReviewEdit = () => () => {},
   displayLine: (key: string, canonicalLine: number) => number = (_key, line) => line,
 ): ReviewHost {
+  const reviewDocument = (
+    document: vscode.TextDocument,
+    cursorLine: number,
+  ): LiveReviewDocument => ({
+    uri: document.uri,
+    key: uriKey(document.uri),
+    text: document.getText(),
+    version: document.version,
+    cursorLine,
+    lineCount: document.lineCount,
+    eol: document.eol,
+  });
   const currentEditor = (expected?: LiveReviewDocument): vscode.TextEditor | undefined => {
     const editor = api.window.activeTextEditor;
     if (editor === undefined) {
@@ -261,16 +285,21 @@ export function createReviewHost(
     endOffset: number,
     replacementText: string,
   ): Promise<boolean> => {
-    const editor = currentEditor(document);
-    if (editor === undefined) {
+    const liveDocument = currentEditor(document)?.document
+      ?? api.workspace.textDocuments.find((candidate) => (
+        uriKey(candidate.uri) === document.key
+        && candidate.version === document.version
+        && candidate.getText() === document.text
+      ));
+    if (liveDocument === undefined) {
       return false;
     }
     const edit = new api.WorkspaceEdit();
     edit.replace(
-      editor.document.uri,
+      liveDocument.uri,
       new api.Range(
-        editor.document.positionAt(startOffset),
-        editor.document.positionAt(endOffset),
+        liveDocument.positionAt(startOffset),
+        liveDocument.positionAt(endOffset),
       ),
       replacementText,
     );
@@ -296,16 +325,11 @@ export function createReviewHost(
       if (editor === undefined) {
         return undefined;
       }
-      const { document } = editor;
-      return {
-        uri: document.uri,
-        key: uriKey(document.uri),
-        text: document.getText(),
-        version: document.version,
-        cursorLine: editor.selection.active.line,
-        lineCount: document.lineCount,
-        eol: document.eol,
-      };
+      return reviewDocument(editor.document, editor.selection.active.line);
+    },
+    async reviewDocument(uri): Promise<LiveReviewDocument | undefined> {
+      const document = await api.workspace.openTextDocument(uri);
+      return reviewDocument(document, 0);
     },
     applyReplacement(document, replacement): Promise<boolean> {
       return applyReplacement(
@@ -359,6 +383,31 @@ export function registerReviewCommands(
   controller: ReviewCommandController,
   onError: (scope: string, error: unknown) => void = () => undefined,
 ): void {
+  type ResourceCommandArgument =
+    | vscode.Uri
+    | vscode.SourceControlResourceState
+    | readonly vscode.SourceControlResourceState[];
+  const resourceUris = (value: ResourceCommandArgument): readonly vscode.Uri[] => {
+    if (Array.isArray(value)) {
+      return (value as readonly vscode.SourceControlResourceState[])
+        .map((state) => state.resourceUri);
+    }
+    const single = value as vscode.Uri | vscode.SourceControlResourceState;
+    return 'resourceUri' in single ? [single.resourceUri] : [single];
+  };
+  const runResourceCommand = async (
+    scope: string,
+    value: ResourceCommandArgument,
+    operation: (uri: vscode.Uri) => Promise<void>,
+  ): Promise<void> => {
+    for (const uri of resourceUris(value)) {
+      try {
+        await operation(uri);
+      } catch (error) {
+        onError(scope, error);
+      }
+    }
+  };
   const guarded = (
     scope: string,
     operation: (...args: any[]) => void | PromiseLike<void>,
@@ -397,6 +446,36 @@ export function registerReviewCommands(
   ownership.use(registerCommand(
     'codexExtensionHelper.rejectAll',
     guarded('RejectAllCommand', (uri?: vscode.Uri) => controller.rejectAll(uri)),
+  ));
+  ownership.use(registerCommand(
+    'codexExtensionHelper.approveFile',
+    guarded(
+      'ApproveFileCommand',
+      (value: ResourceCommandArgument) => runResourceCommand(
+        'ApproveFileCommand',
+        value,
+        (uri) => controller.approveFile(uri),
+      ),
+    ),
+  ));
+  ownership.use(registerCommand(
+    'codexExtensionHelper.rejectFile',
+    guarded(
+      'RejectFileCommand',
+      (value: ResourceCommandArgument) => runResourceCommand(
+        'RejectFileCommand',
+        value,
+        (uri) => controller.rejectFile(uri),
+      ),
+    ),
+  ));
+  ownership.use(registerCommand(
+    'codexExtensionHelper.approveAllFiles',
+    guarded('ApproveAllFilesCommand', () => controller.approveAllFiles()),
+  ));
+  ownership.use(registerCommand(
+    'codexExtensionHelper.rejectAllFiles',
+    guarded('RejectAllFilesCommand', () => controller.rejectAllFiles()),
   ));
 }
 
@@ -565,6 +644,9 @@ export class ExtensionRuntime implements vscode.Disposable {
           ? spacers.presentation(key)?.canonicalText ?? text
           : text,
         (key, line) => spacers.canonicalLine(key, line),
+        () => [...this.comparisonKeys]
+          .map((key) => this.trackedUris.get(key))
+          .filter((resource): resource is vscode.Uri => resource !== undefined),
       ));
       registerReviewCommands(
         ownership,
@@ -669,8 +751,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     this.syncComparison(key);
   }
 
-  async openActiveDiff(): Promise<void> {
-    const resource = vscode.window.activeTextEditor?.document.uri;
+  async openActiveDiff(resource = vscode.window.activeTextEditor?.document.uri): Promise<void> {
     if (resource === undefined || !await this.quickDiff.openDiff(resource)) {
       void vscode.window.showInformationMessage('No active Codex comparison for this file.');
     }
@@ -1035,9 +1116,8 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
     const document = this.liveDocument(key);
     const state = coordinator.state(key);
-    const valid = document !== undefined
-      && state !== undefined
-      && document.getText() === state.currentText;
+    const valid = state !== undefined
+      && (document === undefined || document.getText() === state.currentText);
     if (!valid) {
       void vscode.window.showErrorMessage(
         'The document changed before the Codex review action could be applied.',
@@ -1228,12 +1308,12 @@ export class ExtensionController implements vscode.Disposable {
     await this.runtime?.simulateExternalChange(uri, baselineText, currentText, createdFile);
   }
 
-  async openActiveDiff(): Promise<void> {
+  async openActiveDiff(resource?: vscode.Uri): Promise<void> {
     if (this.runtime === undefined) {
       void vscode.window.showInformationMessage('Codex Extension Helper is disabled.');
       return;
     }
-    await this.runtime.openActiveDiff();
+    await this.runtime.openActiveDiff(resource);
   }
 
   start(): void {
@@ -1336,7 +1416,7 @@ export function activate(context: vscode.ExtensionContext): TestExtensionApi | u
   context.subscriptions.push(controller);
   context.subscriptions.push(vscode.commands.registerCommand(
     'codexExtensionHelper.openDiff',
-    () => controller.openActiveDiff(),
+    (resource?: vscode.Uri) => controller.openActiveDiff(resource),
   ));
   context.subscriptions.push(vscode.commands.registerCommand(
     'codexExtensionHelper.insertExplorerPathIntoCodex',

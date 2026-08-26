@@ -1,38 +1,87 @@
 # Codex Extension Helper
 
-Codex Extension Helper is a personal VS Code Stable extension that shows qualifying external file writes directly in the normal editable editor. VS Code does not identify the process that changed a file, so the extension can show changes made by Codex and by other external writers that meet the same eligibility rules. Git operations that leave a file Git-clean are filtered out.
+Codex Extension Helper is a private, unofficial VS Code extension for reviewing
+external file writes directly in the normal editable editor. It compares a
+qualifying disk change with the last in-memory snapshot, highlights additions
+and deletions, and lets you approve or reject changes by hunk, file, or across
+the current workspace.
 
-This is an independent, unofficial project. It is not affiliated with,
-endorsed by, or sponsored by OpenAI.
+The extension also includes optional tools for inserting Explorer files and
+folders as Codex `@` mentions. It is not affiliated with, endorsed by, or
+sponsored by OpenAI.
 
-## What appears in the editor
+## Features
 
-- Deleted content appears in a translucent-red decoration block at its former location without changing the document buffer.
-- A deleted empty source line remains visually empty. The extension does not insert a `(blank line)` label.
-- Added or replacement lines in the current document are highlighted in green and remain fully editable.
-- VS Code Quick Diff gutter markers provide the native inline diff peek for complete deletion blocks. The `Codex Changes` Source Control provider appears only while tracked changes exist.
-- Each change has **Approve** and **Reject** CodeLens actions. The source already contains the external writer's latest text: Approve keeps that text and advances the comparison baseline without saving, while Reject edits the document back to the latest baseline and leaves that edit unsaved.
-- The active editor's title bar shows previous/next change arrows plus **Approve All** and **Reject All** while that file has pending changes. Previous and next wrap from the first change to the last and from the last change to the first.
-- Rejecting the single change in a newly created file—or choosing **Reject All**—moves the entire file to the operating system trash.
-- Run **Codex Changes: Open Full Diff** from the Command Palette for a full comparison.
-- Saving accepts the current document as the new baseline and immediately clears its comparison UI and title actions.
-- A previously snapshotted background file keeps its pending comparison and renders it when opened.
-- Git reset, restore, or checkout activity that leaves the file Git-clean clears or suppresses the review instead of presenting it as a Codex change.
+### Inline review
 
-VS Code Stable has no public editor-inset API. Deleted content is therefore rendered with decorations only; review display never inserts temporary lines or dirties the live document buffer. The comparison model and review commands always use the canonical source already written by the external process. Approve never saves; Reject applies an ordinary unsaved editor change so it can be reviewed before you save it.
+- Added and replacement lines remain editable and are highlighted in green.
+- Deleted lines appear in translucent red at their former location without
+  becoming part of the document text.
+- Empty deleted lines remain visually empty; no placeholder text is inserted.
+- Each change exposes **Approve** and **Reject** CodeLens actions.
+- The editor title provides previous/next navigation plus **Approve All** and
+  **Reject All** while the active file has pending changes.
+- Quick Diff gutter markers open VS Code's native comparison view, and
+  **Codex Changes: Open Full Diff** opens the complete file diff.
+- Saving accepts the current document as the new baseline and clears its review
+  state.
+
+VS Code Stable does not expose an editor-inset API. Deleted content is rendered
+with decorations, so the review UI does not add persistent text to the file or
+make the document dirty. Review actions operate on the canonical file content.
+
+### Source Control review
+
+The `Codex Changes` Source Control provider appears only while pending changes
+exist and lists every affected file.
+
+- Clicking a file opens its full diff.
+- File-row **Approve File** and **Reject File** actions process that file.
+- Provider-title **Approve All Files** and **Reject All Files** actions process
+  every file currently listed.
+- A background file can be approved or rejected without first making it the
+  active editor.
+
+### Codex Explorer `@` mentions
+
+On macOS, select one or more workspace files or folders in Explorer and choose
+**Codex: Add as @ Mention**. The command opens the Codex sidebar, copies a
+private payload, and pastes it into the composer. Each resource becomes one
+inline `@` mention without sending the message or creating a separate
+attachment card. Directories are not expanded.
+
+This command requires the Codex Explorer drop patch described below. macOS may
+also require Accessibility permission for Visual Studio Code under **System
+Settings → Privacy & Security → Accessibility**.
 
 ## Review behavior
 
-- **Approve** keeps the source already written by Codex or another external writer and accepts only the selected change in the in-memory comparison baseline.
-- **Reject** restores the selected change from the latest baseline and leaves the restoration as an ordinary unsaved editor edit.
-- **Approve All** keeps the complete current source without saving it.
-- **Reject All** restores the complete baseline; for a newly created file, rejection moves the file to the operating system trash.
-- Previous/next navigation and per-change actions use canonical source coordinates while deleted-content decorations are visible.
-- Review display does not add temporary document content, so saving writes exactly the canonical current source.
+The source on disk already contains the external writer's latest text when a
+review begins.
+
+| Action | Result |
+| --- | --- |
+| **Approve** | Keeps the selected change and advances that part of the in-memory baseline without saving. |
+| **Reject** | Restores the selected baseline content as an ordinary unsaved editor edit. |
+| **Approve All** | Keeps every change in the selected file without saving. |
+| **Reject All** | Restores the complete file baseline as an unsaved edit. |
+| **Approve All Files** | Accepts all files currently listed in `Codex Changes`. |
+| **Reject All Files** | Restores all files currently listed in `Codex Changes`. |
+
+Rejecting all changes in a newly created file moves that file to the operating
+system trash. Navigation wraps between the first and last change.
+
+VS Code does not identify which process wrote a file. The extension therefore
+shows every qualifying external write, not only writes made by Codex. Git
+operations that leave a resource Git-clean are cleared or suppressed rather
+than shown as review changes.
 
 ## Requirements
 
-- VS Code 1.105 or newer.
+- VS Code 1.101.1 or newer.
+- Node.js and npm for building from source.
+- macOS for automatic Explorer-to-Codex `@` mention insertion.
+- The OpenAI Codex VS Code extension for Codex mention and patch features.
 
 ## Build, package, and install
 
@@ -41,123 +90,144 @@ From the repository root:
 ```bash
 npm ci
 npm run package
-code --install-extension ./codex-extension-helper-0.0.2.vsix --force
+code --install-extension ./codex-extension-helper-0.0.3.vsix --force
 ```
 
-## Insert Explorer paths into Codex chat
+`npm run package` compiles the extension, runs the unit test suite, and creates
+the VSIX. The package contains the bundled runtime, manifest, README, changelog,
+license, and third-party notices.
 
-On macOS, right-click one or more files or folders in Explorer and choose
-**Codex: Add as @ Mention**. The extension focuses the Codex sidebar and
-copies a private path payload and pastes it once. The patched Codex webview
-turns that payload directly into the same `atMention` nodes used by Explorer
-drag-and-drop, so it does not depend on the `@` file picker's search results
-and does not send the message.
+## Codex Explorer drop patch
 
-The first use may require permission under **System Settings → Privacy &
-Security → Accessibility** for Visual Studio Code. This command requires the
-Codex Explorer drop patch below. It avoids Explorer drag-and-drop and therefore
-does not require Shift.
+The patch manager and patch implementation are included in the VSIX. On normal
+startup, the extension inspects the installed `openai.chatgpt` extension. When
+a compatible installation needs the patch or a verified older patch needs an
+update, a modal prompt offers **Apply and Reload**. Dismissing the prompt leaves
+the Codex installation unchanged.
 
-## Codex Explorer drop chips
+The patch is applied transactionally. It records metadata and preserves
+recovery backups; inspection verifies the bundle, index, bootstrap, metadata,
+and backup hashes before reporting the installation as patched. An unknown or
+invalid bundle layout fails closed without modifying the Codex installation.
 
-The patch manager and patch implementation are included in the VSIX. After a
-recipient installs this extension, it inspects the installed `openai.chatgpt`
-extension without changing it. If a compatible Codex version needs the patch,
-the extension asks for confirmation; choose **Apply and Reload** to install the
-patch transactionally and reload VS Code. Nothing is modified when the prompt
-is dismissed.
-
-The Command Palette also provides these controls:
+The Command Palette exposes:
 
 - **Codex Helper: Install/Repair Drop Patch**
 - **Codex Helper: Remove Drop Patch**
 - **Codex Helper: Show Drop Patch Status**
 
-When Codex updates, its new extension directory is detected on the next VS Code
-start and the confirmation prompt appears again. The remove command verifies
-the recorded backups before restoring them and then reloads VS Code.
+Removing the patch verifies the recorded backups before offering **Remove and
+Reload**. After Codex updates, the new installation is inspected on the next
+VS Code start.
 
-Repository scripts remain available for development or explicitly targeting a
-side-by-side Codex installation:
+Repository scripts provide the same workflow for development:
 
 ```bash
 npm run patch:codex-drop
-# Reload VS Code, then drop Explorer files or folders onto the Codex composer.
+# Reload VS Code after the patch is applied.
 
 npm run unpatch:codex-drop
-# Reload VS Code again after restoring.
+# Reload VS Code after the original files are restored.
 ```
 
-Each dropped file or folder becomes one inline mention without a separate
-attachment card or requiring Shift; directories are not expanded. The same patch
-accepts the private clipboard payload used by **Codex: Add as @ Mention**.
-In automatic CLI mode, the patch command chooses the numerically newest installed
-`openai.chatgpt-*` version first and fails closed if that installation's bundle
-layout is unsupported; it does not fall back to an older installation. To
-intentionally target an older side-by-side installation, run
-`node scripts/patch-codex-drop.mjs --extension-dir <extension-path>` (and use
-the same `--extension-dir` option with the restore script). If the installed
-bundle has an unknown layout, both the VSIX runtime and CLI fail closed without
-modifying the installation.
+Automatic CLI mode selects the numerically newest installed
+`openai.chatgpt-*` directory and fails closed when that installation is not
+supported; it does not silently fall back to an older version. To target an
+older side-by-side installation intentionally, pass its directory explicitly:
 
-## Develop in VS Code Stable
+```bash
+node scripts/patch-codex-drop.mjs --extension-dir <extension-path>
+node scripts/unpatch-codex-drop.mjs --extension-dir <extension-path>
+```
 
-Open this repository in VS Code Stable, create the fixture workspace once, and start the watcher:
+## Configuration
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `codexExtensionHelper.enabled` | `true` | Enables external-change detection and review UI. Disabling it clears pending in-memory state. |
+| `codexExtensionHelper.debounceMs` | `300` | Delay before comparing an external write, from 50 to 5000 ms. |
+| `codexExtensionHelper.maxFileSizeKb` | `1024` | Maximum eligible file size in KiB. |
+| `codexExtensionHelper.exclude` | `**/.git/**`, `**/node_modules/**`, `**/dist/**`, `**/build/**` | Glob patterns excluded from tracking. |
+
+Only `file` resources with decodable, non-binary text, an eligible size, and a
+non-excluded workspace path are compared. Existing files need an observed
+in-memory baseline before an external write can be reviewed; newly detected file
+creation is compared with an empty baseline.
+
+## Development
+
+Create the extension-host fixture workspace once and start the watcher:
 
 ```bash
 mkdir -p test-fixtures/workspace
 npm run watch
 ```
 
-Then run the **Run Extension (Stable)** launch configuration. It opens `test-fixtures/workspace` with these effective arguments:
+Then run the **Run Extension (Stable)** launch configuration. The watcher runs
+TypeScript checking in no-emit mode while esbuild rebuilds the bundled
+`out/src/extension.js` runtime.
 
-```bash
-code --extensionDevelopmentPath="$PWD" \
-  "$PWD/test-fixtures/workspace"
-```
+Useful commands:
 
-The default build task is **npm: watch**, which runs `npm run watch`. TypeScript continuously type-checks in no-emit mode while esbuild exclusively rebuilds the bundled `out/src/extension.js` runtime entry.
-
-## Settings
-
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `codexExtensionHelper.enabled` | `true` | Enables detection and inline rendering. Turning it off clears active and pending comparison state. |
-| `codexExtensionHelper.debounceMs` | `300` | Wait time in milliseconds before reading and comparing an external write (50–5000). |
-| `codexExtensionHelper.maxFileSizeKb` | `1024` | Maximum eligible file size in KiB. |
-| `codexExtensionHelper.exclude` | `**/.git/**`, `**/node_modules/**`, `**/dist/**`, `**/build/**` | Glob patterns excluded from tracking. |
-
-Only `file` documents with decodable, non-binary content, a valid pre-change snapshot, an eligible size, and a non-excluded path are compared. A file must have a usable baseline before its external write; the extension does not invent a comparison for a file it has never observed.
+| Command | Purpose |
+| --- | --- |
+| `npm run compile` | Type-check and build the bundled extension runtime. |
+| `npm run watch` | Watch TypeScript and runtime sources during development. |
+| `npm run test:unit` | Run the unit test suite once. |
+| `npm run test:extension` | Compile and run the VS Code extension-host tests. |
+| `npm run check` | Compile and run all unit tests. |
+| `npm run package` | Run checks and create the distributable VSIX. |
 
 ## Data handling
 
-- The extension reads qualifying workspace file content to compute comparisons locally inside the VS Code extension host.
-- Comparison text and baselines are kept in memory only and are cleared when the extension host stops.
-- The extension does not include telemetry, analytics, account integration, or code that intentionally sends workspace content over the network.
-- Diagnostic messages remain in the local **Codex Extension Helper** output channel. They may include file paths or error details, but the extension does not intentionally log file content.
-- Use `codexExtensionHelper.exclude` to exclude sensitive paths such as local secret or credential directories.
+- Eligible workspace files are read locally in the VS Code extension host to
+  compute comparisons.
+- Baselines and comparison text remain in memory and are cleared when the
+  extension host stops.
+- The project contains no telemetry, analytics, or account integration and does
+  not intentionally send workspace content over the network.
+- Diagnostic output remains in the local **Codex Extension Helper** output
+  channel. Messages may contain paths or error details but do not intentionally
+  include file content.
+- Sensitive directories can be excluded with `codexExtensionHelper.exclude`.
 
-Review these behaviors before installing the extension in a workspace that
-contains personal, confidential, or regulated information.
-
-## License and limited sharing
-
-The copyright holder may provide the packaged extension directly to designated
-recipients for personal or internal use under the terms in the included
-`LICENSE` file. Recipients may not redistribute it. Bundled third-party
-software remains subject to the licenses and notices in the included
-`THIRD_PARTY_NOTICES.txt` file.
+Review these behaviors before using the extension with personal, confidential,
+or regulated data.
 
 ## Limitations
 
-- Comparison state is memory-only and does not persist across VS Code restarts.
-- The extension cannot identify Codex as the writer. It suppresses Git operations that leave a file Git-clean, but other qualifying external writers can still appear as Codex-style review changes.
-- VS Code Stable does not expose `editorInsets`, so deleted-content decorations cannot reserve true editor rows and may be less distinct in dense or folded code.
-- `editor.codeLens` must remain enabled for per-change Approve/Reject actions to be visible.
-- Diff editors, custom editors, binary or undecodable files, oversized files, excluded paths, and non-file documents do not render inline comparisons.
+- Review state does not persist across VS Code restarts.
+- The writer cannot be attributed to Codex; other qualifying external writers
+  can appear in the same review UI.
+- Deleted decorations cannot reserve true editor rows and may be less distinct
+  in dense or folded code.
+- `editor.codeLens` must remain enabled for per-change Approve/Reject actions.
+- Diff editors, custom editors, binary or undecodable content, oversized files,
+  excluded paths, and non-file resources do not render inline comparisons.
+- Codex patch compatibility depends on the installed Codex bundle layout. An
+  unsupported layout is reported and left unchanged.
 
 ## Troubleshooting
 
-Open **View → Output**, then choose **Codex Extension Helper** from the channel picker. File-read, eligibility, diff, and rendering failures are reported there.
+Open **View → Output** and select **Codex Extension Helper** to inspect file-read,
+eligibility, diff, rendering, Codex insertion, and patch errors.
 
-If no UI appears, confirm that the setting is enabled and the file had an observed baseline before the external write. Review actions apply only to the active file. Use the gutter change marker for native Quick Diff or run **Codex Changes: Open Full Diff** from the Command Palette.
+If no review UI appears:
+
+1. Confirm `codexExtensionHelper.enabled` is enabled.
+2. Confirm the path is not excluded and the file is below the size limit.
+3. For an existing file, open it before the external write so an in-memory
+   baseline exists.
+4. Confirm `editor.codeLens` is enabled if only hunk actions are missing.
+5. Use a gutter marker or **Codex Changes: Open Full Diff** when inline deleted
+   decorations are hard to distinguish.
+
+If Explorer `@` mention insertion fails, confirm the Codex patch status from the
+Command Palette and allow Visual Studio Code under macOS Accessibility settings.
+
+## License and sharing
+
+The copyright holder may provide the packaged extension directly to designated
+recipients for personal or internal use under the terms in `LICENSE`.
+Recipients may not redistribute it. Bundled third-party software remains
+subject to the licenses and notices in `THIRD_PARTY_NOTICES.txt`.

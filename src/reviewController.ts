@@ -16,6 +16,7 @@ export interface LiveReviewDocument {
 
 export interface ReviewHost {
   activeDocument(): LiveReviewDocument | undefined;
+  reviewDocument(uri: vscode.Uri): Promise<LiveReviewDocument | undefined>;
   applyReplacement(
     document: LiveReviewDocument,
     replacement: TextReplacement,
@@ -53,7 +54,18 @@ export class ReviewController implements vscode.Disposable {
     private readonly prepareCanonicalDocument: (key: string) => Promise<boolean> = async () => true,
     private readonly canonicalTextForDisplay: (key: string, text: string) => string = (_key, text) => text,
     private readonly canonicalLineForDisplay: (key: string, line: number) => number = (_key, line) => line,
+    private readonly reviewResources: () => readonly vscode.Uri[] = () => [],
   ) {}
+
+  async approveAllFiles(): Promise<void> {
+    for (const uri of [...this.reviewResources()]) {
+      try {
+        await this.approveFile(uri);
+      } catch (error) {
+        this.host.log('Approve all Codex files', error);
+      }
+    }
+  }
 
   async approveHunk(reference: HunkReference): Promise<void> {
     await this.serializeMutation(reference.key, async () => {
@@ -146,6 +158,29 @@ export class ReviewController implements vscode.Disposable {
     });
   }
 
+  async approveFile(uri: vscode.Uri): Promise<void> {
+    const key = uri.toString();
+    await this.serializeMutation(key, async () => {
+      if (!await this.prepareCanonicalDocument(key)) {
+        return;
+      }
+      const initial = await this.resolveResourceState(uri);
+      if (initial === undefined) {
+        return;
+      }
+      const current = await this.resolveResourceState(
+        uri,
+        initial.document.version,
+        initial.state.sourceRevision,
+      );
+      if (current === undefined) {
+        return;
+      }
+      this.coordinator.approveAll(key, current.document.text);
+      this.synchronize(key);
+    });
+  }
+
   async rejectAll(uri?: vscode.Uri): Promise<void> {
     const key = this.mutationKey(uri);
     if (key === undefined) {
@@ -196,6 +231,58 @@ export class ReviewController implements vscode.Disposable {
         }
       }
       this.synchronize(current.document.key);
+    });
+  }
+
+  async rejectAllFiles(): Promise<void> {
+    for (const uri of [...this.reviewResources()]) {
+      try {
+        await this.rejectFile(uri);
+      } catch (error) {
+        this.host.log('Reject all Codex files', error);
+      }
+    }
+  }
+
+  async rejectFile(uri: vscode.Uri): Promise<void> {
+    const key = uri.toString();
+    await this.serializeMutation(key, async () => {
+      if (!await this.prepareCanonicalDocument(key)) {
+        return;
+      }
+      const initial = await this.resolveResourceState(uri);
+      if (initial === undefined) {
+        return;
+      }
+      const current = await this.resolveResourceState(
+        uri,
+        initial.document.version,
+        initial.state.sourceRevision,
+      );
+      if (current === undefined) {
+        return;
+      }
+
+      if (current.state.createdFile) {
+        try {
+          await this.host.deleteToTrash(uri);
+        } catch (error) {
+          this.reportRejectionFailure(error);
+          return;
+        }
+        this.finalizeCreatedFileRejection(key);
+      } else {
+        try {
+          const applied = await this.host.replaceAll(current.document, current.state.baselineText);
+          if (!applied) {
+            throw new Error('VS Code did not apply the rejection edit.');
+          }
+        } catch (error) {
+          this.reportRejectionFailure(error);
+          return;
+        }
+      }
+      this.synchronize(key);
     });
   }
 
@@ -277,6 +364,40 @@ export class ReviewController implements vscode.Disposable {
       return undefined;
     }
 
+    return { document, state };
+  }
+
+  private async resolveResourceState(
+    uri: vscode.Uri,
+    expectedVersion?: number,
+    expectedRevision?: number,
+  ): Promise<{ document: LiveReviewDocument; state: FileComparisonState } | undefined> {
+    if (this.disposed) {
+      return undefined;
+    }
+
+    const key = uri.toString();
+    const document = await this.host.reviewDocument(uri);
+    if (
+      document === undefined
+      || document.key !== key
+      || (expectedVersion !== undefined && document.version !== expectedVersion)
+    ) {
+      this.synchronize(key);
+      return undefined;
+    }
+
+    const state = this.coordinator.state(key);
+    if (
+      state === undefined
+      || !state.pending
+      || state.hunks.length === 0
+      || state.currentText !== this.canonicalTextForDisplay(key, document.text)
+      || (expectedRevision !== undefined && state.sourceRevision !== expectedRevision)
+    ) {
+      this.synchronize(key);
+      return undefined;
+    }
     return { document, state };
   }
 

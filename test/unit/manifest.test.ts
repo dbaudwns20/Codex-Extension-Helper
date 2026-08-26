@@ -37,6 +37,10 @@ describe('extension manifest', () => {
       'codexExtensionHelper.nextChange',
       'codexExtensionHelper.approveAll',
       'codexExtensionHelper.rejectAll',
+      'codexExtensionHelper.approveFile',
+      'codexExtensionHelper.rejectFile',
+      'codexExtensionHelper.approveAllFiles',
+      'codexExtensionHelper.rejectAllFiles',
       'codexExtensionHelper.insertExplorerPathIntoCodex',
       'codexExtensionHelper.installCodexDropPatch',
       'codexExtensionHelper.removeCodexDropPatch',
@@ -117,5 +121,32 @@ describe('extension manifest', () => {
         icon: '$(discard)',
       }),
     ]));
+  });
+
+  it('offers file actions and workspace-wide actions in Codex Changes', () => {
+    expect(manifest.contributes.menus['scm/resourceState/context']).toEqual([
+      {
+        command: 'codexExtensionHelper.approveFile',
+        when: 'scmProvider == codexChanges && scmResourceState == codexChange',
+        group: 'inline@10',
+      },
+      {
+        command: 'codexExtensionHelper.rejectFile',
+        when: 'scmProvider == codexChanges && scmResourceState == codexChange',
+        group: 'inline@11',
+      },
+    ]);
+    expect(manifest.contributes.menus['scm/title']).toEqual([
+      {
+        command: 'codexExtensionHelper.approveAllFiles',
+        when: 'scmProvider == codexChanges',
+        group: 'navigation@10',
+      },
+      {
+        command: 'codexExtensionHelper.rejectAllFiles',
+        when: 'scmProvider == codexChanges',
+        group: 'navigation@11',
+      },
+    ]);
   });
 });

@@ -2,6 +2,15 @@
 
 All notable changes to this personal extension are documented in this file.
 
+## 0.0.3 - 2026-08-26
+
+### Added
+
+- The `Codex Changes` Source Control provider lists every pending file and
+  opens the selected file's full diff.
+- Source Control file rows provide Approve and Reject actions, while the
+  provider title offers Approve All Files and Reject All Files actions.
+
 ## 0.0.2 - 2026-08-26
 
 ### Added

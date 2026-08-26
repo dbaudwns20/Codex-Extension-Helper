@@ -215,10 +215,19 @@ function installRuntimeVscode(initialText = 'before\n') {
     onDidDelete: event('watcherDelete'),
     dispose: vi.fn(),
   };
+  const changesGroup = {
+    resourceStates: [] as Array<{
+      resourceUri: typeof uri;
+      command?: { command: string; arguments?: readonly unknown[] };
+      contextValue?: string;
+    }>,
+    dispose: vi.fn(),
+  };
   const sourceControl = {
     inputBox: { visible: true },
     count: 0,
     quickDiffProvider: undefined as unknown,
+    createResourceGroup: vi.fn(() => changesGroup),
     dispose: vi.fn(),
   };
   const createSourceControl = vi.fn(() => sourceControl);
@@ -242,6 +251,13 @@ function installRuntimeVscode(initialText = 'before\n') {
   };
   const workspace = {
     textDocuments: [document] as Array<typeof document | typeof secondDocument>,
+    openTextDocument: vi.fn(async (resource: typeof uri) => {
+      const opened = resource.toString() === secondUri.toString() ? secondDocument : document;
+      if (!workspace.textDocuments.includes(opened)) {
+        workspace.textDocuments.push(opened);
+      }
+      return opened;
+    }),
     fs: {
       readFile: vi.fn(async () => new TextEncoder().encode(text)),
       delete: vi.fn().mockResolvedValue(undefined),
@@ -325,6 +341,7 @@ function installRuntimeVscode(initialText = 'before\n') {
 
   return {
     callbacks,
+    changesGroup,
     codeLenses() {
       return codeLensProvider?.provideCodeLenses(document) ?? [];
     },
@@ -456,6 +473,185 @@ describe('packaged runtime', () => {
     }
   });
 
+  it('lists each tracked comparison in Codex Changes and opens its diff', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      expect(fake.changesGroup.resourceStates).toEqual([
+        expect.objectContaining({
+          resourceUri: fake.uri,
+          contextValue: 'codexChange',
+          command: {
+            command: 'codexExtensionHelper.openDiff',
+            title: 'Open Codex Changes',
+            arguments: [fake.uri],
+          },
+        }),
+      ]);
+      expect(fake.sourceControl.count).toBe(1);
+
+      fake.window.activeTextEditor = fake.secondEditor;
+      const openDiff = (runtime as unknown as {
+        openActiveDiff(resource?: typeof fake.uri): Promise<void>;
+      }).openActiveDiff;
+      await openDiff.call(runtime, fake.uri);
+      expect(fake.executeCommand).toHaveBeenCalledWith(
+        'vscode.diff',
+        expect.objectContaining({ scheme: 'codex-baseline' }),
+        fake.uri,
+        'file.ts — Codex Changes',
+        { preview: true },
+      );
+
+      fake.callbacks.get('watcherDelete')!(fake.uri);
+      await settleRuntime();
+
+      expect(fake.changesGroup.resourceStates).toEqual([]);
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('approves every listed file from the Codex Changes title command', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+      expect(runtime.comparisonCount).toBe(1);
+
+      await fake.commands.get('codexExtensionHelper.approveAllFiles')!();
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(0);
+      expect(fake.changesGroup.resourceStates).toEqual([]);
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('approves a listed file that is no longer open in an editor', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+
+      fake.setText('before\nafter\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+      fake.workspace.textDocuments.length = 0;
+      fake.window.activeTextEditor = fake.secondEditor;
+
+      await fake.commands.get('codexExtensionHelper.approveFile')!([{ resourceUri: fake.uri }]);
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(0);
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects a listed file without making it the active editor', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+
+      fake.setText('before\nafter\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+      fake.window.activeTextEditor = fake.secondEditor;
+
+      await fake.commands.get('codexExtensionHelper.rejectFile')!([{ resourceUri: fake.uri }]);
+      await settleRuntime();
+
+      expect(fake.window.activeTextEditor).toBe(fake.secondEditor);
+      expect(fake.currentText()).toBe('before\n');
+      expect(runtime.comparisonCount).toBe(0);
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects a listed created file through the operating system trash', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+
+      fake.setText('created\n');
+      await runtime.simulateExternalChange(fake.uri as never, '', 'created\n', true);
+      await settleRuntime();
+
+      await fake.commands.get('codexExtensionHelper.rejectFile')!([{ resourceUri: fake.uri }]);
+      await settleRuntime();
+
+      expect(fake.workspace.fs.delete).toHaveBeenCalledWith(fake.uri, { useTrash: true });
+      expect(runtime.comparisonCount).toBe(0);
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('loads with vscode as its only external module', async () => {
     const temporaryPath = await mkdtemp(path.join(tmpdir(), 'codex-inline-runtime-'));
 
@@ -559,6 +755,45 @@ describe('packaged runtime', () => {
 });
 
 describe('stable review runtime boundaries', () => {
+  it('resolves a review document without making it the active editor', async () => {
+    const { createReviewHost } = await import('../../src/extension');
+    const activeDocument = reviewDocument('active\n');
+    const inactiveDocument = {
+      ...reviewDocument('inactive\n'),
+      uri: { toString: () => 'file:///workspace/inactive.ts' },
+      version: 7,
+    };
+    const api = {
+      window: {
+        activeTextEditor: {
+          document: activeDocument,
+          selection: { active: { line: 1 } },
+          revealRange: vi.fn(),
+        },
+        showErrorMessage: vi.fn(),
+      },
+      workspace: {
+        applyEdit: vi.fn(),
+        openTextDocument: vi.fn().mockResolvedValue(inactiveDocument),
+        fs: { delete: vi.fn() },
+      },
+      WorkspaceEdit: FakeWorkspaceEdit,
+      Range: FakeRange,
+      Selection: FakeSelection,
+      TextEditorRevealType: { InCenter: 9 },
+    };
+    const host = createReviewHost(api as never, { appendLine: vi.fn() }, (uri) => uri.toString());
+
+    expect(host.reviewDocument).toBeTypeOf('function');
+    await expect(host.reviewDocument(inactiveDocument.uri as never)).resolves.toMatchObject({
+      uri: inactiveDocument.uri,
+      key: 'file:///workspace/inactive.ts',
+      text: 'inactive\n',
+      version: 7,
+    });
+    expect(api.window.activeTextEditor.document).toBe(activeDocument);
+  });
+
   it('consumes two separated edit spans in either event array order', async () => {
     const module = await import('../../src/extension');
     const PendingReviewEdits = (module as unknown as {
@@ -919,6 +1154,10 @@ describe('stable review runtime boundaries', () => {
       nextChange: vi.fn(),
       approveAll: vi.fn(),
       rejectAll: vi.fn(),
+      approveFile: vi.fn(),
+      rejectFile: vi.fn(),
+      approveAllFiles: vi.fn(),
+      rejectAllFiles: vi.fn(),
     };
     registerReviewCommands(ownership, registerCommand, controller);
     const reference: HunkReference = {
@@ -935,6 +1174,12 @@ describe('stable review runtime boundaries', () => {
     handlers.get('codexExtensionHelper.nextChange')!(uri as never);
     await handlers.get('codexExtensionHelper.approveAll')!(uri as never);
     await handlers.get('codexExtensionHelper.rejectAll')!(uri as never);
+    const secondUri = { toString: () => 'file:///workspace/second.ts' };
+    const resourceStates = [{ resourceUri: uri }, { resourceUri: secondUri }];
+    await handlers.get('codexExtensionHelper.approveFile')!(resourceStates as never);
+    await handlers.get('codexExtensionHelper.rejectFile')!(resourceStates as never);
+    await handlers.get('codexExtensionHelper.approveAllFiles')!();
+    await handlers.get('codexExtensionHelper.rejectAllFiles')!();
 
     expect([...handlers.keys()]).toEqual([
       'codexExtensionHelper.approveHunk',
@@ -943,6 +1188,10 @@ describe('stable review runtime boundaries', () => {
       'codexExtensionHelper.nextChange',
       'codexExtensionHelper.approveAll',
       'codexExtensionHelper.rejectAll',
+      'codexExtensionHelper.approveFile',
+      'codexExtensionHelper.rejectFile',
+      'codexExtensionHelper.approveAllFiles',
+      'codexExtensionHelper.rejectAllFiles',
     ]);
     expect(controller.approveHunk).toHaveBeenCalledWith(reference);
     expect(controller.rejectHunk).toHaveBeenCalledWith(reference);
@@ -950,6 +1199,10 @@ describe('stable review runtime boundaries', () => {
     expect(controller.nextChange).toHaveBeenCalledWith(uri);
     expect(controller.approveAll).toHaveBeenCalledWith(uri);
     expect(controller.rejectAll).toHaveBeenCalledWith(uri);
+    expect(controller.approveFile.mock.calls).toEqual([[uri], [secondUri]]);
+    expect(controller.rejectFile.mock.calls).toEqual([[uri], [secondUri]]);
+    expect(controller.approveAllFiles).toHaveBeenCalledOnce();
+    expect(controller.rejectAllFiles).toHaveBeenCalledOnce();
 
     ownership.dispose();
     expect(disposals.every((dispose) => dispose.mock.calls.length === 1)).toBe(true);
@@ -961,26 +1214,40 @@ describe('stable review runtime boundaries', () => {
     const handlers = new Map<string, (...args: any[]) => unknown>();
     const failure = new Error('approval failed');
     const onError = vi.fn();
+    const controller = {
+      approveHunk: vi.fn().mockRejectedValue(failure),
+      rejectHunk: vi.fn(),
+      previousChange: vi.fn(),
+      nextChange: vi.fn(),
+      approveAll: vi.fn(),
+      rejectAll: vi.fn(),
+      approveFile: vi.fn().mockRejectedValueOnce(failure),
+      rejectFile: vi.fn(),
+      approveAllFiles: vi.fn(),
+      rejectAllFiles: vi.fn(),
+    };
     registerReviewCommands(
       ownership,
       (command, handler) => {
         handlers.set(command, handler);
         return { dispose: vi.fn() };
       },
-      {
-        approveHunk: vi.fn().mockRejectedValue(failure),
-        rejectHunk: vi.fn(),
-        previousChange: vi.fn(),
-        nextChange: vi.fn(),
-        approveAll: vi.fn(),
-        rejectAll: vi.fn(),
-      },
+      controller,
       onError,
     );
 
     await expect(handlers.get('codexExtensionHelper.approveHunk')!({}))
       .resolves.toBeUndefined();
     expect(onError).toHaveBeenCalledWith('ApproveHunkCommand', failure);
+
+    const firstUri = { toString: () => 'file:///workspace/first.ts' };
+    const secondUri = { toString: () => 'file:///workspace/second.ts' };
+    await expect(handlers.get('codexExtensionHelper.approveFile')!([
+      { resourceUri: firstUri },
+      { resourceUri: secondUri },
+    ])).resolves.toBeUndefined();
+    expect(onError).toHaveBeenCalledWith('ApproveFileCommand', failure);
+    expect(controller.approveFile.mock.calls).toEqual([[firstUri], [secondUri]]);
 
     ownership.dispose();
   });
@@ -1152,6 +1419,10 @@ describe('stable review runtime boundaries', () => {
         'codexExtensionHelper.nextChange',
         'codexExtensionHelper.approveAll',
         'codexExtensionHelper.rejectAll',
+        'codexExtensionHelper.approveFile',
+        'codexExtensionHelper.rejectFile',
+        'codexExtensionHelper.approveAllFiles',
+        'codexExtensionHelper.rejectAllFiles',
       ]);
 
       fake.setText('after\n');

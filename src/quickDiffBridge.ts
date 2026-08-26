@@ -14,6 +14,7 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
   private readonly entries = new Map<string, BaselineEntry>();
   private readonly contents = new Map<string, string>();
   private sourceControl: vscode.SourceControl | undefined;
+  private changesGroup: vscode.SourceControlResourceGroup | undefined;
   private readonly registration: vscode.Disposable;
   private readonly changeEmitter = new vscode.EventEmitter<vscode.Uri>();
   readonly onDidChange = this.changeEmitter.event;
@@ -99,6 +100,20 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
     this.sourceControl.quickDiffProvider = {
       provideOriginalResource: (uri) => this.entries.get(normalizeUriKey(uri))?.baseline,
     };
+    if (this.changesGroup !== undefined) {
+      this.changesGroup.resourceStates = [...this.entries.values()]
+        .sort((left, right) => left.resource.fsPath.localeCompare(right.resource.fsPath))
+        .map((entry) => ({
+          resourceUri: entry.resource,
+          contextValue: 'codexChange',
+          command: {
+            command: 'codexExtensionHelper.openDiff',
+            title: 'Open Codex Changes',
+            arguments: [entry.resource],
+          },
+        }));
+    }
+    this.sourceControl.count = this.entries.size;
   }
 
   private ensureSourceControl(): void {
@@ -106,12 +121,16 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
       return;
     }
     this.sourceControl = vscode.scm.createSourceControl('codexChanges', 'Codex Changes');
+    this.changesGroup = this.sourceControl.createResourceGroup('changes', 'Changes');
     this.sourceControl.inputBox.visible = false;
-    this.sourceControl.count = 0;
   }
 
   private disposeSourceControl(): void {
+    if (this.changesGroup !== undefined) {
+      this.changesGroup.resourceStates = [];
+    }
     this.sourceControl?.dispose();
     this.sourceControl = undefined;
+    this.changesGroup = undefined;
   }
 }

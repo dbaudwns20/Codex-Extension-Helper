@@ -2,7 +2,7 @@
   "name": "codex-extension-helper",
   "displayName": "Codex Extension Helper",
   "description": "Show external file changes inline in VS Code editors.",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "license": "SEE LICENSE IN LICENSE",
   "publisher": "local",
@@ -51,6 +51,26 @@
         "icon": "$(discard)"
       },
       {
+        "command": "codexExtensionHelper.approveFile",
+        "title": "Approve File",
+        "icon": "$(check)"
+      },
+      {
+        "command": "codexExtensionHelper.rejectFile",
+        "title": "Reject File",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "codexExtensionHelper.approveAllFiles",
+        "title": "Approve All Files",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "codexExtensionHelper.rejectAllFiles",
+        "title": "Reject All Files",
+        "icon": "$(trash)"
+      },
+      {
         "command": "codexExtensionHelper.insertExplorerPathIntoCodex",
         "title": "Codex: Add as @ Mention",
         "enablement": "isMac"
@@ -89,6 +109,30 @@
           "command": "codexExtensionHelper.rejectAll",
           "when": "resourceScheme == file && codexExtensionHelper.activeFileHasChanges",
           "group": "navigation@21"
+        }
+      ],
+      "scm/resourceState/context": [
+        {
+          "command": "codexExtensionHelper.approveFile",
+          "when": "scmProvider == codexChanges && scmResourceState == codexChange",
+          "group": "inline@10"
+        },
+        {
+          "command": "codexExtensionHelper.rejectFile",
+          "when": "scmProvider == codexChanges && scmResourceState == codexChange",
+          "group": "inline@11"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "codexExtensionHelper.approveAllFiles",
+          "when": "scmProvider == codexChanges",
+          "group": "navigation@10"
+        },
+        {
+          "command": "codexExtensionHelper.rejectAllFiles",
+          "when": "scmProvider == codexChanges",
+          "group": "navigation@11"
         }
       ],
       "explorer/context": [

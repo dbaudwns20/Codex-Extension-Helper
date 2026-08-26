@@ -53,6 +53,7 @@ type QueuedActiveDocument = ActiveDocumentResult | (() => ActiveDocumentResult);
 
 class RecordingHost implements ReviewHost {
   document: LiveReviewDocument | undefined;
+  readonly documents = new Map<string, LiveReviewDocument>();
   readonly replacementCalls: Array<{
     document: LiveReviewDocument;
     replacement: TextReplacement;
@@ -76,6 +77,10 @@ class RecordingHost implements ReviewHost {
       return queued();
     }
     return queued === undefined ? this.document : queued;
+  }
+
+  async reviewDocument(uri: vscode.Uri): Promise<LiveReviewDocument | undefined> {
+    return this.documents.get(uri.toString());
   }
 
   queueActive(...documents: QueuedActiveDocument[]): void {
@@ -178,6 +183,7 @@ function setup(
   currentText = 'a\nnew\nz\n',
   overrides: Partial<FileComparisonState> = {},
   afterStateChanged?: (key: string) => void,
+  reviewResources: () => readonly vscode.Uri[] = () => [],
 ) {
   const store = new SnapshotStore();
   const view = new RecordingView();
@@ -185,11 +191,12 @@ function setup(
   const state = installState(store, key, baselineText, currentText, overrides);
   const host = new RecordingHost();
   host.document = liveDocument(key, currentText);
+  host.documents.set(key, host.document);
   const changed: string[] = [];
   const controller = new ReviewController(coordinator, host, (changedKey) => {
     changed.push(changedKey);
     afterStateChanged?.(changedKey);
-  });
+  }, undefined, undefined, undefined, reviewResources);
   return { changed, controller, coordinator, host, state, store, view };
 }
 
@@ -206,6 +213,53 @@ function applyReplacement(text: string, replacement: TextReplacement): string {
 }
 
 describe('ReviewController approvals', () => {
+  it('approves every file from the initial Codex Changes snapshot', async () => {
+    const otherKey = 'file:///workspace/other.ts';
+    const resources = [fakeUri(key), fakeUri(otherKey)];
+    const { changed, controller, coordinator, host, store } = setup(
+      undefined,
+      undefined,
+      {},
+      undefined,
+      () => resources,
+    );
+    const otherState = installState(store, otherKey, 'before', 'after');
+    host.documents.set(otherKey, liveDocument(otherKey, otherState.currentText));
+
+    const approveAllFiles = (controller as unknown as {
+      approveAllFiles(): Promise<void>;
+    }).approveAllFiles;
+    expect(approveAllFiles).toBeTypeOf('function');
+    await approveAllFiles.call(controller);
+
+    expect(coordinator.state(key)?.pending).toBe(false);
+    expect(coordinator.state(otherKey)?.pending).toBe(false);
+    expect(changed).toEqual([key, otherKey]);
+  });
+
+  it('approves a selected inactive file without changing the active file', async () => {
+    const otherKey = 'file:///workspace/other.ts';
+    const { changed, controller, coordinator, host, state, store } = setup();
+    const otherState = installState(store, otherKey, 'before', 'after');
+    const otherDocument = liveDocument(otherKey, otherState.currentText);
+    host.documents.set(otherKey, otherDocument);
+
+    const approveFile = (controller as unknown as {
+      approveFile(uri: vscode.Uri): Promise<void>;
+    }).approveFile;
+    expect(approveFile).toBeTypeOf('function');
+    await approveFile.call(controller, otherDocument.uri);
+
+    expect(coordinator.state(otherKey)).toMatchObject({
+      baselineText: 'after',
+      hunks: [],
+      pending: false,
+    });
+    expect(coordinator.state(key)).toEqual(state);
+    expect(changed).toEqual([otherKey]);
+    expectNoHostMutation(host);
+  });
+
   it('approves the referenced hunk through coordinator state only', async () => {
     const { changed, controller, coordinator, host, state } = setup();
     const hunkReference = reference(key, state);
@@ -283,6 +337,55 @@ describe('ReviewController approvals', () => {
 });
 
 describe('ReviewController rejection edits', () => {
+  it('rejects the remaining files when one listed resource is stale', async () => {
+    const staleKey = 'file:///workspace/stale.ts';
+    const otherKey = 'file:///workspace/other.ts';
+    const resources = [fakeUri(staleKey), fakeUri(key), fakeUri(otherKey)];
+    const { changed, controller, host, store } = setup(
+      undefined,
+      undefined,
+      {},
+      undefined,
+      () => resources,
+    );
+    const staleState = installState(store, staleKey, 'stale-before', 'stale-after');
+    host.documents.set(staleKey, liveDocument(staleKey, `${staleState.currentText}!`));
+    const otherState = installState(store, otherKey, 'before', 'after');
+    const otherDocument = liveDocument(otherKey, otherState.currentText);
+    host.documents.set(otherKey, otherDocument);
+
+    const rejectAllFiles = (controller as unknown as {
+      rejectAllFiles(): Promise<void>;
+    }).rejectAllFiles;
+    expect(rejectAllFiles).toBeTypeOf('function');
+    await rejectAllFiles.call(controller);
+
+    expect(host.replaceAllCalls).toEqual([
+      { document: host.document, text: 'a\nold\nz\n' },
+      { document: otherDocument, text: 'before' },
+    ]);
+    expect(changed).toEqual([staleKey, key, otherKey]);
+  });
+
+  it('rejects a selected inactive file without editing the active file', async () => {
+    const otherKey = 'file:///workspace/other.ts';
+    const { changed, controller, coordinator, host, state, store } = setup();
+    const otherState = installState(store, otherKey, 'before', 'after');
+    const otherDocument = liveDocument(otherKey, otherState.currentText);
+    host.documents.set(otherKey, otherDocument);
+
+    const rejectFile = (controller as unknown as {
+      rejectFile(uri: vscode.Uri): Promise<void>;
+    }).rejectFile;
+    expect(rejectFile).toBeTypeOf('function');
+    await rejectFile.call(controller, otherDocument.uri);
+
+    expect(host.replaceAllCalls).toEqual([{ document: otherDocument, text: 'before' }]);
+    expect(coordinator.state(otherKey)).toEqual(otherState);
+    expect(coordinator.state(key)).toEqual(state);
+    expect(changed).toEqual([otherKey]);
+  });
+
   const cases: Array<{
     name: string;
     baselineText: string;

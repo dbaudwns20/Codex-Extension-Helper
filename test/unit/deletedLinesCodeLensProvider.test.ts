@@ -133,7 +133,7 @@ describe('DeletedLinesCodeLensProvider', () => {
     expect(lenses[1].command?.arguments).toEqual(lenses[0].command?.arguments);
   });
 
-  it('preserves hunk order and uses each hunk index in action references', () => {
+  it('preserves hunk order without replacing deleted rows with a CodeLens summary', () => {
     const { provider } = createProvider();
     provider.update(state({ currentText: 'new\nother\n', hunks: [
       hunk({ modifiedStart: 0, modifiedLines: ['new'] }),
@@ -145,38 +145,18 @@ describe('DeletedLinesCodeLensProvider', () => {
     expect(lenses.map((lens) => lens.command?.command)).toEqual([
       'codexExtensionHelper.approveHunk',
       'codexExtensionHelper.rejectHunk',
-      'codexExtensionHelper.openDiff',
       'codexExtensionHelper.approveHunk',
       'codexExtensionHelper.rejectHunk',
     ]);
     expect(lenses[0].command?.arguments).toEqual([expect.objectContaining({ hunkIndex: 0 })]);
     expect(lenses[1].command?.arguments).toEqual(lenses[0].command?.arguments);
-    expect(lenses[2].command?.arguments).toBeUndefined();
-    expect(lenses[3].command?.arguments).toEqual([expect.objectContaining({
+    expect(lenses[2].command?.arguments).toEqual([expect.objectContaining({
       key,
       sourceRevision: 7,
       hunkIndex: 1,
       expectedText: 'new\nother\n',
     })]);
-    expect(lenses[4].command?.arguments).toEqual(lenses[3].command?.arguments);
-  });
-
-  it('keeps legacy updates summary-only and does not show legacy additions', () => {
-    const { provider } = createProvider();
-    provider.update(key, [
-      hunk({ originalLines: ['old'], modifiedStart: 2 }),
-      hunk({ modifiedStart: 3 }),
-    ]);
-
-    const lenses = provide(provider);
-
-    expect(lenses.map((lens) => lens.command?.command)).toEqual([
-      'codexExtensionHelper.openDiff',
-    ]);
-    expect(lenses[0].command?.arguments).toBeUndefined();
-
-    provider.update(key, [hunk({ modifiedLines: ['only addition'] })]);
-    expect(provide(provider)).toEqual([]);
+    expect(lenses[3].command?.arguments).toEqual(lenses[2].command?.arguments);
   });
 
   it('clamps negative modified starts to the first document line', () => {
