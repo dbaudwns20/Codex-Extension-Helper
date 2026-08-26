@@ -1,24 +1,31 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  formatExplorerResourcesAsMentionQueries,
+  formatExplorerResourcesAsMentions,
   insertMentionsIntoCodex,
 } from '../../src/codexChatInsert';
 
 describe('Codex chat @ mention insertion', () => {
-  it('formats files and directories as workspace-relative @ picker queries', () => {
-    expect(formatExplorerResourcesAsMentionQueries([
-      { relativePath: 'CHANGELOG.md', directory: false },
-      { relativePath: 'scripts/lib', directory: true },
-    ])).toEqual(['CHANGELOG.md', 'scripts/lib/']);
+  it('formats files and directories as direct Codex mention attributes', () => {
+    expect(formatExplorerResourcesAsMentions([
+      { relativePath: 'CHANGELOG.md', fsPath: '/workspace/CHANGELOG.md', directory: false },
+      { relativePath: 'scripts/lib', fsPath: '/workspace/scripts/lib', directory: true },
+    ])).toEqual([
+      { label: 'CHANGELOG.md', path: 'CHANGELOG.md', fsPath: '/workspace/CHANGELOG.md' },
+      { label: 'lib', path: 'scripts/lib/', fsPath: '/workspace/scripts/lib' },
+    ]);
   });
 
   it('normalizes Windows path separators without Markdown encoding', () => {
-    expect(formatExplorerResourcesAsMentionQueries([
-      { relativePath: String.raw`docs\draft (old)`, directory: true },
-    ])).toEqual(['docs/draft (old)/']);
+    expect(formatExplorerResourcesAsMentions([
+      { relativePath: String.raw`docs\draft (old)`, fsPath: String.raw`C:\workspace\docs\draft (old)`, directory: true },
+    ])).toEqual([{
+      label: 'draft (old)',
+      path: 'docs/draft (old)/',
+      fsPath: String.raw`C:\workspace\docs\draft (old)`,
+    }]);
   });
 
-  it('focuses Codex and selects every query through the @ picker without sending', async () => {
+  it('focuses Codex and pastes one direct mention payload without opening the picker', async () => {
     const events: string[] = [];
     const dependencies = {
       openCodexSidebar: vi.fn(async () => {
@@ -27,18 +34,24 @@ describe('Codex chat @ mention insertion', () => {
       waitForFocus: vi.fn(async () => {
         events.push('wait');
       }),
-      chooseMention: vi.fn(async (query: string) => {
-        events.push(`mention:${query}`);
+      copyPayload: vi.fn(async (payload: string) => {
+        events.push(`copy:${payload}`);
+      }),
+      pastePayload: vi.fn(async () => {
+        events.push('paste');
       }),
     };
 
-    await insertMentionsIntoCodex(['CHANGELOG.md', 'scripts/lib/'], dependencies);
+    await insertMentionsIntoCodex([
+      { label: 'CHANGELOG.md', path: 'CHANGELOG.md', fsPath: '/workspace/CHANGELOG.md' },
+      { label: 'lib', path: 'scripts/lib/', fsPath: '/workspace/scripts/lib' },
+    ], dependencies);
 
     expect(events).toEqual([
       'open-sidebar',
       'wait',
-      'mention:CHANGELOG.md',
-      'mention:scripts/lib/',
+      'copy:codex-extension-helper:mentions:v1:[{"label":"CHANGELOG.md","path":"CHANGELOG.md","fsPath":"/workspace/CHANGELOG.md"},{"label":"lib","path":"scripts/lib/","fsPath":"/workspace/scripts/lib"}]',
+      'paste',
     ]);
   });
 });

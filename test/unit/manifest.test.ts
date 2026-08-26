@@ -3,7 +3,7 @@ import manifest from '../../package.json';
 
 describe('extension manifest', () => {
   it('targets Stable without a proposed API', () => {
-    expect(manifest.engines.vscode).toBe('^1.105.0');
+    expect(manifest.engines.vscode).toBe('^1.101.1');
     expect(manifest).not.toHaveProperty('enabledApiProposals');
     expect(manifest.activationEvents).toContain('onStartupFinished');
   });
@@ -38,7 +38,27 @@ describe('extension manifest', () => {
       'codexExtensionHelper.approveAll',
       'codexExtensionHelper.rejectAll',
       'codexExtensionHelper.insertExplorerPathIntoCodex',
+      'codexExtensionHelper.installCodexDropPatch',
+      'codexExtensionHelper.removeCodexDropPatch',
+      'codexExtensionHelper.showCodexDropPatchStatus',
     ]);
+  });
+
+  it('exposes Codex drop patch management to VSIX recipients', () => {
+    expect(manifest.contributes.commands).toEqual(expect.arrayContaining([
+      {
+        command: 'codexExtensionHelper.installCodexDropPatch',
+        title: 'Codex Helper: Install/Repair Drop Patch',
+      },
+      {
+        command: 'codexExtensionHelper.removeCodexDropPatch',
+        title: 'Codex Helper: Remove Drop Patch',
+      },
+      {
+        command: 'codexExtensionHelper.showCodexDropPatchStatus',
+        title: 'Codex Helper: Show Drop Patch Status',
+      },
+    ]));
   });
 
   it('offers Codex @ mention insertion from the Explorer context menu on macOS', () => {

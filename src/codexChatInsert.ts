@@ -1,28 +1,44 @@
 export interface ExplorerMentionResource {
   readonly relativePath: string;
+  readonly fsPath: string;
   readonly directory: boolean;
+}
+
+export interface CodexMentionAttributes {
+  readonly label: string;
+  readonly path: string;
+  readonly fsPath: string;
 }
 
 export interface CodexMentionInsertDependencies {
   openCodexSidebar(): PromiseLike<void>;
   waitForFocus(): PromiseLike<void>;
-  chooseMention(query: string): PromiseLike<void>;
+  copyPayload(payload: string): PromiseLike<void>;
+  pastePayload(): PromiseLike<void>;
 }
 
-export function formatExplorerResourcesAsMentionQueries(
+const CODEX_MENTION_CLIPBOARD_PREFIX = 'codex-extension-helper:mentions:v1:';
+
+export function formatExplorerResourcesAsMentions(
   resources: readonly ExplorerMentionResource[],
-): string[] {
+): CodexMentionAttributes[] {
   return resources.map((resource) => {
     const normalizedPath = resource.relativePath.replace(/\\/gu, '/');
-    return resource.directory ? `${normalizedPath}/` : normalizedPath;
+    const mentionPath = resource.directory ? `${normalizedPath}/` : normalizedPath;
+    return {
+      label: normalizedPath.split('/').at(-1) ?? normalizedPath,
+      path: mentionPath,
+      fsPath: resource.fsPath,
+    };
   });
 }
 
 export async function insertMentionsIntoCodex(
-  queries: readonly string[],
+  mentions: readonly CodexMentionAttributes[],
   dependencies: CodexMentionInsertDependencies,
 ): Promise<void> {
   await dependencies.openCodexSidebar();
   await dependencies.waitForFocus();
-  for (const query of queries) await dependencies.chooseMention(query);
+  await dependencies.copyPayload(`${CODEX_MENTION_CLIPBOARD_PREFIX}${JSON.stringify(mentions)}`);
+  await dependencies.pastePayload();
 }

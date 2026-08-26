@@ -41,11 +41,13 @@ async function makeLegacyBundlePatchFixture(extensionDir: string, version: strin
   const backupPath = `${bundlePath}.codex-explorer-drop-chips.original`;
   const metadataPath = `${bundlePath}.codex-explorer-drop-chips.json`;
   const originalBundle = await readFile(bundlePath, 'utf8');
-  const patchedBundle = patchBundleSource(originalBundle).source;
+  const patchedBundle = patchBundleSource(originalBundle).source
+    .replace('codex-explorer-drop-chips:start:v11', 'codex-explorer-drop-chips:start:v10')
+    .replace('codex-explorer-drop-chips:end:v11', 'codex-explorer-drop-chips:end:v10');
   await writeFile(bundlePath, patchedBundle);
   await writeFile(backupPath, originalBundle);
   await writeFile(metadataPath, `${JSON.stringify({
-    patchVersion: 8,
+    patchVersion: 10,
     extensionVersion: version,
     bundlePath,
     backupPath,

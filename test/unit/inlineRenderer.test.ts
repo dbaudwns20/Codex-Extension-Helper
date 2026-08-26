@@ -5,6 +5,7 @@ import {
   InlineRenderer,
   insetPlacementForHunk,
 } from '../../src/inlineRenderer';
+import { createTemporaryLineSpacerPlan } from '../../src/temporaryLineSpacers';
 import type { ChangeHunk } from '../../src/types';
 
 interface FakeUri {
@@ -70,6 +71,39 @@ function renderedStatus(renderer: InlineRenderer, key: string): boolean | undefi
     hasRendered?: (renderedKey: string) => boolean;
   };
   return candidate.hasRendered?.(key);
+}
+
+function deletedRenderingFixture(key: string, lineCount = 1) {
+  const decorationTypes = [
+    { name: 'added', dispose: vi.fn() },
+    { name: 'removed-row', dispose: vi.fn() },
+    { name: 'removed-overlay', dispose: vi.fn() },
+  ];
+  const editor = {
+    viewColumn: 1,
+    document: fakeDocument(key, lineCount),
+    setDecorations: vi.fn(),
+  };
+  const api = {
+    window: {
+      visibleTextEditors: [editor],
+      tabGroups: { all: [tabGroup(1, new FakeTabInputText(fakeUri(key)))] },
+      createTextEditorDecorationType: vi.fn()
+        .mockImplementationOnce(() => decorationTypes[0])
+        .mockImplementationOnce(() => decorationTypes[1])
+        .mockImplementationOnce(() => decorationTypes[2]),
+    },
+    Range: FakeRange,
+    ThemeColor: class {},
+    DecorationRangeBehavior: { ClosedClosed: 0 },
+    OverviewRulerLane: { Full: 7 },
+    TabInputText: FakeTabInputText,
+  };
+  return {
+    decorationTypes,
+    editor,
+    renderer: new InlineRenderer(api as never, { appendLine: vi.fn() }),
+  };
 }
 
 describe('inline renderer helpers', () => {
@@ -247,6 +281,83 @@ describe('inline renderer helpers', () => {
       [new FakeRange(2, 0, 3, 0)],
     );
     expect(diffEditor.setDecorations).not.toHaveBeenCalled();
+  });
+
+  it('renders temporary deleted rows without a diff prefix', async () => {
+    const key = 'file:///deleted-rows.ts';
+    const deletedHunk = hunk({
+      originalEnd: 2,
+      originalLines: ['first old line', 'second old line'],
+    });
+    const plan = createTemporaryLineSpacerPlan('survivor', '\n', [deletedHunk]);
+    const { decorationTypes, editor, renderer } = deletedRenderingFixture(key, 3);
+
+    await renderer.render(key, [deletedHunk], {
+      key,
+      canonicalText: 'survivor',
+      displayText: plan.displayText,
+      documentVersion: 1,
+      revision: 1,
+      plan,
+    });
+
+    expect(editor.setDecorations).toHaveBeenCalledWith(
+      decorationTypes[1],
+      expect.arrayContaining([
+        expect.objectContaining({
+          renderOptions: { after: expect.objectContaining({ contentText: 'first old line' }) },
+        }),
+      ]),
+    );
+  });
+
+  it('terminates the final temporary deleted row with a newline', async () => {
+    const key = 'file:///deleted-row-newline.ts';
+    const deletedHunk = hunk({
+      originalEnd: 2,
+      originalLines: ['first old line', 'second old line'],
+    });
+    const plan = createTemporaryLineSpacerPlan('survivor', '\n', [deletedHunk]);
+    const { decorationTypes, editor, renderer } = deletedRenderingFixture(key, 3);
+
+    await renderer.render(key, [deletedHunk], {
+      key,
+      canonicalText: 'survivor',
+      displayText: plan.displayText,
+      documentVersion: 1,
+      revision: 1,
+      plan,
+    });
+
+    expect(editor.setDecorations).toHaveBeenCalledWith(
+      decorationTypes[1],
+      expect.arrayContaining([
+        expect.objectContaining({
+          renderOptions: { after: expect.objectContaining({ contentText: 'second old line\n' }) },
+        }),
+      ]),
+    );
+  });
+
+  it('renders fallback deleted lines verbatim with a final newline', async () => {
+    const key = 'file:///fallback-deleted-lines.ts';
+    const { decorationTypes, editor, renderer } = deletedRenderingFixture(key);
+
+    await renderer.render(key, [hunk({
+      originalEnd: 2,
+      originalLines: ['first old line', 'second old line'],
+    })]);
+
+    expect(editor.setDecorations).toHaveBeenCalledWith(
+      decorationTypes[2],
+      [expect.objectContaining({
+        renderOptions: {
+          before: expect.objectContaining({
+            contentText: 'first old line\nsecond old line\n',
+          }),
+        },
+      })],
+    );
   });
 
   it('skips unsupported custom tab inputs entirely', async () => {

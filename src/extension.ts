@@ -5,10 +5,12 @@ import { ActiveReviewContext } from './activeReviewContext';
 import { PerKeyDebouncer } from './changePolicy';
 import { ComparisonCoordinator, type ComparisonView } from './coordinator';
 import {
-  formatExplorerResourcesAsMentionQueries,
+  formatExplorerResourcesAsMentions,
   insertMentionsIntoCodex,
   type ExplorerMentionResource,
 } from './codexChatInsert';
+import { createCodexDropPatchController, registerCodexDropPatchCommands } from './codexDropPatchCommands';
+import { createCodexDropPatchRuntimeDependencies } from './codexDropPatchRuntime';
 import {
   DeletedLinesCodeLensProvider,
   type ReviewCodeLensState,
@@ -51,18 +53,10 @@ import type { FileComparisonState, HunkReference } from './types';
 const CONFIGURATION_SECTION = 'codexExtensionHelper';
 const OUTPUT_CHANNEL_NAME = 'Codex Extension Helper';
 const CODEX_CHAT_FOCUS_DELAY_MS = 350;
-const MACOS_MENTION_PICKER_SCRIPT = [
-  'on run argv',
-  'set the clipboard to item 1 of argv',
+const MACOS_MENTION_PASTE_SCRIPT = [
   'tell application "System Events"',
-  'keystroke "@"',
-  'delay 0.15',
   'keystroke "v" using command down',
-  'delay 0.65',
-  'key code 36',
-  'delay 0.15',
   'end tell',
-  'end run',
 ].join('\n');
 
 interface TestDiagnostics {
@@ -417,18 +411,13 @@ export async function synchronizeReviewViews({
   const pending: PromiseLike<void>[] = [];
   if (key !== undefined) {
     if (state !== undefined && state.hunks.length > 0) {
-      const presentation = await views.spacers?.install({
-        key,
-        canonicalText: state.currentText,
-        hunks: state.hunks,
-      });
-      pending.push(views.renderer.render(key, state.hunks, presentation));
+      pending.push(views.renderer.render(key, state.hunks, undefined));
       views.deletedLines.update({
         key,
         sourceRevision: state.sourceRevision,
         currentText: state.currentText,
         hunks: state.hunks,
-        actionLines: presentation?.plan.hunks.map((hunk) => hunk.actionLine),
+        actionLines: undefined,
       });
       if (resource === undefined) {
         views.quickDiff.clear(key);
@@ -1362,20 +1351,22 @@ export function activate(context: vscode.ExtensionContext): TestExtensionApi | u
           const stat = await vscode.workspace.fs.stat(item);
           mentionResources.push({
             relativePath,
+            fsPath: item.fsPath,
             directory: (stat.type & vscode.FileType.Directory) !== 0,
           });
         }
 
-        const queries = formatExplorerResourcesAsMentionQueries(mentionResources);
-        await insertMentionsIntoCodex(queries, {
+        const mentions = formatExplorerResourcesAsMentions(mentionResources);
+        await insertMentionsIntoCodex(mentions, {
           openCodexSidebar: async () => {
             await vscode.commands.executeCommand('chatgpt.openSidebar');
           },
           waitForFocus: () => new Promise((resolve) => {
             setTimeout(resolve, CODEX_CHAT_FOCUS_DELAY_MS);
           }),
-          chooseMention: (query) => new Promise((resolve, reject) => {
-            execFile('/usr/bin/osascript', ['-e', MACOS_MENTION_PICKER_SCRIPT, query], (error) => {
+          copyPayload: (payload) => vscode.env.clipboard.writeText(payload),
+          pastePayload: () => new Promise((resolve, reject) => {
+            execFile('/usr/bin/osascript', ['-e', MACOS_MENTION_PASTE_SCRIPT], (error) => {
               if (error === null) {
                 resolve();
               } else {
@@ -1393,6 +1384,17 @@ export function activate(context: vscode.ExtensionContext): TestExtensionApi | u
       }
     },
   ));
+  const codexDropPatchController = createCodexDropPatchController(
+    createCodexDropPatchRuntimeDependencies(vscode, output),
+  );
+  registerCodexDropPatchCommands(
+    context.subscriptions,
+    (command, handler) => vscode.commands.registerCommand(command, handler),
+    codexDropPatchController,
+  );
+  if (process.env.CODEX_EXTENSION_HELPER_TEST !== '1') {
+    void codexDropPatchController.offerInstallIfNeeded();
+  }
   controller.start();
 
   return process.env.CODEX_EXTENSION_HELPER_TEST === '1'

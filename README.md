@@ -7,10 +7,10 @@ endorsed by, or sponsored by OpenAI.
 
 ## What appears in the editor
 
-- Deleted content appears on dedicated translucent-red rows above the current changed lines, so removed and modified source is stacked vertically instead of overlapping.
-- A deleted empty source line appears as an empty red row. The extension does not insert a `(blank line)` label.
+- Deleted content appears in a translucent-red decoration block at its former location without changing the document buffer.
+- A deleted empty source line remains visually empty. The extension does not insert a `(blank line)` label.
 - Added or replacement lines in the current document are highlighted in green and remain fully editable.
-- VS Code Quick Diff gutter markers provide the native inline diff peek for complete deletion blocks.
+- VS Code Quick Diff gutter markers provide the native inline diff peek for complete deletion blocks. The `Codex Changes` Source Control provider appears only while tracked changes exist.
 - Each change has **Approve** and **Reject** CodeLens actions. The source already contains the external writer's latest text: Approve keeps that text and advances the comparison baseline without saving, while Reject edits the document back to the latest baseline and leaves that edit unsaved.
 - The active editor's title bar shows previous/next change arrows plus **Approve All** and **Reject All** while that file has pending changes. Previous and next wrap from the first change to the last and from the last change to the first.
 - Rejecting the single change in a newly created file—or choosing **Reject All**—moves the entire file to the operating system trash.
@@ -19,7 +19,7 @@ endorsed by, or sponsored by OpenAI.
 - A previously snapshotted background file keeps its pending comparison and renders it when opened.
 - Git reset, restore, or checkout activity that leaves the file Git-clean clears or suppresses the review instead of presenting it as a Codex change.
 
-VS Code Stable has no public editor-inset API. To create dedicated deleted rows, the extension temporarily inserts extension-owned blank lines into the live buffer and decorates those rows with the removed text. It removes those exact rows before save, Approve, Reject, disabling, or shutdown. The comparison model and review commands always use the canonical source without the temporary rows. Approve never saves; Reject applies an ordinary unsaved editor change so it can be reviewed before you save it.
+VS Code Stable has no public editor-inset API. Deleted content is therefore rendered with decorations only; review display never inserts temporary lines or dirties the live document buffer. The comparison model and review commands always use the canonical source already written by the external process. Approve never saves; Reject applies an ordinary unsaved editor change so it can be reviewed before you save it.
 
 ## Review behavior
 
@@ -27,8 +27,8 @@ VS Code Stable has no public editor-inset API. To create dedicated deleted rows,
 - **Reject** restores the selected change from the latest baseline and leaves the restoration as an ordinary unsaved editor edit.
 - **Approve All** keeps the complete current source without saving it.
 - **Reject All** restores the complete baseline; for a newly created file, rejection moves the file to the operating system trash.
-- Previous/next navigation and per-change actions use canonical source coordinates even while temporary deleted-line rows are visible.
-- Before every save or review mutation, the extension removes its exact temporary rows so they are never intentionally written as accepted source.
+- Previous/next navigation and per-change actions use canonical source coordinates while deleted-content decorations are visible.
+- Review display does not add temporary document content, so saving writes exactly the canonical current source.
 
 ## Requirements
 
@@ -48,19 +48,37 @@ code --install-extension ./codex-extension-helper-0.0.2.vsix --force
 
 On macOS, right-click one or more files or folders in Explorer and choose
 **Codex: Add as @ Mention**. The extension focuses the Codex sidebar and
-automates the same `@` path search and selection used by the composer. It
-presses Enter only to choose each autocomplete result; it does not send the
-message.
+copies a private path payload and pastes it once. The patched Codex webview
+turns that payload directly into the same `atMention` nodes used by Explorer
+drag-and-drop, so it does not depend on the `@` file picker's search results
+and does not send the message.
 
 The first use may require permission under **System Settings → Privacy &
-Security → Accessibility** for Visual Studio Code. This command avoids
-Explorer drag-and-drop and therefore does not require Shift.
+Security → Accessibility** for Visual Studio Code. This command requires the
+Codex Explorer drop patch below. It avoids Explorer drag-and-drop and therefore
+does not require Shift.
 
 ## Codex Explorer drop chips
 
-The older optional patch below modifies an installed Codex bundle to add
-Explorer file and folder drops to the Codex
-composer. Apply it after installing or whenever Codex has updated:
+The patch manager and patch implementation are included in the VSIX. After a
+recipient installs this extension, it inspects the installed `openai.chatgpt`
+extension without changing it. If a compatible Codex version needs the patch,
+the extension asks for confirmation; choose **Apply and Reload** to install the
+patch transactionally and reload VS Code. Nothing is modified when the prompt
+is dismissed.
+
+The Command Palette also provides these controls:
+
+- **Codex Helper: Install/Repair Drop Patch**
+- **Codex Helper: Remove Drop Patch**
+- **Codex Helper: Show Drop Patch Status**
+
+When Codex updates, its new extension directory is detected on the next VS Code
+start and the confirmation prompt appears again. The remove command verifies
+the recorded backups before restoring them and then reloads VS Code.
+
+Repository scripts remain available for development or explicitly targeting a
+side-by-side Codex installation:
 
 ```bash
 npm run patch:codex-drop
@@ -71,16 +89,15 @@ npm run unpatch:codex-drop
 ```
 
 Each dropped file or folder becomes one inline mention without a separate
-attachment card; directories are not expanded.
-In automatic mode, the patch command chooses the numerically newest installed
+attachment card or requiring Shift; directories are not expanded. The same patch
+accepts the private clipboard payload used by **Codex: Add as @ Mention**.
+In automatic CLI mode, the patch command chooses the numerically newest installed
 `openai.chatgpt-*` version first and fails closed if that installation's bundle
 layout is unsupported; it does not fall back to an older installation. To
 intentionally target an older side-by-side installation, run
 `node scripts/patch-codex-drop.mjs --extension-dir <extension-path>` (and use
-the same `--extension-dir` option with the restore script). After a Codex
-update, rerun `npm run patch:codex-drop` and reload VS Code. To restore the
-original installation, run `npm run unpatch:codex-drop` and reload VS Code
-again. If the installed bundle has an unknown layout, the command fails without
+the same `--extension-dir` option with the restore script). If the installed
+bundle has an unknown layout, both the VSIX runtime and CLI fail closed without
 modifying the installation.
 
 ## Develop in VS Code Stable
@@ -135,13 +152,12 @@ software remains subject to the licenses and notices in the included
 
 - Comparison state is memory-only and does not persist across VS Code restarts.
 - The extension cannot identify Codex as the writer. It suppresses Git operations that leave a file Git-clean, but other qualifying external writers can still appear as Codex-style review changes.
-- Deleted content uses real temporary buffer rows because VS Code Stable does not expose `editorInsets`. These rows can briefly affect language services, formatters, dirty-state indicators, and autosave even though the extension removes them before writing the file.
-- A hard extension-host crash can strand temporary blank rows in the unsaved buffer. Review the document before saving after a crash.
+- VS Code Stable does not expose `editorInsets`, so deleted-content decorations cannot reserve true editor rows and may be less distinct in dense or folded code.
 - `editor.codeLens` must remain enabled for per-change Approve/Reject actions to be visible.
 - Diff editors, custom editors, binary or undecodable files, oversized files, excluded paths, and non-file documents do not render inline comparisons.
 
 ## Troubleshooting
 
-Open **View → Output**, then choose **Codex Extension Helper** from the channel picker. File-read, eligibility, diff, and rendering failures are reported there. Deleted-row presentation intentionally makes temporary, reversible edits to eligible live documents.
+Open **View → Output**, then choose **Codex Extension Helper** from the channel picker. File-read, eligibility, diff, and rendering failures are reported there.
 
 If no UI appears, confirm that the setting is enabled and the file had an observed baseline before the external write. Review actions apply only to the active file. Use the gutter change marker for native Quick Diff or run **Codex Changes: Open Full Diff** from the Command Palette.

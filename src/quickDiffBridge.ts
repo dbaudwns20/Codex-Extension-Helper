@@ -13,17 +13,13 @@ interface BaselineEntry {
 export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vscode.Disposable {
   private readonly entries = new Map<string, BaselineEntry>();
   private readonly contents = new Map<string, string>();
-  private readonly sourceControl: vscode.SourceControl;
+  private sourceControl: vscode.SourceControl | undefined;
   private readonly registration: vscode.Disposable;
   private readonly changeEmitter = new vscode.EventEmitter<vscode.Uri>();
   readonly onDidChange = this.changeEmitter.event;
 
   constructor() {
-    this.sourceControl = vscode.scm.createSourceControl('codexChanges', 'Codex Changes');
-    this.sourceControl.inputBox.visible = false;
-    this.sourceControl.count = 0;
     this.registration = vscode.workspace.registerTextDocumentContentProvider(BASELINE_SCHEME, this);
-    this.refreshProvider();
   }
 
   provideTextDocumentContent(uri: vscode.Uri): string {
@@ -40,6 +36,7 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
     if (changed) {
       this.changeEmitter.fire(baseline);
     }
+    this.ensureSourceControl();
     this.refreshProvider();
   }
 
@@ -54,7 +51,12 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
       this.changeEmitter.fire(entry.baseline);
     }
     this.entries.delete(key);
-    this.refreshProvider();
+
+    if (this.entries.size === 0) {
+      this.disposeSourceControl();
+    } else {
+      this.refreshProvider();
+    }
   }
 
   async openDiff(resource: vscode.Uri): Promise<boolean> {
@@ -74,7 +76,8 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
 
   dispose(): void {
     this.registration.dispose();
-    this.sourceControl.dispose();
+
+    this.disposeSourceControl();
     this.changeEmitter.dispose();
     this.entries.clear();
     this.contents.clear();
@@ -90,8 +93,25 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
   }
 
   private refreshProvider(): void {
+    if (this.sourceControl === undefined) {
+      return;
+    }
     this.sourceControl.quickDiffProvider = {
       provideOriginalResource: (uri) => this.entries.get(normalizeUriKey(uri))?.baseline,
     };
+  }
+
+  private ensureSourceControl(): void {
+    if (this.sourceControl !== undefined) {
+      return;
+    }
+    this.sourceControl = vscode.scm.createSourceControl('codexChanges', 'Codex Changes');
+    this.sourceControl.inputBox.visible = false;
+    this.sourceControl.count = 0;
+  }
+
+  private disposeSourceControl(): void {
+    this.sourceControl?.dispose();
+    this.sourceControl = undefined;
   }
 }

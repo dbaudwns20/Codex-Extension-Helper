@@ -12,7 +12,28 @@ describe('Codex drop source transformation', () => {
     expect(result.source).toContain(PATCH_START_MARKER);
   });
 
-  it('inserts dropped Explorer resources as Codex atMention nodes instead of Markdown text', async () => {
+  it('patches the composer when Codex renames its minified event registration function', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { PATCH_START_MARKER, patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
+    const renamedAnchor = 'dz(`add-context-file`,ct.view.dom,e=>{Mi(),gee([e.file])});';
+
+    const result = patchBundleSource(`${composerContext}before;${renamedAnchor}after;`);
+
+    expect(result.status).toBe('patched');
+    expect(result.source).toContain(PATCH_START_MARKER);
+    expect(result.source).toContain(renamedAnchor);
+  });
+
+  it('does not treat a member call as the composer registration anchor', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
+    const memberCall = 'registry.dz(`add-context-file`,ct.view.dom,e=>{Mi(),gee([e.file])});';
+
+    expect(() => patchBundleSource(`${composerContext}${memberCall}`))
+      .toThrow(/exactly one Codex composer anchor/u);
+  });
+
+  it('creates mentions without attachment cards before blocking the native drop event', async () => {
     // Removing anchor-relative insertion, or omitting its statement terminator, breaks this fixture.
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
@@ -25,13 +46,14 @@ describe('Codex drop source transformation', () => {
       'const it={insertMentionNodeInRange:(type,attrs,from,to)=>{insertedMentions.push({type:type.name,attrs,from,to});state.selection={from:from+1,to:from+1}},view:{state,dom:{dataset:{},addEventListener:(type,handler)=>{listeners[type]=handler}}}};',
       'let focusCount=0;const Ei=()=>{focusCount+=1};const bee=(items)=>{mentions.push(...items)};const IR=(_type,_dom,handler)=>{nativeHandler=handler};',
       anchor,
-      'return {listeners,mentions,insertedMentions,dispatchDrop:(event)=>{windowListeners.drop?.(event);if(!event.immediatePropagationStopped)mentions.push({label:"native-card"});if(!event.immediatePropagationStopped)listeners.drop?.(event)},emitNative:()=>nativeHandler?.({file:{label:"anchor-card"}}),get focusCount(){return focusCount}}};',
+      'return {listeners,mentions,insertedMentions,dispatchDrop:(event)=>{windowListeners.drop?.(event);if(!event.immediatePropagationStopped)nativeHandler?.({file:{label:"native-card"}});if(!event.immediatePropagationStopped)listeners.drop?.(event)},get focusCount(){return focusCount}}};',
       '//# sourceMappingURL=app-initial.js.map',
     ].join('');
     const patched = patchBundleSource(original);
     const runFixture = new Function(`${patched.source}\nreturn globalThis.__codexDropFixture;`)();
     const fixture = runFixture();
     const event = {
+      defaultPrevented: false,
       immediatePropagationStopped: false,
       dataTransfer: {
         getData: (type: string) => type === 'text/uri-list'
@@ -43,12 +65,11 @@ describe('Codex drop source transformation', () => {
             : '',
         dropEffect: 'none',
       },
-      preventDefault() {},
+      preventDefault() { this.defaultPrevented = true; },
       stopImmediatePropagation() { this.immediatePropagationStopped = true; },
     };
 
     fixture.dispatchDrop(event);
-    fixture.emitNative();
 
     expect(fixture.insertedMentions).toEqual([
       {
@@ -65,8 +86,56 @@ describe('Codex drop source transformation', () => {
       },
     ]);
     expect(fixture.mentions).toEqual([]);
+    expect(event.defaultPrevented).toBe(true);
+    expect(event.immediatePropagationStopped).toBe(true);
     expect(fixture.focusCount).toBe(1);
     delete (globalThis as typeof globalThis & { __codexDropFixture?: unknown }).__codexDropFixture;
+  });
+
+  it('inserts clipboard mentions directly without using the Codex file picker', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
+    const original = [
+      'globalThis.__codexPasteFixture=()=>{',
+      'const window={addEventListener:()=>{}};const listeners={},insertedMentions=[];',
+      'const cwd="/workspace";const isHome=cwd===`~`;',
+      'const atMention={name:"atMention"};const state={selection:{from:3,to:3},schema:{nodes:{atMention}}};',
+      'const it={insertMentionNodeInRange:(type,attrs,from,to)=>{insertedMentions.push({type:type.name,attrs,from,to});state.selection={from:from+1,to:from+1}},view:{state,dom:{dataset:{},addEventListener:(type,handler)=>{listeners[type]=handler},contains:()=>true}}};',
+      'const Ei=()=>{};const bee=()=>{};const IR=()=>{};',
+      anchor,
+      'return {listeners,insertedMentions};};',
+    ].join('');
+    const patched = patchBundleSource(original);
+    const runFixture = new Function(`${patched.source}\nreturn globalThis.__codexPasteFixture;`)();
+    const fixture = runFixture();
+    const payload = 'codex-extension-helper:mentions:v1:' + JSON.stringify([
+      { label: 'CHANGELOG.md', path: 'CHANGELOG.md', fsPath: '/workspace/CHANGELOG.md' },
+      { label: 'lib', path: 'scripts/lib/', fsPath: '/workspace/scripts/lib' },
+    ]);
+    let prevented = false;
+
+    fixture.listeners.paste?.({
+      clipboardData: { getData: (type: string) => type === 'text/plain' ? payload : '' },
+      preventDefault() { prevented = true; },
+      stopImmediatePropagation() {},
+    });
+
+    expect(prevented).toBe(true);
+    expect(fixture.insertedMentions).toEqual([
+      {
+        type: 'atMention',
+        attrs: { label: 'CHANGELOG.md', path: 'CHANGELOG.md', fsPath: '/workspace/CHANGELOG.md' },
+        from: 3,
+        to: 3,
+      },
+      {
+        type: 'atMention',
+        attrs: { label: 'lib', path: 'scripts/lib/', fsPath: '/workspace/scripts/lib' },
+        from: 4,
+        to: 4,
+      },
+    ]);
+    delete (globalThis as typeof globalThis & { __codexPasteFixture?: unknown }).__codexPasteFixture;
   });
 
   it('makes Explorer paths relative to the active VS Code workspace instead of the thread cwd', async () => {
@@ -141,7 +210,7 @@ describe('Codex drop source transformation', () => {
     delete (globalThis as typeof globalThis & { __codexDropFixture?: unknown }).__codexDropFixture;
   });
 
-  it('allows URI-list drops while drag data is protected during dragover', async () => {
+  it('owns URI-list dragover while drag data is protected', async () => {
     // Reading drag payloads during dragover returns an empty string by browser design.
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
@@ -199,6 +268,7 @@ describe('Codex drop source transformation', () => {
   it.each([
     ['missing', 'no composer here'],
     ['duplicate', `${anchor}${anchor}`],
+    ['mixed duplicate', `${anchor}dz(\`add-context-file\`,ct.view.dom,e=>{Mi(),gee([e.file])});`],
   ])('rejects a %s composer anchor', async (_name, source) => {
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');

@@ -221,6 +221,7 @@ function installRuntimeVscode(initialText = 'before\n') {
     quickDiffProvider: undefined as unknown,
     dispose: vi.fn(),
   };
+  const createSourceControl = vi.fn(() => sourceControl);
   let contentProvider: { provideTextDocumentContent(uri: unknown): string } | undefined;
   let codeLensProvider: { provideCodeLenses(document: unknown): FakeCodeLens[] } | undefined;
   const window = {
@@ -294,13 +295,14 @@ function installRuntimeVscode(initialText = 'before\n') {
   Object.assign(vscodeMock, {
     window,
     workspace,
+    extensions: { getExtension: vi.fn(() => undefined) },
     languages: {
       registerCodeLensProvider: vi.fn((_selector: unknown, provider: typeof codeLensProvider) => {
         codeLensProvider = provider;
         return disposable();
       }),
     },
-    scm: { createSourceControl: vi.fn(() => sourceControl) },
+    scm: { createSourceControl },
     commands: {
       executeCommand,
       registerCommand: vi.fn((command: string, callback: (...args: any[]) => unknown) => {
@@ -327,6 +329,7 @@ function installRuntimeVscode(initialText = 'before\n') {
       return codeLensProvider?.provideCodeLenses(document) ?? [];
     },
     commands,
+    createSourceControl,
     currentText() {
       return text;
     },
@@ -361,6 +364,98 @@ function installRuntimeVscode(initialText = 'before\n') {
 }
 
 describe('packaged runtime', () => {
+  it('registers Codex drop patch management commands during activation', async () => {
+    const fake = installRuntimeVscode();
+    const previousTestMode = process.env.CODEX_EXTENSION_HELPER_TEST;
+    process.env.CODEX_EXTENSION_HELPER_TEST = '1';
+    const context = { subscriptions: [] as { dispose(): unknown }[] };
+
+    try {
+      const { activate, deactivate } = await import('../../src/extension');
+      activate(context as never);
+
+      expect([...fake.commands.keys()]).toEqual(expect.arrayContaining([
+        'codexExtensionHelper.installCodexDropPatch',
+        'codexExtensionHelper.removeCodexDropPatch',
+        'codexExtensionHelper.showCodexDropPatchStatus',
+      ]));
+      await fake.commands.get('codexExtensionHelper.showCodexDropPatchStatus')!();
+      expect(fake.window.showInformationMessage).toHaveBeenCalledWith(
+        'The OpenAI Codex extension is not installed.',
+      );
+
+      await deactivate();
+    } finally {
+      if (previousTestMode === undefined) delete process.env.CODEX_EXTENSION_HELPER_TEST;
+      else process.env.CODEX_EXTENSION_HELPER_TEST = previousTestMode;
+    }
+  });
+
+  it('keeps externally saved source clean while rendering a replacement diff', async () => {
+    vi.useFakeTimers();
+    try {
+      const modified = 'new line\nkeep\n';
+      const fake = installRuntimeVscode('old line\nkeep\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+
+      fake.setText(modified);
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      expect(runtime.renderedComparisonCount).toBe(1);
+      expect(fake.currentText()).toBe(modified);
+      expect(fake.document.isDirty).toBe(false);
+
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('registers Codex Changes only while a tracked comparison exists', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+
+      expect(fake.createSourceControl).not.toHaveBeenCalled();
+
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      expect(fake.createSourceControl).toHaveBeenCalledTimes(1);
+      expect(fake.quickDiffBaseline()).toBe('before\n');
+
+      fake.callbacks.get('watcherDelete')!(fake.uri);
+      await settleRuntime();
+
+      expect(fake.sourceControl.dispose).toHaveBeenCalledTimes(1);
+      runtime.dispose();
+      expect(fake.sourceControl.dispose).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('loads with vscode as its only external module', async () => {
     const temporaryPath = await mkdtemp(path.join(tmpdir(), 'codex-inline-runtime-'));
 
@@ -448,6 +543,10 @@ describe('packaged runtime', () => {
   it('documents the Codex Explorer drop patch workflow', async () => {
     const readme = await readFile(path.resolve('README.md'), 'utf8');
 
+    expect(readme).toContain('Apply and Reload');
+    expect(readme).toContain('Codex Helper: Install/Repair Drop Patch');
+    expect(readme).toContain('Codex Helper: Remove Drop Patch');
+    expect(readme).toContain('included in the VSIX');
     expect(readme).toContain('npm run patch:codex-drop');
     expect(readme).toContain('npm run unpatch:codex-drop');
     expect(readme).toContain('openai.chatgpt-*');

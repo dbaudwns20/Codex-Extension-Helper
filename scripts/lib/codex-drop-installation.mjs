@@ -218,16 +218,25 @@ function assertSupportedSchema2MetadataShape(metadata, target, paths) {
   if (metadata?.cacheBootstrapVersion !== 1 && metadata?.cacheBootstrapVersion !== CACHE_BOOTSTRAP_VERSION) {
     throw new Error('Codex drop patch metadata is invalid');
   }
-  assertSchema2MetadataShape(metadata, target, paths, metadata.cacheBootstrapVersion);
+  if (metadata?.patchVersion !== PATCH_VERSION && metadata?.patchVersion !== PREVIOUS_PATCH_VERSION) {
+    throw new Error('Codex drop patch metadata is invalid');
+  }
+  assertSchema2MetadataShape(
+    metadata,
+    target,
+    paths,
+    metadata.cacheBootstrapVersion,
+    metadata.patchVersion,
+  );
 }
 
-function assertLegacyMetadataShape(metadata, target, paths) {
+function assertLegacyMetadataShape(metadata, target, paths, patchVersion = PATCH_VERSION) {
   if (
     metadata === null
     || typeof metadata !== 'object'
     || 'metadataSchemaVersion' in metadata
     || Object.keys(metadata).sort().join('\0') !== LEGACY_METADATA_KEYS.join('\0')
-    || metadata.patchVersion !== PATCH_VERSION
+    || metadata.patchVersion !== patchVersion
     || metadata.extensionVersion !== target.extensionVersion
     || metadata.bundlePath !== target.bundlePath
     || metadata.backupPath !== paths.backupPath
@@ -299,6 +308,7 @@ async function removeBootstrapIfMatches(bootstrapPath, expectedSha256) {
 function fileOperationsFor(options) {
   return {
     rename: options?.__testFileOperations?.rename ?? rename,
+    writeFile: options?.__testFileOperations?.writeFile ?? writeFile,
   };
 }
 
@@ -358,11 +368,20 @@ async function installSchema2Patch({
     if (bundle.patchedSource !== undefined) tempPaths.bundle = await writeTemporary(target.bundlePath, bundle.patchedSource);
     tempPaths.metadata = await writeTemporary(paths.metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
 
+    let bundleBackupCreated = false;
     if (!backups.bundleExists) {
-      await writeFile(paths.backupPath, bundle.originalSource, { flag: 'wx' });
+      await operations.writeFile(paths.backupPath, bundle.originalSource, { flag: 'wx' });
+      bundleBackupCreated = true;
     }
     if (!backups.indexExists) {
-      await writeFile(paths.indexBackupPath, index.originalSource, { flag: 'wx' });
+      try {
+        await operations.writeFile(paths.indexBackupPath, index.originalSource, { flag: 'wx' });
+      } catch (error) {
+        const cleanupFailures = bundleBackupCreated
+          ? await attemptRollbackActions([{ label: 'bundle backup', run: () => rm(paths.backupPath) }])
+          : [];
+        throw transactionError('Could not create Codex drop patch recovery backups', error, cleanupFailures);
+      }
     }
 
     const renamed = [];
@@ -538,6 +557,50 @@ async function migrateSchema2V1Patch(target, paths, bundleSource, metadata, oper
 }
 
 async function migratePreviousBundlePatch(target, paths, bundleSource, metadata, operations) {
+  if (metadata?.metadataSchemaVersion === undefined) {
+    assertLegacyMetadataShape(metadata, target, paths, PREVIOUS_PATCH_VERSION);
+    if (sha256(bundleSource) !== metadata.patchedSha256) throw new Error('Current bundle hash does not match patch metadata');
+    const originalBundleSource = await readFile(paths.backupPath, 'utf8');
+    if (sha256(originalBundleSource) !== metadata.originalSha256) throw new Error('Backup hash does not match patch metadata');
+    const restoredBundle = unpatchBundleSourceVersion(bundleSource, PREVIOUS_PATCH_VERSION);
+    if (restoredBundle.status !== 'restored' || restoredBundle.source !== originalBundleSource) {
+      throw new Error('Codex drop patch metadata is invalid');
+    }
+    const bundleTransformed = patchBundleSource(originalBundleSource);
+    const indexSource = await readFile(paths.indexPath, 'utf8');
+    const indexTransformed = patchIndexSource(indexSource);
+    if (bundleTransformed.status !== 'patched' || indexTransformed.status !== 'patched') {
+      throw new Error('Codex drop patch metadata is invalid');
+    }
+    if (await fileExists(paths.indexBackupPath) || await fileExists(paths.bootstrapPath)) {
+      throw new Error('Current index is already patched without valid schema-2 metadata');
+    }
+    return installSchema2Patch({
+      target,
+      paths,
+      bundle: {
+        originalSource: originalBundleSource,
+        originalSha256: metadata.originalSha256,
+        patchedSource: bundleTransformed.source,
+        patchedSha256: sha256(bundleTransformed.source),
+        rollbackSource: bundleSource,
+      },
+      index: {
+        originalSource: indexSource,
+        originalSha256: sha256(indexSource),
+        patchedSource: indexTransformed.source,
+        patchedSha256: sha256(indexTransformed.source),
+        entrySource: indexTransformed.entrySource,
+      },
+      bootstrapSource: createBootstrapSource(indexTransformed.entrySource),
+      backups: {
+        bundleExists: true,
+        indexExists: false,
+      },
+      operations,
+      status: 'migrated',
+    });
+  }
   assertSchema2MetadataShape(
     metadata,
     target,
@@ -602,6 +665,126 @@ async function migratePreviousBundlePatch(target, paths, bundleSource, metadata,
     operations,
     status: 'migrated',
   });
+}
+
+export async function inspectCodexDropPatch(options = {}) {
+  const target = await resolveCodexTarget(options);
+  const paths = patchPaths(target.bundlePath);
+  const bundleSource = await readFile(target.bundlePath, 'utf8');
+  const indexSource = await readFile(paths.indexPath, 'utf8');
+  const startMarker = `codex-explorer-drop-chips:start:v${PATCH_VERSION}`;
+  const endMarker = `codex-explorer-drop-chips:end:v${PATCH_VERSION}`;
+  const startCount = bundleSource.split(startMarker).length - 1;
+  const endCount = bundleSource.split(endMarker).length - 1;
+
+  if (startCount !== 1 || endCount !== 1 || bundleSource.indexOf(startMarker) > bundleSource.indexOf(endMarker)) {
+    if (startCount !== 0 || endCount !== 0) {
+      throw new Error('Current Codex bundle contains invalid patch markers');
+    }
+  }
+
+  const metadataExists = await fileExists(paths.metadataPath);
+  const bundleBackupExists = await fileExists(paths.backupPath);
+  const indexBackupExists = await fileExists(paths.indexBackupPath);
+  const currentBootstrapExists = await fileExists(paths.bootstrapPath);
+  const previousBootstrapPath = bootstrapPathForVersion(target.bundlePath, 1);
+  const previousBootstrapExists = previousBootstrapPath === paths.bootstrapPath
+    ? currentBootstrapExists
+    : await fileExists(previousBootstrapPath);
+  if (!metadataExists) {
+    const indexHasPatchMarkers = indexSource.includes('codex-explorer-drop-cache:start:v');
+    if (
+      startCount === 0
+      && endCount === 0
+      && !bundleBackupExists
+      && !indexBackupExists
+      && !currentBootstrapExists
+      && !previousBootstrapExists
+      && !indexHasPatchMarkers
+    ) {
+      return { status: 'not-patched', ...target, ...paths };
+    }
+    if (
+      bundleBackupExists
+      && indexBackupExists
+      && startCount === 0
+      && endCount === 0
+      && !currentBootstrapExists
+      && !previousBootstrapExists
+      && !indexHasPatchMarkers
+      && sha256(await readFile(paths.backupPath)) === sha256(bundleSource)
+      && sha256(await readFile(paths.indexBackupPath)) === sha256(indexSource)
+    ) {
+      return { status: 'not-patched', ...target, ...paths };
+    }
+    throw new Error('Current Codex install contains inconsistent patch artifacts');
+  }
+
+  const metadata = await readParsedMetadata(paths);
+  if (metadata?.metadataSchemaVersion === undefined) {
+    if (metadata.patchVersion !== PATCH_VERSION && metadata.patchVersion !== PREVIOUS_PATCH_VERSION) {
+      throw new Error('Codex drop patch metadata is invalid');
+    }
+    assertLegacyMetadataShape(metadata, target, paths, metadata.patchVersion);
+    if (
+      indexBackupExists
+      || currentBootstrapExists
+      || previousBootstrapExists
+      || indexSource.includes('codex-explorer-drop-cache:start:v')
+    ) {
+      throw new Error('Legacy Codex drop patch contains unexpected managed artifacts');
+    }
+    const bundleSha256 = sha256(bundleSource);
+    assertCurrentMatches(bundleSha256, metadata.originalSha256, metadata.patchedSha256, 'bundle');
+    if (sha256(await readFile(paths.backupPath)) !== metadata.originalSha256) {
+      throw new Error('Backup hash does not match patch metadata');
+    }
+    return {
+      status: bundleSha256 === metadata.originalSha256 ? 'not-patched' : 'legacy-patched',
+      ...target,
+      ...paths,
+    };
+  }
+
+  assertSupportedSchema2MetadataShape(metadata, target, paths);
+  const schemaPaths = { ...paths, bootstrapPath: metadata.bootstrapPath };
+  if (
+    (metadata.bootstrapPath !== paths.bootstrapPath && currentBootstrapExists)
+    || (metadata.bootstrapPath !== previousBootstrapPath && previousBootstrapExists)
+  ) {
+    throw new Error('Current Codex install contains an unexpected managed bootstrap');
+  }
+  const bundleSha256 = sha256(bundleSource);
+  const indexSha256 = sha256(indexSource);
+  assertCurrentMatches(bundleSha256, metadata.originalSha256, metadata.patchedSha256, 'bundle');
+  assertCurrentMatches(indexSha256, metadata.originalIndexSha256, metadata.patchedIndexSha256, 'index');
+  if (sha256(await readFile(paths.backupPath)) !== metadata.originalSha256) {
+    throw new Error('Backup hash does not match patch metadata');
+  }
+  if (sha256(await readFile(paths.indexBackupPath)) !== metadata.originalIndexSha256) {
+    throw new Error('Index backup hash does not match patch metadata');
+  }
+  const bootstrapExists = await fileExists(schemaPaths.bootstrapPath);
+  if (bundleSha256 === metadata.originalSha256 && indexSha256 === metadata.originalIndexSha256) {
+    if (bootstrapExists) throw new Error('Current install is partially restored with a managed bootstrap');
+    return { status: 'not-patched', ...target, ...schemaPaths };
+  }
+  if (
+    bundleSha256 !== metadata.patchedSha256
+    || indexSha256 !== metadata.patchedIndexSha256
+    || !bootstrapExists
+  ) {
+    throw new Error('Current install is partially restored');
+  }
+  if (sha256(await readFile(schemaPaths.bootstrapPath)) !== metadata.bootstrapSha256) {
+    throw new Error('Current bootstrap hash does not match patch metadata');
+  }
+  const status = metadata.patchVersion === PATCH_VERSION
+    && metadata.cacheBootstrapVersion === CACHE_BOOTSTRAP_VERSION
+    && startCount === 1
+    ? 'patched'
+    : 'legacy-patched';
+  return { status, ...target, ...schemaPaths };
 }
 
 export async function applyCodexDropPatch(options = {}) {
@@ -694,37 +877,47 @@ export async function applyCodexDropPatch(options = {}) {
     indexExists: indexBackupExists,
   };
   if (backups.bundleExists) {
-    if (!metadataExists) throw new Error('Existing Codex drop backup does not match the current original bundle');
-    const metadata = await readParsedMetadata(paths);
-    assertReusableMetadataShape(metadata, target, paths);
-    if (metadata.metadataSchemaVersion === undefined && metadata.patchedSha256 !== bundle.patchedSha256) {
-      throw new Error('Codex drop patch metadata is invalid');
-    }
-    if (
-      metadata.originalSha256 !== bundle.originalSha256
-      || sha256(await readFile(paths.backupPath)) !== bundle.originalSha256
-    ) {
-      throw new Error('Existing Codex drop backup does not match the current original bundle');
-    }
-    if (metadata.metadataSchemaVersion === METADATA_SCHEMA_VERSION || backups.indexExists || bootstrapExists) {
-      if (!backups.indexExists) throw new Error('Codex drop patch metadata is invalid');
+    if (!metadataExists) {
       if (
-        metadata.originalIndexSha256 !== index.originalSha256
+        !backups.indexExists
+        || bootstrapExists
+        || sha256(await readFile(paths.backupPath)) !== bundle.originalSha256
         || sha256(await readFile(paths.indexBackupPath)) !== index.originalSha256
       ) {
         throw new Error('Existing Codex drop backup does not match the current original bundle');
       }
-      if (metadata.metadataSchemaVersion === METADATA_SCHEMA_VERSION) {
-        if (
-          metadata.patchedSha256 !== bundle.patchedSha256
-          || metadata.patchedIndexSha256 !== index.patchedSha256
-          || metadata.bootstrapSha256 !== sha256(bootstrapSource)
-          || metadata.entrySource !== index.entrySource
-        ) {
-          throw new Error('Codex drop patch metadata is invalid');
-        }
+    } else {
+      const metadata = await readParsedMetadata(paths);
+      assertReusableMetadataShape(metadata, target, paths);
+      if (metadata.metadataSchemaVersion === undefined && metadata.patchedSha256 !== bundle.patchedSha256) {
+        throw new Error('Codex drop patch metadata is invalid');
       }
-      if (bootstrapExists) throw new Error('Current index is already patched without valid schema-2 metadata');
+      if (
+        metadata.originalSha256 !== bundle.originalSha256
+        || sha256(await readFile(paths.backupPath)) !== bundle.originalSha256
+      ) {
+        throw new Error('Existing Codex drop backup does not match the current original bundle');
+      }
+      if (metadata.metadataSchemaVersion === METADATA_SCHEMA_VERSION || backups.indexExists || bootstrapExists) {
+        if (!backups.indexExists) throw new Error('Codex drop patch metadata is invalid');
+        if (
+          metadata.originalIndexSha256 !== index.originalSha256
+          || sha256(await readFile(paths.indexBackupPath)) !== index.originalSha256
+        ) {
+          throw new Error('Existing Codex drop backup does not match the current original bundle');
+        }
+        if (metadata.metadataSchemaVersion === METADATA_SCHEMA_VERSION) {
+          if (
+            metadata.patchedSha256 !== bundle.patchedSha256
+            || metadata.patchedIndexSha256 !== index.patchedSha256
+            || metadata.bootstrapSha256 !== sha256(bootstrapSource)
+            || metadata.entrySource !== index.entrySource
+          ) {
+            throw new Error('Codex drop patch metadata is invalid');
+          }
+        }
+        if (bootstrapExists) throw new Error('Current index is already patched without valid schema-2 metadata');
+      }
     }
   } else if (metadataExists) {
     throw new Error('Existing Codex drop patch metadata has no backup');
@@ -750,7 +943,10 @@ export async function restoreCodexDropPatch(options = {}) {
   const paths = patchPaths(target.bundlePath);
   const metadata = await readParsedMetadata(paths);
   if (metadata?.metadataSchemaVersion === undefined) {
-    assertLegacyMetadataShape(metadata, target, paths);
+    if (metadata.patchVersion !== PATCH_VERSION && metadata.patchVersion !== PREVIOUS_PATCH_VERSION) {
+      throw new Error('Codex drop patch metadata is invalid');
+    }
+    assertLegacyMetadataShape(metadata, target, paths, metadata.patchVersion);
     return restoreLegacyBundlePatch(target, paths, metadata, operations);
   }
   assertSupportedSchema2MetadataShape(metadata, target, paths);

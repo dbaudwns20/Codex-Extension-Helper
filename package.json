@@ -7,7 +7,7 @@
   "license": "SEE LICENSE IN LICENSE",
   "publisher": "local",
   "engines": {
-    "vscode": "^1.105.0"
+    "vscode": "^1.101.1"
   },
   "categories": [
     "Other"
@@ -54,6 +54,18 @@
         "command": "codexExtensionHelper.insertExplorerPathIntoCodex",
         "title": "Codex: Add as @ Mention",
         "enablement": "isMac"
+      },
+      {
+        "command": "codexExtensionHelper.installCodexDropPatch",
+        "title": "Codex Helper: Install/Repair Drop Patch"
+      },
+      {
+        "command": "codexExtensionHelper.removeCodexDropPatch",
+        "title": "Codex Helper: Remove Drop Patch"
+      },
+      {
+        "command": "codexExtensionHelper.showCodexDropPatchStatus",
+        "title": "Codex Helper: Show Drop Patch Status"
       }
     ],
     "menus": {
@@ -142,11 +154,12 @@
   "devDependencies": {
     "@types/diff": "^7.0.0",
     "@types/node": "^24.3.0",
-    "@types/vscode": "^1.105.0",
+    "@types/vscode": "^1.101.0",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.6.2",
     "esbuild": "^0.21.5",
     "typescript": "^5.9.2",
+    "vite": "5.4.21",
     "vitest": "^3.2.4"
   }
 }

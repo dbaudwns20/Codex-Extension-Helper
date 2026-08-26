@@ -4,6 +4,7 @@ test/**
 test-fixtures/**
 scripts/**
 node_modules/**
+pnpm-lock.yaml
 out/**
 !out/src/extension.js
 out/test/**

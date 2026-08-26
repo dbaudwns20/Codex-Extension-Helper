@@ -1,10 +1,10 @@
-export const PATCH_VERSION = 8;
-export const PREVIOUS_PATCH_VERSION = 7;
+export const PATCH_VERSION = 11;
+export const PREVIOUS_PATCH_VERSION = 10;
 
 
 
-export const PATCH_START_MARKER = '/* codex-explorer-drop-chips:start:v8 */';
-export const PATCH_END_MARKER = '/* codex-explorer-drop-chips:end:v8 */';
+export const PATCH_START_MARKER = '/* codex-explorer-drop-chips:start:v11 */';
+export const PATCH_END_MARKER = '/* codex-explorer-drop-chips:end:v11 */';
 
 // Deliberately browser-safe: this exact function is serialized into the bundle patch.
 function mentionsFromDrop(uriListText, resourceUrlsText, rootCandidates) {
@@ -66,11 +66,11 @@ function mentionsFromDrop(uriListText, resourceUrlsText, rootCandidates) {
   return mentions;
 }
 
-const COMPOSER_ANCHOR = /IR\(`add-context-file`,(?<controller>[A-Za-z_$][\w$]*)\.view\.dom,(?<event>[A-Za-z_$][\w$]*)=>\{(?<focus>[A-Za-z_$][\w$]*)\(\),(?<add>[A-Za-z_$][\w$]*)\(\[\k<event>\.file\]\)\}\);/gu;
+const COMPOSER_ANCHOR = /(?<![\w$.])[A-Za-z_$][\w$]*\(`add-context-file`,(?<controller>[A-Za-z_$][\w$]*)\.view\.dom,(?<event>[A-Za-z_$][\w$]*)=>\{(?<focus>[A-Za-z_$][\w$]*)\(\),(?<add>[A-Za-z_$][\w$]*)\(\[\k<event>\.file\]\)\}\);/gu;
 
 function browserDropInjection({ controller, focus, pathRoots }) {
   const mentionsSource = mentionsFromDrop.toString();
-  return `(()=>{const composer=${controller}.view.dom;if(composer.dataset.codexExplorerDropChips==='1')return;composer.dataset.codexExplorerDropChips='1';const mentionsFromDrop=${mentionsSource};const read=(event,type)=>event.dataTransfer?.getData(type)??'';const hasUriList=(event)=>Array.from(event.dataTransfer?.types??[]).some((type)=>{const normalized=type.toLowerCase();return normalized==='text/uri-list'||normalized==='application/vnd.code.uri-list'});const canInsertMention=()=>typeof ${controller}.insertMentionNodeInRange==='function'&&${controller}.view.state?.schema?.nodes?.atMention!=null;window.addEventListener('dragenter',(event)=>{if(hasUriList(event))event.preventDefault()},true);composer.addEventListener('dragover',(event)=>{if(!hasUriList(event))return;event.preventDefault();event.stopPropagation();event.dataTransfer.dropEffect='copy';},true);window.addEventListener('drop',(event)=>{if(event.target!=null&&!composer.contains(event.target))return;const uriList=read(event,'application/vnd.code.uri-list')||read(event,'text/uri-list');const mentions=mentionsFromDrop(uriList,read(event,'ResourceURLs'),${pathRoots});if(mentions.length===0||!canInsertMention())return;event.preventDefault();event.stopImmediatePropagation();for(const mention of mentions){const state=${controller}.view.state;const{from,to}=state.selection;${controller}.insertMentionNodeInRange(state.schema.nodes.atMention,mention,from,to)}${focus}();},true)})();`;
+  return `(()=>{const composer=${controller}.view.dom;if(composer.dataset.codexExplorerDropChips==='1')return;composer.dataset.codexExplorerDropChips='1';const mentionsFromDrop=${mentionsSource};const clipboardPrefix='codex-extension-helper:mentions:v1:';const read=(event,type)=>event.dataTransfer?.getData(type)??'';const hasUriList=(event)=>Array.from(event.dataTransfer?.types??[]).some((type)=>{const normalized=type.toLowerCase();return normalized==='text/uri-list'||normalized==='application/vnd.code.uri-list'});const canInsertMention=()=>typeof ${controller}.insertMentionNodeInRange==='function'&&${controller}.view.state?.schema?.nodes?.atMention!=null;const insertMentions=(mentions)=>{if(mentions.length===0||!canInsertMention())return false;for(const mention of mentions){const state=${controller}.view.state;const{from,to}=state.selection;${controller}.insertMentionNodeInRange(state.schema.nodes.atMention,mention,from,to)}${focus}();return true};const clipboardMentions=(event)=>{const text=event.clipboardData?.getData('text/plain')??'';if(!text.startsWith(clipboardPrefix))return[];try{const parsed=JSON.parse(text.slice(clipboardPrefix.length));if(!Array.isArray(parsed))return[];return parsed.filter((mention)=>mention!=null&&typeof mention==='object'&&typeof mention.label==='string'&&typeof mention.path==='string'&&typeof mention.fsPath==='string')}catch{return[]}};window.addEventListener('dragenter',(event)=>{if(hasUriList(event))event.preventDefault()},true);composer.addEventListener('dragover',(event)=>{if(!hasUriList(event))return;event.preventDefault();event.stopPropagation();event.dataTransfer.dropEffect='copy';},true);window.addEventListener('drop',(event)=>{if(event.target!=null&&!composer.contains(event.target))return;const uriList=read(event,'application/vnd.code.uri-list')||read(event,'text/uri-list');const mentions=mentionsFromDrop(uriList,read(event,'ResourceURLs'),${pathRoots});if(!insertMentions(mentions))return;event.preventDefault();event.stopImmediatePropagation()},true);composer.addEventListener('paste',(event)=>{const mentions=clipboardMentions(event);if(!insertMentions(mentions))return;event.preventDefault();event.stopImmediatePropagation()},true)})();`;
 }
 
 function composerPathRoots(source, anchorIndex) {
@@ -111,7 +111,7 @@ export function patchBundleSource(source) {
     pathRoots: composerPathRoots(source, match.index),
   });
   const originalAnchor = Buffer.from(match[0], 'utf8').toString('base64');
-  const patchBlock = `${PATCH_START_MARKER}${injection}/* codex-explorer-drop-chips:original:${originalAnchor} */${PATCH_END_MARKER}`;
+  const patchBlock = `${PATCH_START_MARKER}${injection}${match[0]}/* codex-explorer-drop-chips:original:${originalAnchor} */${PATCH_END_MARKER}`;
   const endIndex = match.index + match[0].length;
   return {
     status: 'patched',

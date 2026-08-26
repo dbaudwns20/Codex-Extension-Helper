@@ -49,11 +49,13 @@ async function makeLegacyBundlePatchFixture(extensionDir: string) {
   const backupPath = `${bundlePath}.codex-explorer-drop-chips.original`;
   const metadataPath = `${bundlePath}.codex-explorer-drop-chips.json`;
   const originalBundle = await readFile(bundlePath, 'utf8');
-  const patchedBundle = patchBundleSource(originalBundle).source;
+  const patchedBundle = patchBundleSource(originalBundle).source
+    .replace('codex-explorer-drop-chips:start:v11', 'codex-explorer-drop-chips:start:v10')
+    .replace('codex-explorer-drop-chips:end:v11', 'codex-explorer-drop-chips:end:v10');
   await writeFile(bundlePath, patchedBundle);
   await writeFile(backupPath, originalBundle);
   await writeFile(metadataPath, `${JSON.stringify({
-    patchVersion: 8,
+    patchVersion: 10,
     extensionVersion: '26.818.61809',
     bundlePath,
     backupPath,
@@ -127,7 +129,7 @@ async function makeSchema2V1PatchFixture(extensionDir: string) {
   const bootstrapSource = createCacheBootstrapV1Source(patchedIndex.entrySource);
   const metadata = {
     metadataSchemaVersion: 2,
-    patchVersion: 8,
+    patchVersion: 11,
     cacheBootstrapVersion: 1,
     extensionVersion: '26.818.61809',
     bundlePath,
@@ -165,6 +167,122 @@ afterEach(async () => {
 });
 
 describe('Codex drop installation discovery', () => {
+  it('inspects a clean, patched, and restored installation without changing it', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const installationModule = await import('../../scripts/lib/codex-drop-installation.mjs') as unknown as {
+      applyCodexDropPatch(options: { extensionDir: string }): Promise<unknown>;
+      inspectCodexDropPatch?: (options: { extensionDir: string }) => Promise<{
+        status: string;
+        extensionVersion: string;
+      }>;
+      restoreCodexDropPatch(options: { extensionDir: string }): Promise<unknown>;
+    };
+    expect(typeof installationModule.inspectCodexDropPatch).toBe('function');
+    if (installationModule.inspectCodexDropPatch === undefined) return;
+    const extensionsRoot = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(extensionsRoot, '26.820.60940');
+
+    await expect(installationModule.inspectCodexDropPatch({ extensionDir })).resolves.toMatchObject({
+      status: 'not-patched',
+      extensionVersion: '26.820.60940',
+    });
+    await installationModule.applyCodexDropPatch({ extensionDir });
+    await expect(installationModule.inspectCodexDropPatch({ extensionDir })).resolves.toMatchObject({
+      status: 'patched',
+      extensionVersion: '26.820.60940',
+    });
+    await installationModule.restoreCodexDropPatch({ extensionDir });
+    await expect(installationModule.inspectCodexDropPatch({ extensionDir })).resolves.toMatchObject({
+      status: 'not-patched',
+      extensionVersion: '26.820.60940',
+    });
+  });
+
+  it('fails closed when inspection finds a patched bundle changed after installation', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { applyCodexDropPatch, inspectCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    const extensionsRoot = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(extensionsRoot, '26.820.60940');
+    const result = await applyCodexDropPatch({ extensionDir });
+    const patchedSource = await readFile(result.bundlePath, 'utf8');
+    await writeFile(result.bundlePath, `${patchedSource}\n/* changed after patch */\n`);
+
+    await expect(inspectCodexDropPatch({ extensionDir })).rejects.toThrow(
+      'Current bundle hash does not match patch metadata',
+    );
+  });
+
+  it('fails closed when patch markers disappear but managed index artifacts remain', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { applyCodexDropPatch, inspectCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    const extensionsRoot = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(extensionsRoot, '26.820.60940');
+    const result = await applyCodexDropPatch({ extensionDir });
+    await writeFile(result.bundlePath, await readFile(result.backupPath));
+
+    await expect(inspectCodexDropPatch({ extensionDir })).rejects.toThrow(
+      'Current install is partially restored',
+    );
+  });
+
+  it('reports a verified previous patch separately so it can be migrated or removed', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { inspectCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    const extensionsRoot = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(extensionsRoot, '26.818.61809');
+    await makeLegacyBundlePatchFixture(extensionDir);
+
+    await expect(inspectCodexDropPatch({ extensionDir })).resolves.toMatchObject({
+      status: 'legacy-patched',
+      extensionVersion: '26.818.61809',
+    });
+  });
+
+  it('rejects legacy metadata when schema-2 index artifacts are also present', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { inspectCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    const extensionsRoot = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(extensionsRoot, '26.818.61809');
+    await makeLegacyBundlePatchFixture(extensionDir);
+    const indexPath = path.join(extensionDir, 'webview/index.html');
+    await writeFile(`${indexPath}.codex-explorer-drop-chips.original`, await readFile(indexPath));
+
+    await expect(inspectCodexDropPatch({ extensionDir })).rejects.toThrow(
+      'Legacy Codex drop patch contains unexpected managed artifacts',
+    );
+  });
+
+  it('rejects a schema-2 patch with a stray alternate-version bootstrap', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { applyCodexDropPatch, inspectCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    const extensionsRoot = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(extensionsRoot, '26.820.60940');
+    await applyCodexDropPatch({ extensionDir });
+    await writeFile(
+      path.join(extensionDir, 'webview/assets/codex-explorer-drop-cache-bootstrap-v1.js'),
+      'stray bootstrap',
+    );
+
+    await expect(inspectCodexDropPatch({ extensionDir })).rejects.toThrow(
+      'Current Codex install contains an unexpected managed bootstrap',
+    );
+  });
+
+  it('fails closed when bundle patch markers exist without managed metadata', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { inspectCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { patchBundleSource } = await import('../../scripts/lib/codex-drop-source.mjs');
+    const extensionsRoot = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(extensionsRoot, '26.820.60940');
+    const bundlePath = path.join(extensionDir, 'webview/assets/app-initial-current.js');
+    await writeFile(bundlePath, patchBundleSource(await readFile(bundlePath, 'utf8')).source);
+
+    await expect(inspectCodexDropPatch({ extensionDir })).rejects.toThrow(
+      'Current Codex install contains inconsistent patch artifacts',
+    );
+  });
+
   it('discovers installations and selects the numerically newest installation bundle', async () => {
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { discoverCodexInstallations, resolveCodexTarget } = await import('../../scripts/lib/codex-drop-installation.mjs');
@@ -260,7 +378,7 @@ describe('Codex drop installation lifecycle', () => {
     expect(first.bootstrapPath).toBe(path.join(extensionDir, 'webview/assets/codex-explorer-drop-cache-bootstrap-v2.js'));
     const metadata = JSON.parse(await readFile(first.metadataPath, 'utf8'));
     expect(metadata.metadataSchemaVersion).toBe(2);
-    expect(metadata.patchVersion).toBe(8);
+    expect(metadata.patchVersion).toBe(11);
     expect(metadata.cacheBootstrapVersion).toBe(2);
     expect(await readFile(first.indexPath, 'utf8')).toContain('codex-explorer-drop-cache-bootstrap-v2.js');
     expect(await readFile(first.bootstrapPath, 'utf8')).toContain('./assets/index-current.js');
@@ -287,43 +405,45 @@ describe('Codex drop installation lifecycle', () => {
     expect(await readFile(first.metadataPath, 'utf8')).toBe(corruptedMetadataSource);
   });
 
-  it('migrates a verified legacy v8 bundle patch to schema 2 without rewriting the bundle backup', async () => {
+  it('migrates a verified legacy v10 bundle patch to v11 schema 2 without rewriting the bundle backup', async () => {
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { applyCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
     const extensionsRoot = await makeTemporaryDirectory();
     const extensionDir = await makeInstallation(extensionsRoot, '26.818.61809');
     const { backupPath, bundlePath, metadataPath } = await makeLegacyBundlePatchFixture(extensionDir);
-    const bundleBeforeMigration = await readFile(bundlePath);
     const backupBeforeMigration = await readFile(backupPath);
 
     const migrated = await applyCodexDropPatch({ extensionDir });
     expect(migrated.status).toBe('migrated');
-    expect(await readFile(bundlePath)).toEqual(bundleBeforeMigration);
+    expect(await readFile(bundlePath, 'utf8')).toContain('codex-explorer-drop-chips:start:v11');
     expect(await readFile(backupPath)).toEqual(backupBeforeMigration);
-    expect(JSON.parse(await readFile(metadataPath, 'utf8')).metadataSchemaVersion).toBe(2);
+    expect(JSON.parse(await readFile(metadataPath, 'utf8'))).toMatchObject({
+      metadataSchemaVersion: 2,
+      patchVersion: 11,
+    });
   });
 
-  it('upgrades a verified schema-2 v7 bundle patch to v8', async () => {
+  it('upgrades a verified schema-2 v10 bundle patch to v11', async () => {
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { applyCodexDropPatch, sha256 } = await import('../../scripts/lib/codex-drop-installation.mjs');
     const extensionsRoot = await makeTemporaryDirectory();
     const extensionDir = await makeInstallation(extensionsRoot, '26.818.61809');
     const first = await applyCodexDropPatch({ extensionDir });
-    const v8Bundle = await readFile(first.bundlePath, 'utf8');
-    const v7Bundle = v8Bundle
-      .replace('codex-explorer-drop-chips:start:v8', 'codex-explorer-drop-chips:start:v7')
-      .replace('codex-explorer-drop-chips:end:v8', 'codex-explorer-drop-chips:end:v7');
+    const v11Bundle = await readFile(first.bundlePath, 'utf8');
+    const v10Bundle = v11Bundle
+      .replace('codex-explorer-drop-chips:start:v11', 'codex-explorer-drop-chips:start:v10')
+      .replace('codex-explorer-drop-chips:end:v11', 'codex-explorer-drop-chips:end:v10');
     const metadata = JSON.parse(await readFile(first.metadataPath, 'utf8'));
-    metadata.patchVersion = 7;
-    metadata.patchedSha256 = sha256(v7Bundle);
-    await writeFile(first.bundlePath, v7Bundle);
+    metadata.patchVersion = 10;
+    metadata.patchedSha256 = sha256(v10Bundle);
+    await writeFile(first.bundlePath, v10Bundle);
     await writeFile(first.metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
 
     const migrated = await applyCodexDropPatch({ extensionDir });
 
     expect(migrated.status).toBe('migrated');
-    expect(await readFile(first.bundlePath, 'utf8')).toContain('codex-explorer-drop-chips:start:v8');
-    expect(JSON.parse(await readFile(first.metadataPath, 'utf8')).patchVersion).toBe(8);
+    expect(await readFile(first.bundlePath, 'utf8')).toContain('codex-explorer-drop-chips:start:v11');
+    expect(JSON.parse(await readFile(first.metadataPath, 'utf8')).patchVersion).toBe(11);
   });
 
   it('migrates a verified schema-2 bootstrap-v1 install to bootstrap v2', async () => {
@@ -469,7 +589,7 @@ describe('Codex drop installation lifecycle', () => {
   it.each([
     ['first target rename', (extensionDir: string) => path.join(extensionDir, 'webview/assets/codex-explorer-drop-cache-bootstrap-v2.js')],
     ['second target rename', (extensionDir: string) => path.join(extensionDir, 'webview/index.html')],
-  ])('preserves original backups and publishes no metadata after %s failure', async (_name, failedTarget) => {
+  ])('preserves original backups and retries safely after %s failure', async (_name, failedTarget) => {
     // @ts-expect-error Script modules are intentionally JavaScript-only.
     const { applyCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
     const extensionsRoot = await makeTemporaryDirectory();
@@ -500,6 +620,32 @@ describe('Codex drop installation lifecycle', () => {
     expect(await readFile(indexBackupPath)).toEqual(originalIndex);
     await expect(readFile(metadataPath)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(readFile(bootstrapPath)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    await expect(applyCodexDropPatch({ extensionDir })).resolves.toMatchObject({ status: 'patched' });
+  });
+
+  it('removes a newly created first backup when creating the backup pair is interrupted', async () => {
+    // @ts-expect-error Script modules are intentionally JavaScript-only.
+    const { applyCodexDropPatch } = await import('../../scripts/lib/codex-drop-installation.mjs');
+    const extensionsRoot = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(extensionsRoot, '26.820.60940');
+    const bundlePath = path.join(extensionDir, 'webview/assets/app-initial-current.js');
+    const backupPath = `${bundlePath}.codex-explorer-drop-chips.original`;
+    const indexBackupPath = `${path.join(extensionDir, 'webview/index.html')}.codex-explorer-drop-chips.original`;
+
+    await expect(applyCodexDropPatch({
+      extensionDir,
+      __testFileOperations: {
+        writeFile: async (targetPath: string, data: string | Uint8Array, options: object) => {
+          if (targetPath === indexBackupPath) throw new Error('index backup creation blocked');
+          await writeFile(targetPath, data, options);
+        },
+      },
+    })).rejects.toThrow('index backup creation blocked');
+
+    await expect(readFile(backupPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(indexBackupPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(applyCodexDropPatch({ extensionDir })).resolves.toMatchObject({ status: 'patched' });
   });
 
   it('attempts every install rollback and reports rollback failures while preserving recovery backups', async () => {
