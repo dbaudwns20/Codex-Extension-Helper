@@ -46,6 +46,13 @@ interface ReadyTransition {
   readonly evidence: readonly string[];
 }
 
+interface NormalizedEvidenceGroup {
+  readonly accepted: ProvenanceFileState;
+  readonly links: { item: ItemRecord; change: CodexFileUpdateChange }[];
+  readonly evidence: Set<string>;
+  acceptedStateConflict: boolean;
+}
+
 const DEFAULT_RETENTION_MS = 5 * 60 * 1_000;
 
 function itemKey(threadId: string, turnId: string, itemId: string): string {
@@ -97,7 +104,8 @@ function nextState(
 
 export class CodexProvenanceLedger {
   private readonly items = new Map<string, ItemRecord>();
-  private readonly consumedEvidence = new Set<string>();
+  private readonly retiredEvidence = new Set<string>();
+  private readonly evidenceByNormalizedKey = new Map<string, Set<string>>();
   private readonly ready = new Map<string, ReadyTransition>();
 
   constructor(
@@ -175,24 +183,41 @@ export class CodexProvenanceLedger {
     resolveAcceptedPath: AcceptedStateResolver,
   ): readonly ExactCodexTransition[] {
     this.ready.clear();
-    const changesByPath = new Map<string, { item: ItemRecord; change: CodexFileUpdateChange }[]>();
+    this.evidenceByNormalizedKey.clear();
+    const groups = new Map<string, NormalizedEvidenceGroup>();
 
     for (const item of this.items.values()) {
       if (item.invalid || item.terminalStatus !== 'completed') continue;
       for (const change of item.changes) {
-        if (this.consumedEvidence.has(evidenceKey(item, change.path))) continue;
-        const changes = changesByPath.get(change.path) ?? [];
-        changes.push({ item, change });
-        changesByPath.set(change.path, changes);
+        const evidence = evidenceKey(item, change.path);
+        if (this.retiredEvidence.has(evidence)) continue;
+        const accepted = resolveAcceptedPath(change.path);
+        if (accepted === undefined) continue;
+        const key = accepted.uri.toString();
+        const existing = groups.get(key);
+        const group = existing ?? {
+          accepted,
+          links: [],
+          evidence: new Set<string>(),
+          acceptedStateConflict: false,
+        };
+        if (existing !== undefined
+          && (accepted.exists !== existing.accepted.exists || accepted.text !== existing.accepted.text)) {
+          group.acceptedStateConflict = true;
+        }
+        group.links.push({ item, change });
+        group.evidence.add(evidence);
+        groups.set(key, group);
+        this.evidenceByNormalizedKey.set(key, group.evidence);
       }
     }
 
-    for (const [path, links] of changesByPath) {
-      const accepted = resolveAcceptedPath(path);
-      if (accepted === undefined || (!accepted.exists && accepted.text !== '')) continue;
-
+    for (const [key, group] of groups) {
+      const { accepted, evidence, links } = group;
       const first = links[0].item;
-      if (links.some(({ item }) => item.threadId !== first.threadId || item.turnId !== first.turnId)) {
+      if (group.acceptedStateConflict || (!accepted.exists && accepted.text !== '')
+        || links.some(({ item }) => item.threadId !== first.threadId || item.turnId !== first.turnId)) {
+        this.retireEvidence(evidence);
         continue;
       }
 
@@ -200,7 +225,6 @@ export class CodexProvenanceLedger {
       let current: ProvenanceFileState = before;
       let precedingAfterHash = sha256Text(current.text);
       const itemIds: string[] = [];
-      const evidence: string[] = [];
       let valid = true;
 
       for (const { item, change } of links) {
@@ -217,11 +241,12 @@ export class CodexProvenanceLedger {
         current = after;
         precedingAfterHash = sha256Text(after.text);
         if (itemIds[itemIds.length - 1] !== item.itemId) itemIds.push(item.itemId);
-        evidence.push(evidenceKey(item, path));
       }
 
-      if (!valid) continue;
-      const key = accepted.uri.toString();
+      if (!valid) {
+        this.retireEvidence(evidence);
+        continue;
+      }
       const transition: ExactCodexTransition = {
         key,
         uri: accepted.uri,
@@ -234,7 +259,7 @@ export class CodexProvenanceLedger {
           itemIds,
         },
       };
-      this.ready.set(key, { transition, afterHash: precedingAfterHash, evidence });
+      this.ready.set(key, { transition, afterHash: precedingAfterHash, evidence: [...evidence] });
     }
 
     return [...this.ready.values()].map(({ transition }) => transition);
@@ -243,15 +268,14 @@ export class CodexProvenanceLedger {
   consume(key: string, afterHash: string): ExactCodexTransition | undefined {
     const ready = this.ready.get(key);
     if (ready === undefined || ready.afterHash !== afterHash) return undefined;
-    for (const evidence of ready.evidence) this.consumedEvidence.add(evidence);
+    this.retireEvidence(ready.evidence);
     this.ready.delete(key);
     return ready.transition;
   }
 
   invalidate(key: string): void {
-    const ready = this.ready.get(key);
-    if (ready === undefined) return;
-    for (const evidence of ready.evidence) this.consumedEvidence.add(evidence);
+    const evidence = this.evidenceByNormalizedKey.get(key);
+    if (evidence !== undefined) this.retireEvidence(evidence);
     this.ready.delete(key);
   }
 
@@ -264,5 +288,9 @@ export class CodexProvenanceLedger {
       }
     }
     if (changed) this.ready.clear();
+  }
+
+  private retireEvidence(evidence: Iterable<string>): void {
+    for (const value of evidence) this.retiredEvidence.add(value);
   }
 }

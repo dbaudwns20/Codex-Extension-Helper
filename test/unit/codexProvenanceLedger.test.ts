@@ -299,6 +299,45 @@ describe('CodexProvenanceLedger', () => {
     }))).toEqual([]);
   });
 
+  it('permanently rejects evidence after replay fails against its accepted pre-image', () => {
+    const ledger = new CodexProvenanceLedger();
+    ledger.record(completed([update('file.txt', 'old', 'new')]));
+
+    expect(ledger.completedTransitions(accepted({
+      'file.txt': state('file.txt', true, 'different\n'),
+    }))).toEqual([]);
+
+    expect(ledger.completedTransitions(accepted({
+      'file.txt': state('file.txt', true, 'old\n'),
+    }))).toEqual([]);
+  });
+
+  it('does not let pruning a blocking same-file record promote surviving evidence', () => {
+    let now = 1_000;
+    const ledger = new CodexProvenanceLedger(100, () => now);
+    ledger.record(completed([update('file.txt', 'different', 'final')], 'blocker'));
+    now = 1_050;
+    ledger.record(completed([update('file.txt', 'old', 'new')], 'survivor'));
+    const resolveAcceptedPath = accepted({ 'file.txt': state('file.txt', true, 'old\n') });
+
+    expect(ledger.completedTransitions(resolveAcceptedPath)).toEqual([]);
+
+    ledger.prune(1_100);
+    expect(ledger.completedTransitions(resolveAcceptedPath)).toEqual([]);
+  });
+
+  it('combines raw-path aliases by normalized URI and rejects their conflicting chain', () => {
+    const ledger = new CodexProvenanceLedger();
+    ledger.record(completed([update('SRC/file.txt', 'old', 'new')], 'first'));
+    ledger.record(completed([update('src/file.txt', 'old', 'final')], 'second'));
+    const normalizedState = state('src/file.txt', true, 'old\n');
+
+    expect(ledger.completedTransitions(accepted({
+      'SRC/file.txt': normalizedState,
+      'src/file.txt': normalizedState,
+    }))).toEqual([]);
+  });
+
   it('rejects lifecycle mismatches and delete patches that do not replay to empty text', () => {
     const cases: readonly [CodexFileUpdateChange, ProvenanceFileState][] = [
       [add('file.txt', 'new'), state('file.txt', true, 'old\n')],
