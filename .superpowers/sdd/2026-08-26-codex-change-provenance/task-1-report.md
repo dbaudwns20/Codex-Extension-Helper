@@ -25,7 +25,7 @@ Additional verification: `npx tsc -p . --noEmit` exited successfully with no dia
 
 ## Commit hash
 
-Pending commit.
+`9894174` (amended below to include the final report hash reference).
 
 ## Self-review
 
