@@ -162,7 +162,13 @@ function installState(
     sourceRevision: 8,
     comparisonActive: true,
     pending: true,
-    createdFile: false,
+    lifecycle: 'existing',
+    provenance: {
+      confidence: 'exact',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      itemIds: ['item-1'],
+    },
     ...overrides,
   };
   store.setComparison(stateKey, state);
@@ -653,7 +659,7 @@ describe('ReviewController rejection edits', () => {
 describe('ReviewController mutation serialization', () => {
   for (const approval of ['hunk', 'all'] as const) {
     it(`waits for a same-key Reject before ${approval === 'hunk' ? 'Approve Hunk' : 'Approve All'} revalidation`, async () => {
-      const { controller, coordinator, host, state } = setup('', 'one\ntwo\n', { createdFile: true });
+      const { controller, coordinator, host, state } = setup('', 'one\ntwo\n', { lifecycle: 'created' });
       const firstDelete = deferred<void>();
       host.deleteResult = firstDelete.promise;
 
@@ -702,7 +708,7 @@ describe('ReviewController mutation serialization', () => {
 
   it('keeps different file keys independent while one mutation is deferred', async () => {
     const otherKey = 'file:///workspace/other.ts';
-    const { controller, coordinator, host, state, store } = setup('', 'created\n', { createdFile: true });
+    const { controller, coordinator, host, state, store } = setup('', 'created\n', { lifecycle: 'created' });
     const otherState = installState(store, otherKey, 'before', 'after');
     const firstDelete = deferred<void>();
     host.deleteResult = firstDelete.promise;
@@ -736,7 +742,7 @@ describe('ReviewController mutation serialization', () => {
 
 describe('ReviewController created-file rejection', () => {
   function setupCreated() {
-    return setup('', 'one\ntwo\n', { createdFile: true });
+    return setup('', 'one\ntwo\n', { lifecycle: 'created' });
   }
 
   it('rejects one created-file hunk by trashing the file before clearing state', async () => {
@@ -801,7 +807,7 @@ describe('ReviewController created-file rejection', () => {
     const { changed, controller, coordinator, host } = setup(
       '',
       'one\ntwo\n',
-      { createdFile: true },
+      { lifecycle: 'created' },
       () => { throw failure; },
     );
 
@@ -876,7 +882,7 @@ describe('ReviewController in-flight disposal', () => {
     const { changed, controller, coordinator, host } = setup(
       '',
       'one\ntwo\n',
-      { createdFile: true },
+      { lifecycle: 'created' },
     );
     const result = deferred<void>();
     host.deleteResult = result.promise;

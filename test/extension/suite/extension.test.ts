@@ -13,7 +13,7 @@ interface TestExtensionApi {
     uri: vscode.Uri,
     baselineText: string,
     currentText: string,
-    createdFile?: boolean,
+    lifecycle?: 'existing' | 'created',
   ): Promise<void>;
 }
 
@@ -252,7 +252,7 @@ export async function runExtensionSmokeTest(): Promise<void> {
     createdUri,
     '',
     'export const created = true;\n',
-    true,
+    'created',
   );
   await waitForReview(diagnostics, 'created-file comparison to become active');
 

@@ -48,7 +48,7 @@ import {
   type InstalledSpacerPresentation,
   type SpacerDocument,
 } from './temporaryLineSpacers';
-import type { FileComparisonState, HunkReference } from './types';
+import type { FileComparisonState, FileLifecycle, HunkReference } from './types';
 
 const CONFIGURATION_SECTION = 'codexExtensionHelper';
 const OUTPUT_CHANNEL_NAME = 'Codex Extension Helper';
@@ -71,7 +71,7 @@ interface TestExtensionApi {
     uri: vscode.Uri,
     baselineText: string,
     currentText: string,
-    createdFile?: boolean,
+    lifecycle?: Exclude<FileLifecycle, 'deleted'>,
   ): Promise<void>;
 }
 
@@ -730,7 +730,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     uri: vscode.Uri,
     baselineText: string,
     currentText: string,
-    createdFile = false,
+    lifecycle: Exclude<FileLifecycle, 'deleted'> = 'existing',
   ): Promise<void> {
     if (this.disposed) {
       return;
@@ -743,7 +743,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     this.detector.markRecentSave(uri);
     this.trackedUris.set(key, uri);
     this.coordinator.seed(key, baselineText);
-    if (createdFile) {
+    if (lifecycle === 'created') {
       await this.coordinator.externalCreate(key, currentText);
     } else {
       await this.coordinator.externalChange(key, currentText);
@@ -1303,9 +1303,9 @@ export class ExtensionController implements vscode.Disposable {
     uri: vscode.Uri,
     baselineText: string,
     currentText: string,
-    createdFile = false,
+    lifecycle: Exclude<FileLifecycle, 'deleted'> = 'existing',
   ): Promise<void> {
-    await this.runtime?.simulateExternalChange(uri, baselineText, currentText, createdFile);
+    await this.runtime?.simulateExternalChange(uri, baselineText, currentText, lifecycle);
   }
 
   async openActiveDiff(resource?: vscode.Uri): Promise<void> {
@@ -1494,8 +1494,8 @@ export function activate(context: vscode.ExtensionContext): TestExtensionApi | u
   return process.env.CODEX_EXTENSION_HELPER_TEST === '1'
     ? {
       testDiagnostics,
-      simulateExternalChange: (uri, baselineText, currentText, createdFile) => (
-        controller.simulateExternalChange(uri, baselineText, currentText, createdFile)
+      simulateExternalChange: (uri, baselineText, currentText, lifecycle) => (
+        controller.simulateExternalChange(uri, baselineText, currentText, lifecycle)
       ),
     }
     : undefined;

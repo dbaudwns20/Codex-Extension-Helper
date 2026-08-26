@@ -3,7 +3,7 @@ import { PerKeyDebouncer } from '../../src/changePolicy';
 import { ComparisonCoordinator, ComparisonView } from '../../src/coordinator';
 import { LineDiffEngine } from '../../src/diffEngine';
 import { SnapshotStore } from '../../src/snapshotStore';
-import type { ChangeHunk, HunkReference } from '../../src/types';
+import type { ChangeHunk, ExactCodexProvenance, HunkReference } from '../../src/types';
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -47,6 +47,13 @@ const createdHunks: readonly ChangeHunk[] = [{
   originalLines: [],
   modifiedLines: ['const value = 1;', 'export { value };'],
 }];
+
+const provenance: ExactCodexProvenance = {
+  confidence: 'exact',
+  threadId: 'thread-1',
+  turnId: 'turn-1',
+  itemIds: ['item-1'],
+};
 
 class FakeDiffEngine {
   readonly calls: Array<{ original: string; modified: string }> = [];
@@ -105,19 +112,38 @@ function setup() {
 describe('ComparisonCoordinator', () => {
   const key = 'file:///workspace/file.ts';
 
-  it('treats newly created content as an addition from an empty baseline', async () => {
+  it('creates an exact existing-file comparison from the accepted pre-image', async () => {
     const { coordinator, engine, store, view } = setup();
+    coordinator.seed(key, 'baseline');
     view.visible.add(key);
-    engine.queue(createdHunks);
-    const externalCreate = (coordinator as ComparisonCoordinator & {
-      externalCreate?: (createdKey: string, text: string) => Promise<void>;
-    }).externalCreate;
+    engine.queue(newerHunks);
 
-    expect(typeof externalCreate).toBe('function');
-    if (externalCreate === undefined) {
-      return;
-    }
-    await externalCreate.call(coordinator, key, 'const value = 1;\nexport { value };\n');
+    await coordinator.provenChange(key, 'baseline', 'new-result', 'existing', provenance);
+
+    expect(engine.calls).toEqual([{ original: 'baseline', modified: 'new-result' }]);
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'baseline',
+      currentText: 'new-result',
+      hunks: newerHunks,
+      lifecycle: 'existing',
+      provenance,
+      comparisonActive: true,
+      pending: true,
+    });
+    expect(view.renders).toEqual([{ key, hunks: newerHunks }]);
+  });
+
+  it('creates an exact created-file comparison only from accepted absence', async () => {
+    const { coordinator, engine, store } = setup();
+    engine.queue(createdHunks);
+
+    await coordinator.provenChange(
+      key,
+      '',
+      'const value = 1;\nexport { value };\n',
+      'created',
+      provenance,
+    );
 
     expect(engine.calls).toEqual([{
       original: '',
@@ -126,31 +152,147 @@ describe('ComparisonCoordinator', () => {
     expect(store.get(key)).toMatchObject({
       baselineText: '',
       currentText: 'const value = 1;\nexport { value };\n',
-      hunks: createdHunks,
+      lifecycle: 'created',
+      provenance,
       comparisonActive: true,
-      createdFile: true,
     });
-    expect(view.renders).toEqual([{ key, hunks: createdHunks }]);
   });
 
-  it('clears created-file origin when creation produces no unresolved hunks', async () => {
-    const { coordinator, engine, store, view } = setup();
-    engine.queue([]);
+  it('retains the exact pre-delete baseline in an active deleted-file comparison', async () => {
+    const { coordinator, engine, store } = setup();
+    const deletedHunks: readonly ChangeHunk[] = [{
+      kind: 'deletion',
+      originalStart: 0,
+      originalEnd: 1,
+      modifiedStart: 0,
+      modifiedEnd: 0,
+      originalLines: ['baseline'],
+      modifiedLines: [],
+    }];
+    coordinator.seed(key, 'baseline');
+    engine.queue(deletedHunks);
 
-    await coordinator.externalCreate(key, 'created without changes');
+    await coordinator.provenChange(key, 'baseline', '', 'deleted', provenance);
+
+    expect(engine.calls).toEqual([{ original: 'baseline', modified: '' }]);
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'baseline',
+      currentText: '',
+      hunks: deletedHunks,
+      lifecycle: 'deleted',
+      provenance,
+      comparisonActive: true,
+    });
+  });
+
+  it.each([
+    { name: 'update from absence', accepted: undefined, before: 'before', after: 'after', lifecycle: 'existing' as const },
+    { name: 'update from the wrong pre-image', accepted: 'accepted', before: 'wrong', after: 'after', lifecycle: 'existing' as const },
+    { name: 'create over an existing file', accepted: 'accepted', before: '', after: 'after', lifecycle: 'created' as const },
+    { name: 'create with a present pre-image', accepted: undefined, before: 'present', after: 'after', lifecycle: 'created' as const },
+    { name: 'delete from the wrong pre-image', accepted: 'accepted', before: 'wrong', after: '', lifecycle: 'deleted' as const },
+    { name: 'delete to present content', accepted: 'accepted', before: 'accepted', after: 'after', lifecycle: 'deleted' as const },
+  ])('fails closed for $name', async ({ accepted, before, after, lifecycle }) => {
+    const { coordinator, engine, store, view } = setup();
+    if (accepted !== undefined) {
+      coordinator.seed(key, accepted);
+    }
+
+    await coordinator.provenChange(key, before, after, lifecycle, provenance);
+
+    expect(engine.calls).toEqual([]);
+    expect(store.get(key)?.comparisonActive ?? false).toBe(false);
+    expect(store.get(key)?.provenance).toBeUndefined();
+    expect(view.renders).toEqual([]);
+  });
+
+  it('accepts unknown present content as a clean existing baseline', async () => {
+    const { coordinator, engine, store, view } = setup();
+    coordinator.seed(key, 'baseline');
+    engine.queue(newerHunks);
+    await coordinator.provenChange(key, 'baseline', 'new-result', 'existing', provenance);
+
+    await coordinator.acceptExternalState(key, 'unknown');
 
     expect(store.get(key)).toMatchObject({
-      baselineText: '',
-      currentText: 'created without changes',
+      baselineText: 'unknown',
+      currentText: 'unknown',
       hunks: [],
+      lifecycle: 'existing',
+      provenance: undefined,
       comparisonActive: false,
       pending: false,
-      createdFile: false,
     });
     expect(view.clear).toHaveBeenCalledWith(key);
   });
 
-  it('seeds unseen external content without diffing or rendering', async () => {
+  it('accepts unknown absence by removing accepted and active state', async () => {
+    const { coordinator, engine, store, view } = setup();
+    coordinator.seed(key, 'baseline');
+    engine.queue(newerHunks);
+    await coordinator.provenChange(key, 'baseline', 'new-result', 'existing', provenance);
+
+    await coordinator.acceptExternalState(key, undefined);
+
+    expect(store.get(key)).toBeUndefined();
+    expect(view.clear).toHaveBeenCalledWith(key);
+  });
+
+  it('does not let a stale exact diff revive after an unknown state is accepted', async () => {
+    const { coordinator, engine, store, view } = setup();
+    const result = deferred<readonly ChangeHunk[]>();
+    coordinator.seed(key, 'baseline');
+    engine.queue(result.promise);
+    const run = coordinator.provenChange(key, 'baseline', 'new-result', 'existing', provenance);
+
+    await coordinator.acceptExternalState(key, 'unknown');
+    result.resolve(newerHunks);
+    await run;
+
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'unknown',
+      currentText: 'unknown',
+      hunks: [],
+      lifecycle: 'existing',
+      provenance: undefined,
+      comparisonActive: false,
+    });
+    expect(view.renders).toEqual([]);
+  });
+
+  it('clears stale exact rendering after an unknown state is accepted', async () => {
+    const { coordinator, engine, store, view } = setup();
+    const render = deferred<void>();
+    coordinator.seed(key, 'baseline');
+    view.visible.add(key);
+    view.queueRender(render.promise);
+    engine.queue(newerHunks);
+
+    const run = coordinator.provenChange(
+      key,
+      'baseline',
+      'new-result',
+      'existing',
+      provenance,
+    );
+    await Promise.resolve();
+    expect(view.renderStarts).toEqual([{ key, hunks: newerHunks }]);
+
+    await coordinator.acceptExternalState(key, 'unknown');
+    render.resolve();
+    await run;
+
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'unknown',
+      currentText: 'unknown',
+      hunks: [],
+      lifecycle: 'existing',
+      provenance: undefined,
+    });
+    expect(view.renderedHunks.get(key)).toBeUndefined();
+  });
+
+  it('routes legacy unknown writes to a clean accepted baseline', async () => {
     const { coordinator, engine, store, view } = setup();
 
     await coordinator.externalChange(key, 'baseline');
@@ -160,27 +302,11 @@ describe('ComparisonCoordinator', () => {
       currentText: 'baseline',
       hunks: [],
       pending: false,
-      createdFile: false,
+      lifecycle: 'existing',
+      provenance: undefined,
     });
     expect(engine.calls).toEqual([]);
     expect(view.renders).toEqual([]);
-  });
-
-  it('diffs a later external write against the accepted baseline', async () => {
-    const { coordinator, engine, store, view } = setup();
-    coordinator.seed(key, 'baseline');
-    view.visible.add(key);
-    engine.queue(newerHunks);
-
-    await coordinator.externalChange(key, 'new-result');
-
-    expect(engine.calls).toEqual([{ original: 'baseline', modified: 'new-result' }]);
-    expect(store.get(key)).toMatchObject({
-      baselineText: 'baseline',
-      currentText: 'new-result',
-      hunks: newerHunks,
-    });
-    expect(view.renders).toEqual([{ key, hunks: newerHunks }]);
   });
 
   it('keeps an invisible comparison pending and renders it on show', async () => {
@@ -188,7 +314,7 @@ describe('ComparisonCoordinator', () => {
     coordinator.seed(key, 'baseline');
     engine.queue(newerHunks);
 
-    await coordinator.externalChange(key, 'new-result');
+    await coordinator.provenChange(key, 'baseline', 'new-result', 'existing', provenance);
     expect(view.renders).toEqual([]);
     expect(store.get(key)?.pending).toBe(true);
 
@@ -204,7 +330,7 @@ describe('ComparisonCoordinator', () => {
     coordinator.seed(key, 'baseline');
     view.visible.add(key);
     engine.queue(olderHunks, newerHunks);
-    await coordinator.externalChange(key, 'old-result');
+    await coordinator.provenChange(key, 'baseline', 'old-result', 'existing', provenance);
 
     await coordinator.documentEdit(key, 'new-result');
 
@@ -225,7 +351,8 @@ describe('ComparisonCoordinator', () => {
       sourceRevision: store.get(key)!.sourceRevision,
       comparisonActive: true,
       pending: true,
-      createdFile: false,
+      lifecycle: 'existing',
+      provenance,
     });
 
     coordinator.save(key, 'saved');
@@ -235,7 +362,8 @@ describe('ComparisonCoordinator', () => {
       currentText: 'saved',
       hunks: [],
       pending: false,
-      createdFile: false,
+      lifecycle: 'existing',
+      provenance: undefined,
     });
     expect(view.clear).toHaveBeenCalledWith(key);
   });
@@ -247,7 +375,7 @@ describe('ComparisonCoordinator', () => {
     view.visible.add(key);
     engine.queue(result.promise);
 
-    const run = coordinator.externalChange(key, 'old-result');
+    const run = coordinator.provenChange(key, 'baseline', 'old-result', 'existing', provenance);
     coordinator.save(key, 'saved');
     result.resolve(olderHunks);
     await run;
@@ -287,7 +415,7 @@ describe('ComparisonCoordinator', () => {
     view.visible.add(key);
     engine.queue(result.promise);
 
-    const run = coordinator.externalChange(key, 'old-result');
+    const run = coordinator.provenChange(key, 'baseline', 'old-result', 'existing', provenance);
     coordinator.delete(key);
     result.resolve(olderHunks);
     await run;
@@ -302,7 +430,7 @@ describe('ComparisonCoordinator', () => {
     view.visible.add(key);
     engine.queue([], newerHunks);
 
-    await coordinator.externalChange(key, 'baseline');
+    await coordinator.provenChange(key, 'baseline', 'baseline', 'existing', provenance);
     await coordinator.documentEdit(key, 'new-result');
 
     expect(store.get(key)).toMatchObject({
@@ -314,31 +442,29 @@ describe('ComparisonCoordinator', () => {
     expect(view.renders).toEqual([]);
   });
 
-  it('keeps an active session when a user temporarily returns to the baseline', async () => {
+  it('finishes a fully rejected comparison as a clean existing baseline', async () => {
     const { coordinator, engine, store, view } = setup();
     coordinator.seed(key, 'baseline');
     view.visible.add(key);
-    engine.queue(olderHunks, [], newerHunks);
+    engine.queue(olderHunks, []);
 
-    await coordinator.externalChange(key, 'old-result');
+    await coordinator.provenChange(key, 'baseline', 'old-result', 'existing', provenance);
     await coordinator.documentEdit(key, 'baseline');
 
     expect(store.get(key)).toMatchObject({
       baselineText: 'baseline',
       currentText: 'baseline',
-      comparisonActive: true,
+      lifecycle: 'existing',
+      provenance: undefined,
+      comparisonActive: false,
       hunks: [],
       pending: false,
     });
-
-    await coordinator.documentEdit(key, 'new-result');
-
     expect(engine.calls).toEqual([
       { original: 'baseline', modified: 'old-result' },
       { original: 'baseline', modified: 'baseline' },
-      { original: 'baseline', modified: 'new-result' },
     ]);
-    expect(view.renders.at(-1)).toEqual({ key, hunks: newerHunks });
+    expect(view.clear).toHaveBeenCalledWith(key);
   });
 
   it('checks a live-document guard before applying a deferred comparison', async () => {
@@ -347,18 +473,16 @@ describe('ComparisonCoordinator', () => {
     let liveDocumentIsCurrent = true;
     coordinator.seed(key, 'baseline');
     view.visible.add(key);
-    engine.queue(result.promise);
-
-    const run = coordinator.externalChange(
-      key,
-      'old-result',
-      () => liveDocumentIsCurrent,
-    );
+    engine.queue(olderHunks, result.promise);
+    await coordinator.provenChange(key, 'baseline', 'old-result', 'existing', provenance);
+    const priorState = store.get(key);
+    view.renders.length = 0;
+    const run = coordinator.documentEdit(key, 'new-result', () => liveDocumentIsCurrent);
     liveDocumentIsCurrent = false;
     result.resolve(olderHunks);
     await run;
 
-    expect(store.get(key)?.hunks).toEqual([]);
+    expect(store.get(key)?.hunks).toEqual(priorState?.hunks);
     expect(view.renders).toEqual([]);
   });
 
@@ -369,7 +493,7 @@ describe('ComparisonCoordinator', () => {
     view.visible.add(key);
     engine.queue(result.promise);
 
-    const run = coordinator.externalChange(key, 'old-result');
+    const run = coordinator.provenChange(key, 'baseline', 'old-result', 'existing', provenance);
     const invalidate = (coordinator as ComparisonCoordinator & {
       invalidate?: (invalidatedKey: string) => void;
     }).invalidate;
@@ -389,8 +513,8 @@ describe('ComparisonCoordinator', () => {
     view.visible.add(key);
     engine.queue(first.promise, Promise.resolve(newerHunks));
 
-    const oldRun = coordinator.externalChange(key, 'old-result');
-    await coordinator.externalChange(key, 'new-result');
+    const oldRun = coordinator.provenChange(key, 'baseline', 'old-result', 'existing', provenance);
+    await coordinator.provenChange(key, 'baseline', 'new-result', 'existing', provenance);
     first.resolve(olderHunks);
     await oldRun;
 
@@ -404,7 +528,7 @@ describe('ComparisonCoordinator', () => {
     view.visible.add(key);
     engine.queue(result.promise);
 
-    const run = coordinator.externalChange(key, 'old-result');
+    const run = coordinator.provenChange(key, 'baseline', 'old-result', 'existing', provenance);
     const pending = store.get(key)!;
     store.setComparison(key, { ...pending, currentText: 'changed-elsewhere' });
     result.resolve(olderHunks);
@@ -440,7 +564,13 @@ describe('ComparisonCoordinator', () => {
     };
     coordinator.seed(key, 'alpha\nbeta\ngamma\n');
     engine.queue([firstHunk, secondHunk], [remainingHunk]);
-    await coordinator.externalChange(key, 'ALPHA\nbeta\nGAMMA\n');
+    await coordinator.provenChange(
+      key,
+      'alpha\nbeta\ngamma\n',
+      'ALPHA\nbeta\nGAMMA\n',
+      'existing',
+      provenance,
+    );
     const state = store.get(key)!;
     const reference: HunkReference = {
       key,
@@ -460,7 +590,8 @@ describe('ComparisonCoordinator', () => {
       hunks: [remainingHunk],
       comparisonActive: true,
       pending: true,
-      createdFile: false,
+      lifecycle: 'existing',
+      provenance,
     });
   });
 
@@ -477,7 +608,7 @@ describe('ComparisonCoordinator', () => {
     };
     coordinator.seed(key, 'before\n');
     engine.queue([finalHunk], []);
-    await coordinator.externalChange(key, 'after\n');
+    await coordinator.provenChange(key, 'before\n', 'after\n', 'existing', provenance);
     const state = store.get(key)!;
     const reference: HunkReference = {
       key,
@@ -493,7 +624,8 @@ describe('ComparisonCoordinator', () => {
       hunks: [],
       comparisonActive: false,
       pending: false,
-      createdFile: false,
+      lifecycle: 'existing',
+      provenance: undefined,
     });
     expect(view.clear).toHaveBeenCalledWith(key);
   });
@@ -502,7 +634,7 @@ describe('ComparisonCoordinator', () => {
     const store = new SnapshotStore();
     const view = new FakeView();
     const coordinator = new ComparisonCoordinator(new LineDiffEngine(), store, view);
-    await coordinator.externalCreate(key, 'x\n');
+    await coordinator.provenChange(key, '', 'x\n', 'created', provenance);
     const state = store.get(key)!;
     const hunkReference: HunkReference = {
       key,
@@ -518,7 +650,8 @@ describe('ComparisonCoordinator', () => {
       hunks: [],
       comparisonActive: false,
       pending: false,
-      createdFile: false,
+      lifecycle: 'existing',
+      provenance: undefined,
     });
     expect(await coordinator.approveHunk(hunkReference)).toBe('stale');
   });
@@ -639,7 +772,7 @@ describe('ComparisonCoordinator', () => {
       modifiedLines: ['two'],
     };
     engine.queue([firstHunk, remainingHunk], reDiff.promise);
-    await coordinator.externalCreate(key, 'one\ntwo\n');
+    await coordinator.provenChange(key, '', 'one\ntwo\n', 'created', provenance);
     const state = store.get(key)!;
 
     const approval = coordinator.approveHunk({
@@ -648,13 +781,15 @@ describe('ComparisonCoordinator', () => {
       hunkIndex: 0,
       expectedText: state.currentText,
     });
-    expect(store.get(key)?.createdFile).toBe(true);
+    expect(store.get(key)?.lifecycle).toBe('created');
+    expect(store.get(key)?.provenance).toEqual(provenance);
     reDiff.resolve([remainingHunk]);
 
     await expect(approval).resolves.toBe('approved');
     expect(store.get(key)).toMatchObject({
       hunks: [remainingHunk],
-      createdFile: true,
+      lifecycle: 'created',
+      provenance,
     });
   });
 
@@ -671,7 +806,8 @@ describe('ComparisonCoordinator', () => {
       hunks: [],
       comparisonActive: false,
       pending: false,
-      createdFile: false,
+      lifecycle: 'existing',
+      provenance: undefined,
     });
     expect(view.clear).toHaveBeenCalledWith(key);
   });
@@ -720,7 +856,7 @@ describe('ComparisonCoordinator', () => {
       view.visible.add(key);
       engine.queue(result.promise);
       debouncer.schedule(key, 100, pending);
-      const run = coordinator.externalChange(key, 'new-result');
+      const run = coordinator.provenChange(key, 'baseline', 'new-result', 'existing', provenance);
 
       coordinator.dispose();
       vi.advanceTimersByTime(100);

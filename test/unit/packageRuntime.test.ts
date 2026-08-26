@@ -93,7 +93,13 @@ function reviewState(overrides: Partial<FileComparisonState> = {}): FileComparis
     sourceRevision: 9,
     comparisonActive: true,
     pending: true,
-    createdFile: false,
+    lifecycle: 'existing',
+    provenance: {
+      confidence: 'exact',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      itemIds: ['item-1'],
+    },
     ...overrides,
   };
 }
@@ -638,7 +644,7 @@ describe('packaged runtime', () => {
       });
 
       fake.setText('created\n');
-      await runtime.simulateExternalChange(fake.uri as never, '', 'created\n', true);
+      await runtime.simulateExternalChange(fake.uri as never, '', 'created\n', 'created');
       await settleRuntime();
 
       await fake.commands.get('codexExtensionHelper.rejectFile')!([{ resourceUri: fake.uri }]);

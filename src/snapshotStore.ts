@@ -4,12 +4,18 @@ export type { FileComparisonState } from './types';
 
 export class SnapshotStore {
   private readonly states = new Map<string, FileComparisonState>();
+  private readonly acceptedTexts = new Map<string, string>();
 
   get(key: string): FileComparisonState | undefined {
     return this.states.get(key);
   }
 
+  acceptedText(key: string): string | undefined {
+    return this.acceptedTexts.get(key);
+  }
+
   seed(key: string, text: string): void {
+    this.acceptedTexts.set(key, text);
     this.states.set(key, this.acceptedState(text));
   }
 
@@ -19,14 +25,25 @@ export class SnapshotStore {
 
   accept(key: string, text: string): void {
     const sourceRevision = this.states.get(key)?.sourceRevision;
+    this.acceptedTexts.set(key, text);
     this.states.set(key, this.acceptedState(text, sourceRevision === undefined ? 0 : sourceRevision + 1));
   }
 
+  setAcceptedText(key: string, text: string): void {
+    this.acceptedTexts.set(key, text);
+  }
+
+  deleteAcceptedText(key: string): void {
+    this.acceptedTexts.delete(key);
+  }
+
   delete(key: string): void {
+    this.acceptedTexts.delete(key);
     this.states.delete(key);
   }
 
   clear(): void {
+    this.acceptedTexts.clear();
     this.states.clear();
   }
 
@@ -38,7 +55,8 @@ export class SnapshotStore {
       sourceRevision,
       comparisonActive: false,
       pending: false,
-      createdFile: false,
+      lifecycle: 'existing',
+      provenance: undefined,
     };
   }
 }

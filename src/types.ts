@@ -1,5 +1,13 @@
 export type ChangeKind = 'addition' | 'deletion' | 'modification';
 export type EofTerminator = '' | '\n' | '\r\n';
+export type FileLifecycle = 'existing' | 'created' | 'deleted';
+
+export interface ExactCodexProvenance {
+  readonly confidence: 'exact';
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly itemIds: readonly string[];
+}
 
 export interface ChangeHunk {
   kind: ChangeKind;
@@ -27,7 +35,8 @@ export interface FileComparisonState {
   sourceRevision: number;
   comparisonActive: boolean;
   pending: boolean;
-  createdFile: boolean;
+  readonly lifecycle: FileLifecycle;
+  readonly provenance: ExactCodexProvenance | undefined;
 }
 
 export type ReviewStateResult =

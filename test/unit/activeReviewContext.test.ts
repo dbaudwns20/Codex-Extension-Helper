@@ -40,7 +40,13 @@ function state(overrides: Partial<FileComparisonState> = {}): FileComparisonStat
     sourceRevision: 2,
     comparisonActive: true,
     pending: true,
-    createdFile: false,
+    lifecycle: 'existing',
+    provenance: {
+      confidence: 'exact',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      itemIds: ['item-1'],
+    },
     ...overrides,
   };
 }

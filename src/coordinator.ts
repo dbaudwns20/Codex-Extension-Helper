@@ -1,7 +1,13 @@
 import { PerKeyDebouncer } from './changePolicy';
 import { applyApprovedHunk } from './reviewText';
 import { SnapshotStore } from './snapshotStore';
-import type { ChangeHunk, FileComparisonState, HunkReference } from './types';
+import type {
+  ChangeHunk,
+  ExactCodexProvenance,
+  FileComparisonState,
+  FileLifecycle,
+  HunkReference,
+} from './types';
 
 interface CoordinatorDiffEngine {
   compute(
@@ -36,16 +42,7 @@ export class ComparisonCoordinator {
       return;
     }
 
-    this.debouncer.cancel(key);
-    this.snapshots.setComparison(key, {
-      baselineText: text,
-      currentText: text,
-      hunks: [],
-      sourceRevision: this.nextRevision(key),
-      comparisonActive: false,
-      pending: false,
-      createdFile: false,
-    });
+    this.acceptExternalStateNow(key, text);
   }
 
   async externalChange(
@@ -75,6 +72,7 @@ export class ComparisonCoordinator {
     }
 
     this.debouncer.cancel(key);
+    this.snapshots.deleteAcceptedText(key);
     this.snapshots.setComparison(key, {
       baselineText: '',
       currentText: '',
@@ -82,9 +80,91 @@ export class ComparisonCoordinator {
       sourceRevision: this.nextRevision(key),
       comparisonActive: false,
       pending: false,
-      createdFile: true,
+      lifecycle: 'created',
+      provenance: undefined,
     });
     await this.compare(key, text, isCurrent);
+  }
+
+  async provenChange(
+    key: string,
+    beforeText: string,
+    afterText: string,
+    lifecycle: FileLifecycle,
+    provenance: ExactCodexProvenance,
+  ): Promise<void> {
+    if (this.disposed || !this.provenTransitionMatchesAcceptedState(
+      key,
+      beforeText,
+      afterText,
+      lifecycle,
+    )) {
+      return;
+    }
+
+    this.debouncer.cancel(key);
+    const sourceRevision = this.nextRevision(key);
+    const exactProvenance = this.immutableProvenance(provenance);
+    const baselineText = lifecycle === 'created' ? '' : beforeText;
+    const currentText = lifecycle === 'deleted' ? '' : afterText;
+    this.snapshots.setComparison(key, {
+      baselineText,
+      currentText,
+      hunks: [],
+      sourceRevision,
+      comparisonActive: false,
+      pending: false,
+      lifecycle,
+      provenance: exactProvenance,
+    });
+
+    const hunks = await this.diffEngine.compute(baselineText, currentText);
+    const current = this.snapshots.get(key);
+    if (
+      this.disposed
+      || current?.sourceRevision !== sourceRevision
+      || current.baselineText !== baselineText
+      || current.currentText !== currentText
+      || current.lifecycle !== lifecycle
+      || current.provenance !== exactProvenance
+    ) {
+      return;
+    }
+
+    if (hunks.length === 0) {
+      this.snapshots.setAcceptedText(key, currentText);
+      this.snapshots.setComparison(key, this.inactiveExistingState(currentText, sourceRevision));
+      this.view.clear(key);
+      return;
+    }
+
+    this.snapshots.setComparison(key, {
+      ...current,
+      hunks,
+      comparisonActive: true,
+      pending: true,
+    });
+    await this.view.render(key, hunks);
+    const rendered = this.snapshots.get(key);
+    if (
+      this.disposed
+      || rendered?.sourceRevision !== sourceRevision
+      || rendered.baselineText !== baselineText
+      || rendered.currentText !== currentText
+      || rendered.hunks !== hunks
+      || rendered.lifecycle !== lifecycle
+      || rendered.provenance !== exactProvenance
+    ) {
+      await this.synchronizeView(key);
+    }
+  }
+
+  async acceptExternalState(key: string, currentText: string | undefined): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
+
+    this.acceptExternalStateNow(key, currentText);
   }
 
   async documentEdit(
@@ -118,17 +198,7 @@ export class ComparisonCoordinator {
       return;
     }
 
-    this.debouncer.cancel(key);
-    this.snapshots.setComparison(key, {
-      baselineText: text,
-      currentText: text,
-      hunks: [],
-      sourceRevision: this.nextRevision(key),
-      comparisonActive: false,
-      pending: false,
-      createdFile: false,
-    });
-    this.view.clear(key);
+    this.acceptExternalStateNow(key, text);
   }
 
   state(key: string): FileComparisonState | undefined {
@@ -164,13 +234,13 @@ export class ComparisonCoordinator {
     const baselineText = applyApprovedHunk(resolved.state.baselineText, resolved.hunk);
     const sourceRevision = this.nextRevision(reference.key);
     const currentText = resolved.state.currentText;
+    this.snapshots.setAcceptedText(reference.key, baselineText);
     this.snapshots.setComparison(reference.key, {
       ...resolved.state,
       baselineText,
       hunks: [],
       sourceRevision,
       pending: true,
-      createdFile: resolved.state.createdFile,
     });
 
     const hunks = await this.diffEngine.compute(baselineText, currentText);
@@ -185,15 +255,11 @@ export class ComparisonCoordinator {
     }
 
     if (hunks.length === 0) {
-      this.snapshots.setComparison(reference.key, {
-        baselineText: currentText,
-        currentText,
-        hunks: [],
-        sourceRevision,
-        comparisonActive: false,
-        pending: false,
-        createdFile: false,
-      });
+      this.snapshots.setAcceptedText(reference.key, currentText);
+      this.snapshots.setComparison(
+        reference.key,
+        this.inactiveExistingState(currentText, sourceRevision),
+      );
       this.view.clear(reference.key);
       return 'approved';
     }
@@ -203,7 +269,6 @@ export class ComparisonCoordinator {
       hunks,
       comparisonActive: true,
       pending: true,
-      createdFile: resolved.state.createdFile,
     });
     await this.view.render(reference.key, hunks);
     const rendered = this.snapshots.get(reference.key);
@@ -229,15 +294,9 @@ export class ComparisonCoordinator {
       return 'stale';
     }
 
-    this.snapshots.setComparison(key, {
-      baselineText: expectedText,
-      currentText: expectedText,
-      hunks: [],
-      sourceRevision: this.nextRevision(key),
-      comparisonActive: false,
-      pending: false,
-      createdFile: false,
-    });
+    const sourceRevision = this.nextRevision(key);
+    this.snapshots.setAcceptedText(key, expectedText);
+    this.snapshots.setComparison(key, this.inactiveExistingState(expectedText, sourceRevision));
     this.view.clear(key);
     return 'approved';
   }
@@ -247,10 +306,7 @@ export class ComparisonCoordinator {
       return;
     }
 
-    this.debouncer.cancel(key);
-    this.nextRevision(key);
-    this.snapshots.delete(key);
-    this.view.clear(key);
+    this.acceptExternalStateNow(key, undefined);
   }
 
   async show(
@@ -304,7 +360,10 @@ export class ComparisonCoordinator {
     isCurrent: ComparisonApplicability,
   ): Promise<void> {
     const state = this.snapshots.get(key);
-    if (state === undefined || !isCurrent()) {
+    if (
+      state === undefined
+      || !isCurrent()
+    ) {
       return;
     }
 
@@ -327,19 +386,71 @@ export class ComparisonCoordinator {
     }
 
     const comparisonActive = current.comparisonActive || hunks.length > 0;
-    this.snapshots.setComparison(key, {
-      ...current,
-      hunks,
-      comparisonActive,
-      pending: hunks.length > 0,
-      createdFile: hunks.length > 0 ? current.createdFile : false,
-    });
     if (hunks.length === 0) {
+      this.snapshots.setAcceptedText(key, text);
+      this.snapshots.setComparison(key, this.inactiveExistingState(text, sourceRevision));
       this.view.clear(key);
       return;
     }
 
+    this.snapshots.setComparison(key, {
+      ...current,
+      hunks,
+      comparisonActive,
+      pending: true,
+    });
+
     await this.view.render(key, hunks);
+  }
+
+  private acceptExternalStateNow(key: string, currentText: string | undefined): void {
+    this.debouncer.cancel(key);
+    const sourceRevision = this.nextRevision(key);
+    if (currentText === undefined) {
+      this.snapshots.delete(key);
+    } else {
+      this.snapshots.setAcceptedText(key, currentText);
+      this.snapshots.setComparison(key, this.inactiveExistingState(currentText, sourceRevision));
+    }
+    this.view.clear(key);
+  }
+
+  private provenTransitionMatchesAcceptedState(
+    key: string,
+    beforeText: string,
+    afterText: string,
+    lifecycle: FileLifecycle,
+  ): boolean {
+    const acceptedText = this.snapshots.acceptedText(key);
+    if (lifecycle === 'created') {
+      return acceptedText === undefined && beforeText === '';
+    }
+    if (acceptedText === undefined || acceptedText !== beforeText) {
+      return false;
+    }
+    return lifecycle !== 'deleted' || afterText === '';
+  }
+
+  private inactiveExistingState(text: string, sourceRevision: number): FileComparisonState {
+    return {
+      baselineText: text,
+      currentText: text,
+      hunks: [],
+      sourceRevision,
+      comparisonActive: false,
+      pending: false,
+      lifecycle: 'existing',
+      provenance: undefined,
+    };
+  }
+
+  private immutableProvenance(provenance: ExactCodexProvenance): ExactCodexProvenance {
+    return Object.freeze({
+      confidence: provenance.confidence,
+      threadId: provenance.threadId,
+      turnId: provenance.turnId,
+      itemIds: Object.freeze([...provenance.itemIds]),
+    });
   }
 
   private async synchronizeView(key: string): Promise<void> {

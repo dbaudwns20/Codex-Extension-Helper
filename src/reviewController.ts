@@ -101,7 +101,7 @@ export class ReviewController implements vscode.Disposable {
         return;
       }
 
-      if (current.state.createdFile) {
+      if (current.state.lifecycle === 'created') {
         try {
           await this.host.deleteToTrash(current.document.uri);
         } catch (error) {
@@ -208,7 +208,7 @@ export class ReviewController implements vscode.Disposable {
         return;
       }
 
-      if (current.state.createdFile) {
+      if (current.state.lifecycle === 'created') {
         try {
           await this.host.deleteToTrash(current.document.uri);
         } catch (error) {
@@ -263,7 +263,7 @@ export class ReviewController implements vscode.Disposable {
         return;
       }
 
-      if (current.state.createdFile) {
+      if (current.state.lifecycle === 'created') {
         try {
           await this.host.deleteToTrash(uri);
         } catch (error) {

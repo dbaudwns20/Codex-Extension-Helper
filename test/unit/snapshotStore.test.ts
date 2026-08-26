@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { SnapshotStore } from '../../src/snapshotStore';
 
+const provenance = {
+  confidence: 'exact' as const,
+  threadId: 'thread-1',
+  turnId: 'turn-1',
+  itemIds: ['item-1'],
+};
+
 describe('SnapshotStore', () => {
   it('keeps baselines independent for separate URI keys', () => {
     const store = new SnapshotStore();
@@ -9,6 +16,8 @@ describe('SnapshotStore', () => {
 
     expect(store.get('file:///workspace/first.ts')?.baselineText).toBe('first');
     expect(store.get('file:///workspace/second.ts')?.baselineText).toBe('second');
+    expect(store.acceptedText('file:///workspace/first.ts')).toBe('first');
+    expect(store.acceptedText('file:///workspace/second.ts')).toBe('second');
   });
 
   it('persists a comparison state for a key', () => {
@@ -20,15 +29,17 @@ describe('SnapshotStore', () => {
       sourceRevision: 4,
       comparisonActive: true,
       pending: true,
-      createdFile: false,
+      lifecycle: 'existing' as const,
+      provenance,
     };
 
     store.setComparison('file:///workspace/file.ts', state);
 
     expect(store.get('file:///workspace/file.ts')).toEqual(state);
+    expect(store.acceptedText('file:///workspace/file.ts')).toBeUndefined();
   });
 
-  it('preserves the created-file origin on an explicit comparison state', () => {
+  it('preserves lifecycle and exact provenance on an explicit comparison state', () => {
     const store = new SnapshotStore();
     const state = {
       baselineText: '',
@@ -37,7 +48,8 @@ describe('SnapshotStore', () => {
       sourceRevision: 4,
       comparisonActive: true,
       pending: true,
-      createdFile: true,
+      lifecycle: 'created' as const,
+      provenance,
     };
 
     store.setComparison('file:///workspace/file.ts', state);
@@ -63,27 +75,30 @@ describe('SnapshotStore', () => {
       sourceRevision: 4,
       comparisonActive: true,
       pending: true,
-      createdFile: false,
+      lifecycle: 'existing',
+      provenance,
     });
 
     store.accept(key, 'saved');
 
+    expect(store.acceptedText(key)).toBe('saved');
     expect(store.get(key)).toMatchObject({
       baselineText: 'saved',
       currentText: 'saved',
       hunks: [],
       comparisonActive: false,
       pending: false,
-      createdFile: false,
+      lifecycle: 'existing',
+      provenance: undefined,
     });
   });
 
-  it('marks seeded and accepted states as non-created files', () => {
+  it('marks seeded and accepted states as clean existing files without provenance', () => {
     const store = new SnapshotStore();
     const key = 'file:///workspace/file.ts';
 
     store.seed(key, 'seeded');
-    expect(store.get(key)).toMatchObject({ createdFile: false });
+    expect(store.get(key)).toMatchObject({ lifecycle: 'existing', provenance: undefined });
 
     store.accept(key, 'accepted');
     expect(store.get(key)).toMatchObject({
@@ -92,7 +107,8 @@ describe('SnapshotStore', () => {
       hunks: [],
       comparisonActive: false,
       pending: false,
-      createdFile: false,
+      lifecycle: 'existing',
+      provenance: undefined,
     });
   });
 
@@ -105,6 +121,7 @@ describe('SnapshotStore', () => {
 
     store.delete(first);
     expect(store.get(first)).toBeUndefined();
+    expect(store.acceptedText(first)).toBeUndefined();
     expect(store.get(second)).toBeDefined();
 
     store.clear();
