@@ -57,6 +57,9 @@ describe('parseCodexProvenanceNotification', () => {
     expect(parseCodexProvenanceNotification(patchUpdated({
       changes: [{ ...change, kind: { type: 'update', move_path: 3 } }],
     }))).toBeUndefined();
+    expect(parseCodexProvenanceNotification(patchUpdated({
+      changes: [{ ...change, kind: { type: 'rename' } }],
+    }))).toBeUndefined();
   });
 
   it('rejects too many changes and oversized UTF-8 diffs', () => {

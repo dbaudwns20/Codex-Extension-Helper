@@ -34,3 +34,11 @@ The parser uses plain-object guards, exact method/status/kind checks, non-empty 
 ## Concerns
 
 The parser intentionally leaves workspace containment to the runtime gate. The local installed bundle confirms `item/fileChange/patchUpdated` support, but no generated schema was available to expand the interruption status set beyond `interrupted`.
+
+## Fix round 1
+
+Addressed the review finding by adding regression coverage for an unknown change kind (`{ type: 'rename' }`). The requested minor status-assertion suggestion was intentionally deferred per review direction.
+
+Command: `npx vitest run test/unit/codexProvenanceProtocol.test.ts`
+
+Output: 1 test file passed; 5 tests passed; exit code 0.
