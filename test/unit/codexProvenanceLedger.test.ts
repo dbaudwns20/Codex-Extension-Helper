@@ -374,6 +374,27 @@ describe('CodexProvenanceLedger', () => {
     expect(ledger.completedTransitions(resolveAcceptedPath)).toEqual([]);
   });
 
+  it('does not advance a completed cleanup watermark when an unrelated item later expires', () => {
+    let now = 1_000;
+    const ledger = new CodexProvenanceLedger(100, () => now);
+    const resolveAcceptedPath = (path: string): ProvenanceFileState | undefined => (
+      path === 'unresolved.txt' ? undefined : state('file.txt', true, 'old\n')
+    );
+    ledger.record(completed([update('file.txt', 'different', 'final')], 'blocker'));
+    expect(ledger.completedTransitions(resolveAcceptedPath)).toEqual([]);
+
+    now = 1_050;
+    ledger.record(completed([update('unresolved.txt', 'old', 'other')], 'unrelated'));
+    ledger.prune(1_100);
+
+    now = 1_101;
+    ledger.record(completed([update('file.txt', 'old', 'new')], 'fresh'));
+    expect(ledger.completedTransitions(resolveAcceptedPath)[0].provenance.itemIds).toEqual(['fresh']);
+
+    ledger.prune(1_150);
+    expect(ledger.completedTransitions(resolveAcceptedPath)[0].provenance.itemIds).toEqual(['fresh']);
+  });
+
   it('combines raw-path aliases by normalized URI and rejects their conflicting chain', () => {
     const ledger = new CodexProvenanceLedger();
     ledger.record(completed([update('SRC/file.txt', 'old', 'new')], 'first'));

@@ -59,6 +59,7 @@ interface InvalidatedGeneration {
   readonly evidence: Set<string>;
   readonly itemKeys: Set<string>;
   cleanupWatermark: number;
+  cleanupComplete: boolean;
 }
 
 const DEFAULT_RETENTION_MS = 5 * 60 * 1_000;
@@ -313,11 +314,13 @@ export class CodexProvenanceLedger {
     }
     if (changed) {
       for (const generation of this.invalidatedGenerations.values()) {
-        if (![...generation.itemKeys].some((key) => this.items.has(key))) {
+        if (!generation.cleanupComplete
+          && ![...generation.itemKeys].some((key) => this.items.has(key))) {
           generation.cleanupWatermark = Math.max(
             generation.cleanupWatermark,
             this.latestRecordOrder,
           );
+          generation.cleanupComplete = true;
         }
       }
       this.evidenceByNormalizedKey.clear();
@@ -339,9 +342,11 @@ export class CodexProvenanceLedger {
       evidence: new Set<string>(),
       itemKeys: new Set<string>(),
       cleanupWatermark: 0,
+      cleanupComplete: false,
     };
     for (const itemKey of itemKeys) generation.itemKeys.add(itemKey);
     for (const value of evidence) generation.evidence.add(value);
+    generation.cleanupComplete = false;
     this.retireEvidence(generation.evidence);
     this.invalidatedGenerations.set(key, generation);
   }
@@ -361,7 +366,7 @@ export class CodexProvenanceLedger {
     }
 
     const generationHasLiveItems = [...generation.itemKeys].some((itemKey) => this.items.has(itemKey));
-    if (generationHasLiveItems) {
+    if (!generation.cleanupComplete || generationHasLiveItems) {
       generation.itemKeys.add(item.key);
       generation.evidence.add(evidence);
       this.retiredEvidence.add(evidence);
