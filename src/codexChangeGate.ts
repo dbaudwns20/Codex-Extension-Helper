@@ -44,6 +44,11 @@ interface EligibleTransition {
   readonly expiresAt: number;
 }
 
+interface NotificationKeyResolution {
+  readonly relevantKeys: Set<string>;
+  readonly rejectedKeys: Set<string>;
+}
+
 const DEFAULT_QUARANTINE_MS = 1_000;
 const DEFAULT_TRANSITION_LIFETIME_MS = 5_000;
 const DEFAULT_MAX_PENDING_CANDIDATES = 256;
@@ -145,10 +150,14 @@ export class CodexChangeGate implements vscode.Disposable {
       }
       const previouslyEligible = new Set(this.eligibleTransitions.keys());
       this.ledger.record(notification);
-      const relevantKeys = this.resolveRelevantKeys(notification);
+      const resolution = this.resolveNotificationKeys(notification);
       this.refreshEligibleTransitions(this.now());
+      for (const key of resolution.rejectedKeys) {
+        this.eligibleTransitions.delete(key);
+        this.ledger.invalidate(key);
+      }
 
-      for (const key of relevantKeys) {
+      for (const key of resolution.relevantKeys) {
         const terminal = notification.method === 'item/completed';
         const becameIneligible = previouslyEligible.has(key)
           && !this.eligibleTransitions.has(key);
@@ -231,14 +240,23 @@ export class CodexChangeGate implements vscode.Disposable {
     return result;
   }
 
-  private resolveRelevantKeys(notification: CodexProvenanceNotification): Set<string> {
-    const keys = new Set<string>();
+  private resolveNotificationKeys(
+    notification: CodexProvenanceNotification,
+  ): NotificationKeyResolution {
+    const relevantKeys = new Set<string>();
+    const rejectedKeys = new Set<string>();
     for (const change of changesOf(notification)) {
-      const uri = this.options.resolveWorkspacePath(change.path)
-        ?? this.options.resolveAcceptedPath(change.path)?.uri;
-      if (uri !== undefined) keys.add(uri.toString());
+      const workspaceKey = this.options.resolveWorkspacePath(change.path)?.toString();
+      const acceptedKey = this.options.resolveAcceptedPath(change.path)?.uri.toString();
+      if (workspaceKey !== undefined) relevantKeys.add(workspaceKey);
+      if (acceptedKey !== undefined) relevantKeys.add(acceptedKey);
+      if (workspaceKey === undefined || acceptedKey === undefined
+        || workspaceKey !== acceptedKey) {
+        if (workspaceKey !== undefined) rejectedKeys.add(workspaceKey);
+        if (acceptedKey !== undefined) rejectedKeys.add(acceptedKey);
+      }
     }
-    return keys;
+    return { relevantKeys, rejectedKeys };
   }
 
   private refreshEligibleTransitions(now: number): void {

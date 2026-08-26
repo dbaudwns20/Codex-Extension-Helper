@@ -136,6 +136,125 @@ function setup(
 }
 
 describe('CodexChangeGate', () => {
+  it.each(['notification-first', 'candidate-first'] as const)(
+    'fails closed for workspace/accepted key disagreement in %s order',
+    async (order) => {
+      const workspaceCandidate = present('workspace-a.txt', 'new\n');
+      const acceptedCandidate = present('accepted-b.txt', 'new\n');
+      const acceptedState: ProvenanceFileState = {
+        uri: acceptedCandidate.uri,
+        exists: true,
+        text: 'old\n',
+      };
+      let workspaceUri: vscode.Uri | undefined = workspaceCandidate.uri;
+      const { clock, gate, proven, unproven, flush } = setup({
+        'file.txt': acceptedState,
+      }, {
+        resolveWorkspacePath: () => workspaceUri,
+      });
+      const notification = completed([update('file.txt', 'old', 'new')]);
+
+      if (order === 'candidate-first') {
+        await gate.handleCandidate(workspaceCandidate);
+        await gate.handleCandidate(acceptedCandidate);
+      }
+      await gate.handleNotification(notification);
+      if (order === 'notification-first') {
+        await gate.handleCandidate(workspaceCandidate);
+        await gate.handleCandidate(acceptedCandidate);
+      }
+
+      expect(proven).toEqual([]);
+      if (order === 'candidate-first') {
+        expect(unproven).toEqual([workspaceCandidate, acceptedCandidate]);
+      } else {
+        expect(unproven).toEqual([]);
+      }
+
+      workspaceUri = acceptedState.uri;
+      const laterCandidate = order === 'candidate-first'
+        ? present('accepted-b.txt', 'new\n')
+        : acceptedCandidate;
+      if (order === 'candidate-first') await gate.handleCandidate(laterCandidate);
+      await gate.handleNotification(notification);
+      clock.advance(100);
+      await flush();
+
+      expect(proven).toEqual([]);
+      for (const candidate of [workspaceCandidate, acceptedCandidate, laterCandidate]) {
+        expect(unproven.filter((value) => value === candidate)).toHaveLength(1);
+      }
+    },
+  );
+
+  it.each(['notification-first', 'candidate-first'] as const)(
+    'fails closed when workspace resolution is absent in %s order',
+    async (order) => {
+      const acceptedCandidate = present('accepted-b.txt', 'new\n');
+      const acceptedState: ProvenanceFileState = {
+        uri: acceptedCandidate.uri,
+        exists: true,
+        text: 'old\n',
+      };
+      let workspaceUri: vscode.Uri | undefined;
+      const { gate, proven, unproven } = setup({
+        'file.txt': acceptedState,
+      }, {
+        resolveWorkspacePath: () => workspaceUri,
+      });
+      const notification = completed([update('file.txt', 'old', 'new')]);
+
+      if (order === 'candidate-first') await gate.handleCandidate(acceptedCandidate);
+      await gate.handleNotification(notification);
+      if (order === 'notification-first') await gate.handleCandidate(acceptedCandidate);
+
+      expect(proven).toEqual([]);
+      expect(unproven).toEqual(order === 'candidate-first' ? [acceptedCandidate] : []);
+
+      workspaceUri = acceptedState.uri;
+      const laterCandidate = order === 'candidate-first'
+        ? present('accepted-b.txt', 'new\n')
+        : acceptedCandidate;
+      if (order === 'candidate-first') await gate.handleCandidate(laterCandidate);
+      await gate.handleNotification(notification);
+
+      expect(proven).toEqual([]);
+      expect(unproven.filter((value) => value === acceptedCandidate)).toHaveLength(1);
+      expect(unproven.filter((value) => value === laterCandidate)).toHaveLength(1);
+    },
+  );
+
+  it('invalidates prior evidence under the workspace side of a disagreement', async () => {
+    const workspaceCandidate = present('workspace-a.txt', 'new\n');
+    const workspaceState: ProvenanceFileState = {
+      uri: workspaceCandidate.uri,
+      exists: true,
+      text: 'old-a\n',
+    };
+    const acceptedState = state('accepted-b.txt', true, 'old\n');
+    const { clock, gate, proven, unproven, flush } = setup({
+      'workspace.txt': workspaceState,
+      'file.txt': acceptedState,
+    }, {
+      resolveWorkspacePath: (path) => (
+        path === 'workspace.txt' ? workspaceState.uri : workspaceCandidate.uri
+      ),
+    });
+
+    await gate.handleNotification(completed([
+      update('workspace.txt', 'old-a', 'new'),
+    ], 'workspace-item'));
+    await gate.handleNotification(completed([
+      update('file.txt', 'old', 'new'),
+    ], 'disagreement-item'));
+    await gate.handleCandidate(workspaceCandidate);
+    clock.advance(100);
+    await flush();
+
+    expect(proven).toEqual([]);
+    expect(unproven).toEqual([workspaceCandidate]);
+  });
+
   it('proves an exact post-image when completion arrives before the watcher candidate', async () => {
     const change = update('file.txt', 'old', 'new');
     const { gate, proven, unproven } = setup({
