@@ -391,7 +391,7 @@ describe('packaged runtime', () => {
     }
   });
 
-  it('keeps externally saved source clean while rendering a replacement diff', async () => {
+  it('installs a temporary deleted row while rendering a replacement diff', async () => {
     vi.useFakeTimers();
     try {
       const modified = 'new line\nkeep\n';
@@ -412,8 +412,8 @@ describe('packaged runtime', () => {
       await settleRuntime();
 
       expect(runtime.renderedComparisonCount).toBe(1);
-      expect(fake.currentText()).toBe(modified);
-      expect(fake.document.isDirty).toBe(false);
+      expect(fake.currentText()).toBe(`\n${modified}`);
+      expect(fake.document.isDirty).toBe(true);
 
       runtime.dispose();
     } finally {
@@ -991,11 +991,45 @@ describe('stable review runtime boundaries', () => {
     const resource = { toString: () => key };
     const state = reviewState();
     const activeState = reviewState({ sourceRevision: 11 });
+    const presentation = {
+      key,
+      canonicalText: state.currentText,
+      displayText: '\nlive document\n',
+      documentVersion: 5,
+      revision: 1,
+      plan: {
+        canonicalText: state.currentText,
+        displayText: '\nlive document\n',
+        eol: '\n',
+        insertions: [{ offset: 0, length: 0, text: '\n' }],
+        spans: [{
+          displayStart: 0,
+          displayEnd: 1,
+          text: '\n',
+          hunkIndex: 0,
+          originalLineIndex: 0,
+          displayLine: 0,
+        }],
+        hunks: [{
+          hunkIndex: 0,
+          actionLine: 0,
+          removedRows: [{ line: 0, text: 'before' }],
+          modifiedStart: 1,
+          modifiedEnd: 2,
+        }],
+        displayLineForCanonical: vi.fn((line: number) => line + 1),
+      },
+    };
     const views = {
       renderer: { render: vi.fn().mockResolvedValue(undefined), clear: vi.fn() },
       deletedLines: { update: vi.fn(), clear: vi.fn() },
       quickDiff: { update: vi.fn(), clear: vi.fn() },
       activeContext: { update: vi.fn().mockResolvedValue(undefined) },
+      spacers: {
+        install: vi.fn().mockResolvedValue(presentation),
+        presentation: vi.fn(),
+        clear: vi.fn(),
+      },
     };
 
     await synchronizeReviewViews({
@@ -1007,13 +1041,18 @@ describe('stable review runtime boundaries', () => {
       views,
     });
 
-    expect(views.renderer.render).toHaveBeenCalledWith(key, state.hunks, undefined);
+    expect(views.spacers.install).toHaveBeenCalledWith({
+      key,
+      canonicalText: state.currentText,
+      hunks: state.hunks,
+    });
+    expect(views.renderer.render).toHaveBeenCalledWith(key, state.hunks, presentation);
     expect(views.deletedLines.update).toHaveBeenCalledWith({
       key,
       sourceRevision: 9,
       currentText: 'live document\n',
       hunks: state.hunks,
-      actionLines: undefined,
+      actionLines: [0],
     });
     expect(views.quickDiff.update).toHaveBeenCalledWith(
       key,
@@ -1200,6 +1239,7 @@ describe('stable review runtime boundaries', () => {
 
       expect(render).toHaveBeenCalledTimes(2);
       expect(fake.editor.setDecorations).toHaveBeenCalledTimes(9);
+      expect(fake.currentText()).toBe('ONE\nkeep\n\nTWO\n');
       expect(fake.quickDiffBaseline()).toBe('ONE\nkeep\ntwo\n');
 
       fake.workspace.applyEdit.mockClear();
@@ -1220,6 +1260,47 @@ describe('stable review runtime boundaries', () => {
       expect(runtime.renderedComparisonCount).toBe(0);
 
       render.mockRestore();
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reinstalls remaining deleted rows after a partial rejection', async () => {
+    vi.useFakeTimers();
+    try {
+      const baseline = 'one\nkeep\ntwo\nkeep again\nthree\n';
+      const modified = 'ONE\nkeep\nTWO\nkeep again\nTHREE\n';
+      const fake = installRuntimeVscode(baseline);
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+
+      fake.setText(modified);
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      const rejectLenses = fake.codeLenses().filter(
+        (lens) => lens.command?.command === 'codexExtensionHelper.rejectHunk',
+      );
+      expect(rejectLenses).toHaveLength(3);
+      await fake.commands.get('codexExtensionHelper.rejectHunk')!(
+        ...rejectLenses[0].command!.arguments!,
+      );
+      await settleRuntime();
+
+      expect(fake.currentText()).toBe('one\nkeep\n\nTWO\nkeep again\n\nTHREE\n');
+      expect(fake.codeLenses().filter(
+        (lens) => lens.command?.command === 'codexExtensionHelper.rejectHunk',
+      )).toHaveLength(2);
+
       runtime.dispose();
     } finally {
       vi.useRealTimers();

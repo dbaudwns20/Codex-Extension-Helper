@@ -102,6 +102,14 @@ export class DeletedLinesCodeLensProvider implements vscode.CodeLensProvider, vs
       const range = new this.api.Range(line, character, line, character);
       const lenses: vscode.CodeLens[] = [];
 
+      if (state.actionLines === undefined && hunk.originalLines.length > 0) {
+        lenses.push(new this.api.CodeLens(range, {
+          title: this.title(hunk.originalLines),
+          command: OPEN_DIFF_COMMAND,
+          tooltip: this.tooltip(hunk.originalLines),
+        }));
+      }
+
       const reference: HunkReference = {
         key: state.key,
         sourceRevision: state.sourceRevision,

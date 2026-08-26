@@ -411,13 +411,18 @@ export async function synchronizeReviewViews({
   const pending: PromiseLike<void>[] = [];
   if (key !== undefined) {
     if (state !== undefined && state.hunks.length > 0) {
-      pending.push(views.renderer.render(key, state.hunks, undefined));
+      const presentation = await views.spacers?.install({
+        key,
+        canonicalText: state.currentText,
+        hunks: state.hunks,
+      });
+      pending.push(views.renderer.render(key, state.hunks, presentation));
       views.deletedLines.update({
         key,
         sourceRevision: state.sourceRevision,
         currentText: state.currentText,
         hunks: state.hunks,
-        actionLines: undefined,
+        actionLines: presentation?.plan.hunks.map((hunk) => hunk.actionLine),
       });
       if (resource === undefined) {
         views.quickDiff.clear(key);
@@ -797,6 +802,15 @@ export class ExtensionRuntime implements vscode.Disposable {
       resultingText: event.document.getText(),
       contentChanges,
     });
+    if (isReviewEdit) {
+      this.spacers.authorizeDirtyInstall({
+        key,
+        text: event.document.getText(),
+        version: event.document.version,
+        isDirty: event.document.isDirty,
+        eol: event.document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n',
+      });
+    }
     if (
       !isReviewEdit
       && !shouldInvalidateDocumentChange(event.contentChanges.length, event.document.isDirty)

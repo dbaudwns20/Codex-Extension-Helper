@@ -126,7 +126,7 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
         );
         editor.setDecorations(
           this.removedOverlayDecorationType,
-          presentation === undefined ? this.deletedLineDecorations(editor, hunks) : [],
+          [],
         );
       }
       if (views.length > 0) {
@@ -190,45 +190,16 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
   private deletedSpacerRows(
     presentation: InstalledSpacerPresentation,
   ): vscode.DecorationOptions[] {
-    return presentation.plan.hunks.flatMap((mapping) => mapping.removedRows.map((row, rowIndex) => ({
+    return presentation.plan.hunks.flatMap((mapping) => mapping.removedRows.map((row) => ({
       range: new this.api.Range(row.line, 0, row.line, 0),
       renderOptions: {
         after: {
-          contentText: row.text + (rowIndex === mapping.removedRows.length - 1 ? '\n' : ''),
+          contentText: row.text,
           color: new this.api.ThemeColor('editor.foreground'),
           textDecoration: 'none; white-space: pre;',
         },
       },
     })));
-  }
-
-  private deletedLineDecorations(
-    editor: vscode.TextEditor,
-    hunks: readonly ChangeHunk[],
-  ): vscode.DecorationOptions[] {
-    const finalLine = Math.max(0, editor.document.lineCount - 1);
-    return hunks.flatMap((hunk) => {
-      if (hunk.originalLines.length === 0) {
-        return [];
-      }
-
-      const atEndOfFile = hunk.modifiedStart >= editor.document.lineCount;
-      const anchorLine = Math.min(Math.max(0, hunk.modifiedStart), finalLine);
-      const anchorCharacter = atEndOfFile
-        ? editor.document.lineAt(anchorLine).range.end.character
-        : 0;
-      const attachment: vscode.ThemableDecorationAttachmentRenderOptions = {
-        contentText: `${hunk.originalLines.join('\n')}\n`,
-        color: new this.api.ThemeColor('editor.foreground'),
-        backgroundColor: new this.api.ThemeColor('diffEditor.removedTextBackground'),
-        textDecoration: 'none; display: block; width: 100%; box-sizing: border-box; white-space: pre;',
-      };
-
-      return [{
-        range: new this.api.Range(anchorLine, anchorCharacter, anchorLine, anchorCharacter),
-        renderOptions: atEndOfFile ? { after: attachment } : { before: attachment },
-      }];
-    });
   }
 
   private isNormalTextEditor(editor: vscode.TextEditor): boolean {

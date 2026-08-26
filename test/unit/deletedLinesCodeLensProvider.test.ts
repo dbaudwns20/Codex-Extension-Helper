@@ -101,13 +101,13 @@ describe('DeletedLinesCodeLensProvider', () => {
     expect(lenses[0].command?.arguments?.[0]).toBe(lenses[1].command?.arguments?.[0]);
   });
 
-  it('places approve and reject at the configured spacer action line', () => {
+  it('shows only review actions when deleted content has a spacer row', () => {
     const { provider } = createProvider();
     provider.update(state({ hunks: [hunk({
       kind: 'modification',
       modifiedStart: 2,
-      originalLines: ['const value = 1;'],
-      modifiedLines: ['const value = 2;'],
+      originalLines: ['"version": "0.0.2",'],
+      modifiedLines: ['"version": "0.0.3",'],
     })], actionLines: [3] }));
 
     const lenses = provide(provider);
@@ -115,6 +115,10 @@ describe('DeletedLinesCodeLensProvider', () => {
     expect(lenses.map((lens) => lens.command?.command)).toEqual([
       'codexExtensionHelper.approveHunk',
       'codexExtensionHelper.rejectHunk',
+    ]);
+    expect(lenses.map((lens) => lens.command?.title)).toEqual([
+      '$(check) Approve',
+      '$(close) Reject',
     ]);
     expect(lenses.map((lens) => lens.range)).toEqual([
       new FakeRange(3, 6, 3, 6),
@@ -126,6 +130,7 @@ describe('DeletedLinesCodeLensProvider', () => {
       hunkIndex: 0,
       expectedText: 'new\n',
     }]);
+    expect(lenses[1].command?.arguments).toEqual(lenses[0].command?.arguments);
   });
 
   it('preserves hunk order and uses each hunk index in action references', () => {
@@ -140,18 +145,20 @@ describe('DeletedLinesCodeLensProvider', () => {
     expect(lenses.map((lens) => lens.command?.command)).toEqual([
       'codexExtensionHelper.approveHunk',
       'codexExtensionHelper.rejectHunk',
+      'codexExtensionHelper.openDiff',
       'codexExtensionHelper.approveHunk',
       'codexExtensionHelper.rejectHunk',
     ]);
     expect(lenses[0].command?.arguments).toEqual([expect.objectContaining({ hunkIndex: 0 })]);
     expect(lenses[1].command?.arguments).toEqual(lenses[0].command?.arguments);
-    expect(lenses[2].command?.arguments).toEqual([expect.objectContaining({
+    expect(lenses[2].command?.arguments).toBeUndefined();
+    expect(lenses[3].command?.arguments).toEqual([expect.objectContaining({
       key,
       sourceRevision: 7,
       hunkIndex: 1,
       expectedText: 'new\nother\n',
     })]);
-    expect(lenses[3].command?.arguments).toEqual(lenses[2].command?.arguments);
+    expect(lenses[4].command?.arguments).toEqual(lenses[3].command?.arguments);
   });
 
   it('keeps legacy updates summary-only and does not show legacy additions', () => {

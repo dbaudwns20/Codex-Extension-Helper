@@ -311,18 +311,21 @@ describe('inline renderer helpers', () => {
     );
   });
 
-  it('terminates the final temporary deleted row with a newline', async () => {
-    const key = 'file:///deleted-row-newline.ts';
-    const deletedHunk = hunk({
+  it('keeps deleted decoration text within spacer rows before modified lines', async () => {
+    const key = 'file:///modified-row-separation.ts';
+    const modifiedHunk = hunk({
+      kind: 'modification',
       originalEnd: 2,
+      modifiedEnd: 1,
       originalLines: ['first old line', 'second old line'],
+      modifiedLines: ['new line'],
     });
-    const plan = createTemporaryLineSpacerPlan('survivor', '\n', [deletedHunk]);
+    const plan = createTemporaryLineSpacerPlan('new line', '\n', [modifiedHunk]);
     const { decorationTypes, editor, renderer } = deletedRenderingFixture(key, 3);
 
-    await renderer.render(key, [deletedHunk], {
+    await renderer.render(key, [modifiedHunk], {
       key,
-      canonicalText: 'survivor',
+      canonicalText: 'new line',
       displayText: plan.displayText,
       documentVersion: 1,
       revision: 1,
@@ -333,30 +336,31 @@ describe('inline renderer helpers', () => {
       decorationTypes[1],
       expect.arrayContaining([
         expect.objectContaining({
-          renderOptions: { after: expect.objectContaining({ contentText: 'second old line\n' }) },
+          range: new FakeRange(1, 0, 1, 0),
+          renderOptions: { after: expect.objectContaining({ contentText: 'second old line' }) },
         }),
       ]),
     );
+    expect(editor.setDecorations).toHaveBeenCalledWith(
+      decorationTypes[0],
+      [new FakeRange(2, 0, 2, 0)],
+    );
   });
 
-  it('renders fallback deleted lines verbatim with a final newline', async () => {
-    const key = 'file:///fallback-deleted-lines.ts';
+  it('does not overlay fallback deleted content on a modified line', async () => {
+    const key = 'file:///fallback-modification.ts';
     const { decorationTypes, editor, renderer } = deletedRenderingFixture(key);
 
     await renderer.render(key, [hunk({
-      originalEnd: 2,
-      originalLines: ['first old line', 'second old line'],
+      kind: 'modification',
+      modifiedEnd: 1,
+      originalLines: ['"version": "0.0.2",'],
+      modifiedLines: ['"version": "0.0.3",'],
     })]);
 
     expect(editor.setDecorations).toHaveBeenCalledWith(
       decorationTypes[2],
-      [expect.objectContaining({
-        renderOptions: {
-          before: expect.objectContaining({
-            contentText: 'first old line\nsecond old line\n',
-          }),
-        },
-      })],
+      [],
     );
   });
 

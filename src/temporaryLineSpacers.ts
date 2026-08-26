@@ -210,8 +210,7 @@ export function createTemporaryLineSpacerPlan(
     displayCursor += prefix.length;
     canonicalCursor = group.offset;
 
-    const offsetIsLineStart = group.offset === 0 || canonicalText[group.offset - 1] === '\n';
-    let displayLine = group.canonicalLine + insertedLines + (offsetIsLineStart ? 0 : 1);
+    let displayLine = group.canonicalLine + insertedLines;
     for (const hunk of group.hunks) {
       const rows = removedRowsByHunk.get(hunk.hunkIndex) ?? [];
       for (let originalLineIndex = 0; originalLineIndex < hunk.lines.length; originalLineIndex += 1) {
@@ -374,6 +373,10 @@ function removalEdits(plan: TemporaryLineSpacerPlan): SpacerTextEdit[] {
 export class TemporaryLineSpacerManager {
   private readonly presentations = new Map<string, InstalledSpacerPresentation>();
   private readonly revisions = new Map<string, number>();
+  private readonly authorizedDirtyInstalls = new Map<string, {
+    readonly text: string;
+    readonly version: number;
+  }>();
   private disposed = false;
 
   constructor(
@@ -408,10 +411,13 @@ export class TemporaryLineSpacerManager {
     }
 
     const document = this.host.document(request.key);
+    const matchesCanonicalText = document?.text === request.canonicalText;
+    const dirtyInstallAuthorized = matchesCanonicalText && document !== undefined
+      && this.consumeDirtyInstallAuthorization(document);
     if (
       document === undefined
-      || document.isDirty
-      || document.text !== request.canonicalText
+      || (document.isDirty && !dirtyInstallAuthorized)
+      || !matchesCanonicalText
       || !this.isCurrent(request.key, revision)
     ) {
       return undefined;
@@ -470,6 +476,16 @@ export class TemporaryLineSpacerManager {
       : this.removePresentation(presentation, true);
   }
 
+  authorizeDirtyInstall(document: SpacerDocument): void {
+    if (this.disposed || !document.isDirty) {
+      return;
+    }
+    this.authorizedDirtyInstalls.set(document.key, {
+      text: document.text,
+      version: document.version,
+    });
+  }
+
   async reconcileUnexpectedChange(
     event: SpacerDocumentChange,
   ): Promise<SpacerUnexpectedEditResult | undefined> {
@@ -483,6 +499,7 @@ export class TemporaryLineSpacerManager {
 
     this.nextRevision(event.key);
     this.presentations.delete(event.key);
+    this.authorizedDirtyInstalls.delete(event.key);
     const reconciled = reconcileSpacerEdit(presentation.plan, event.changes);
     if (
       reconciled === undefined
@@ -545,6 +562,7 @@ export class TemporaryLineSpacerManager {
   abandon(key: string): void {
     this.nextRevision(key);
     this.presentations.delete(key);
+    this.authorizedDirtyInstalls.delete(key);
     this.fence.invalidate(key);
   }
 
@@ -578,6 +596,7 @@ export class TemporaryLineSpacerManager {
     this.disposed = true;
     this.presentations.clear();
     this.revisions.clear();
+    this.authorizedDirtyInstalls.clear();
     this.fence.clear();
   }
 
@@ -609,6 +628,12 @@ export class TemporaryLineSpacerManager {
       presentation.canonicalText,
     );
     this.presentations.delete(presentation.key);
+    if (applied) {
+      const current = this.host.document(presentation.key);
+      if (current !== undefined) {
+        this.authorizeDirtyInstall(current);
+      }
+    }
     return applied
       ? { status: 'removed', canonicalText: presentation.canonicalText }
       : { status: 'unsafe' };
@@ -662,6 +687,17 @@ export class TemporaryLineSpacerManager {
 
   private isCurrent(key: string, revision: number): boolean {
     return !this.disposed && this.revisions.get(key) === revision;
+  }
+
+  private consumeDirtyInstallAuthorization(document: SpacerDocument): boolean {
+    if (!document.isDirty) {
+      this.authorizedDirtyInstalls.delete(document.key);
+      return false;
+    }
+    const authorization = this.authorizedDirtyInstalls.get(document.key);
+    this.authorizedDirtyInstalls.delete(document.key);
+    return authorization?.text === document.text
+      && authorization.version === document.version;
   }
 
   private matchesRequest(
