@@ -54,6 +54,24 @@ describe('applyUnifiedFilePatch', () => {
     expect(applyUnifiedFilePatch('one\r\ntwo\r\n', patch)).toBe('one\r\nthree\r\n');
   });
 
+  it('rejects an LF patch against a CRLF source', () => {
+    const patch = [
+      '--- a/file.txt', '+++ b/file.txt',
+      '@@ -1,2 +1,2 @@', ' one', '-two', '+three', '',
+    ].join('\n');
+
+    expect(applyUnifiedFilePatch('one\r\ntwo\r\n', patch)).toBeUndefined();
+  });
+
+  it('rejects a CRLF patch against an LF source', () => {
+    const patch = [
+      '--- a/file.txt', '+++ b/file.txt',
+      '@@ -1,2 +1,2 @@', ' one', '-two', '+three', '',
+    ].join('\r\n');
+
+    expect(applyUnifiedFilePatch('one\ntwo\n', patch)).toBeUndefined();
+  });
+
   it('applies a final-newline addition exactly', () => {
     const patch = [
       '--- a/file.txt', '+++ b/file.txt',
