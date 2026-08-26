@@ -46,7 +46,7 @@ interface EligibleTransition {
 
 interface NotificationKeyResolution {
   readonly relevantKeys: Set<string>;
-  readonly rejectedKeys: Set<string>;
+  readonly resolverAgreementFailed: boolean;
 }
 
 const DEFAULT_QUARANTINE_MS = 1_000;
@@ -158,7 +158,7 @@ export class CodexChangeGate implements vscode.Disposable {
       }
       const resolution = this.resolveNotificationKeys(notification);
       const itemKey = notificationItemKey(notification);
-      if (resolution.rejectedKeys.size > 0 || this.rejectedItems.has(itemKey)) {
+      if (resolution.resolverAgreementFailed || this.rejectedItems.has(itemKey)) {
         this.rejectedItems.add(itemKey);
         for (const key of resolution.relevantKeys) {
           this.eligibleTransitions.delete(key);
@@ -268,7 +268,7 @@ export class CodexChangeGate implements vscode.Disposable {
     notification: CodexProvenanceNotification,
   ): NotificationKeyResolution {
     const relevantKeys = new Set<string>();
-    const rejectedKeys = new Set<string>();
+    let resolverAgreementFailed = false;
     for (const change of changesOf(notification)) {
       const workspaceKey = this.options.resolveWorkspacePath(change.path)?.toString();
       const acceptedKey = this.options.resolveAcceptedPath(change.path)?.uri.toString();
@@ -276,11 +276,10 @@ export class CodexChangeGate implements vscode.Disposable {
       if (acceptedKey !== undefined) relevantKeys.add(acceptedKey);
       if (workspaceKey === undefined || acceptedKey === undefined
         || workspaceKey !== acceptedKey) {
-        if (workspaceKey !== undefined) rejectedKeys.add(workspaceKey);
-        if (acceptedKey !== undefined) rejectedKeys.add(acceptedKey);
+        resolverAgreementFailed = true;
       }
     }
-    return { relevantKeys, rejectedKeys };
+    return { relevantKeys, resolverAgreementFailed };
   }
 
   private refreshEligibleTransitions(now: number): void {

@@ -263,6 +263,39 @@ describe('CodexChangeGate', () => {
     },
   );
 
+  it.each(['notification-first', 'candidate-first'] as const)(
+    'rejects and never reuses both-undefined evidence in %s order',
+    async (order) => {
+      const candidate = present('workspace-a.txt', 'new\n');
+      const acceptedState: ProvenanceFileState = {
+        uri: candidate.uri,
+        exists: true,
+        text: 'old\n',
+      };
+      let resolutionAvailable = false;
+      const { clock, gate, proven, unproven, flush } = setup({}, {
+        resolveAcceptedPath: () => resolutionAvailable ? acceptedState : undefined,
+        resolveWorkspacePath: () => resolutionAvailable ? candidate.uri : undefined,
+      });
+      const notification = completed([update('file.txt', 'old', 'new')]);
+
+      if (order === 'candidate-first') await gate.handleCandidate(candidate);
+      await gate.handleNotification(notification);
+      if (order === 'notification-first') await gate.handleCandidate(candidate);
+
+      expect(proven).toEqual([]);
+      expect(unproven).toEqual([]);
+
+      resolutionAvailable = true;
+      await gate.handleNotification(notification);
+      clock.advance(100);
+      await flush();
+
+      expect(proven).toEqual([]);
+      expect(unproven).toEqual([candidate]);
+    },
+  );
+
   it('retires previously valid evidence before accepted-undefined refresh can clear its index', async () => {
     const candidate = present('workspace-a.txt', 'new\n');
     const acceptedState: ProvenanceFileState = {
