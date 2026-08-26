@@ -326,6 +326,26 @@ describe('CodexProvenanceLedger', () => {
     expect(ledger.completedTransitions(resolveAcceptedPath)).toEqual([]);
   });
 
+  it('starts a new normalized-key generation only from notifications recorded after full cleanup', () => {
+    let now = 1_000;
+    const ledger = new CodexProvenanceLedger(100, () => now);
+    const resolveAcceptedPath = accepted({ 'file.txt': state('file.txt', true, 'old\n') });
+    ledger.record(completed([update('file.txt', 'different', 'final')], 'blocker'));
+    expect(ledger.completedTransitions(resolveAcceptedPath)).toEqual([]);
+
+    now = 1_050;
+    ledger.record(completed([update('file.txt', 'old', 'new')], 'before-cleanup'));
+    expect(ledger.completedTransitions(resolveAcceptedPath)).toEqual([]);
+
+    ledger.prune(1_150);
+    now = 1_200;
+    ledger.record(completed([update('file.txt', 'old', 'final')], 'after-cleanup'));
+    expect(ledger.completedTransitions(resolveAcceptedPath)[0]).toMatchObject({
+      after: { exists: true, text: 'final\n' },
+      provenance: { itemIds: ['after-cleanup'] },
+    });
+  });
+
   it('combines raw-path aliases by normalized URI and rejects their conflicting chain', () => {
     const ledger = new CodexProvenanceLedger();
     ledger.record(completed([update('SRC/file.txt', 'old', 'new')], 'first'));

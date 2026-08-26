@@ -34,6 +34,7 @@ interface ItemRecord {
   readonly threadId: string;
   readonly turnId: string;
   readonly itemId: string;
+  readonly order: number;
   changes: readonly CodexFileUpdateChange[];
   terminalStatus: CodexFileChangeStatus | undefined;
   invalid: boolean;
@@ -50,7 +51,14 @@ interface NormalizedEvidenceGroup {
   readonly accepted: ProvenanceFileState;
   readonly links: { item: ItemRecord; change: CodexFileUpdateChange }[];
   readonly evidence: Set<string>;
+  readonly itemKeys: Set<string>;
   acceptedStateConflict: boolean;
+}
+
+interface InvalidatedGeneration {
+  readonly evidence: Set<string>;
+  readonly itemKeys: Set<string>;
+  cleanedThroughOrder: number | undefined;
 }
 
 const DEFAULT_RETENTION_MS = 5 * 60 * 1_000;
@@ -106,7 +114,10 @@ export class CodexProvenanceLedger {
   private readonly items = new Map<string, ItemRecord>();
   private readonly retiredEvidence = new Set<string>();
   private readonly evidenceByNormalizedKey = new Map<string, Set<string>>();
+  private readonly itemKeysByNormalizedKey = new Map<string, Set<string>>();
+  private readonly invalidatedGenerations = new Map<string, InvalidatedGeneration>();
   private readonly ready = new Map<string, ReadyTransition>();
+  private latestRecordOrder = 0;
 
   constructor(
     private readonly retentionMs = DEFAULT_RETENTION_MS,
@@ -135,6 +146,7 @@ export class CodexProvenanceLedger {
         threadId,
         turnId,
         itemId,
+        order: ++this.latestRecordOrder,
         changes,
         terminalStatus: notification.method === 'item/completed'
           ? notification.params.item.status
@@ -184,21 +196,30 @@ export class CodexProvenanceLedger {
   ): readonly ExactCodexTransition[] {
     this.ready.clear();
     this.evidenceByNormalizedKey.clear();
+    this.itemKeysByNormalizedKey.clear();
     const groups = new Map<string, NormalizedEvidenceGroup>();
 
     for (const item of this.items.values()) {
       if (item.invalid || item.terminalStatus !== 'completed') continue;
       for (const change of item.changes) {
         const evidence = evidenceKey(item, change.path);
-        if (this.retiredEvidence.has(evidence)) continue;
         const accepted = resolveAcceptedPath(change.path);
         if (accepted === undefined) continue;
         const key = accepted.uri.toString();
+        const currentEvidence = this.evidenceByNormalizedKey.get(key) ?? new Set<string>();
+        const currentItemKeys = this.itemKeysByNormalizedKey.get(key) ?? new Set<string>();
+        currentEvidence.add(evidence);
+        currentItemKeys.add(item.key);
+        this.evidenceByNormalizedKey.set(key, currentEvidence);
+        this.itemKeysByNormalizedKey.set(key, currentItemKeys);
+        if (this.invalidatedGenerationBlocks(key, item, evidence)) continue;
+        if (this.retiredEvidence.has(evidence)) continue;
         const existing = groups.get(key);
         const group = existing ?? {
           accepted,
           links: [],
           evidence: new Set<string>(),
+          itemKeys: new Set<string>(),
           acceptedStateConflict: false,
         };
         if (existing !== undefined
@@ -207,8 +228,8 @@ export class CodexProvenanceLedger {
         }
         group.links.push({ item, change });
         group.evidence.add(evidence);
+        group.itemKeys.add(item.key);
         groups.set(key, group);
-        this.evidenceByNormalizedKey.set(key, group.evidence);
       }
     }
 
@@ -217,7 +238,7 @@ export class CodexProvenanceLedger {
       const first = links[0].item;
       if (group.acceptedStateConflict || (!accepted.exists && accepted.text !== '')
         || links.some(({ item }) => item.threadId !== first.threadId || item.turnId !== first.turnId)) {
-        this.retireEvidence(evidence);
+        this.invalidateGeneration(key, group.itemKeys, evidence);
         continue;
       }
 
@@ -244,7 +265,7 @@ export class CodexProvenanceLedger {
       }
 
       if (!valid) {
-        this.retireEvidence(evidence);
+        this.invalidateGeneration(key, group.itemKeys, evidence);
         continue;
       }
       const transition: ExactCodexTransition = {
@@ -275,7 +296,10 @@ export class CodexProvenanceLedger {
 
   invalidate(key: string): void {
     const evidence = this.evidenceByNormalizedKey.get(key);
-    if (evidence !== undefined) this.retireEvidence(evidence);
+    const itemKeys = this.itemKeysByNormalizedKey.get(key);
+    if (evidence !== undefined && itemKeys !== undefined) {
+      this.invalidateGeneration(key, itemKeys, evidence);
+    }
     this.ready.delete(key);
   }
 
@@ -287,10 +311,61 @@ export class CodexProvenanceLedger {
         changed = true;
       }
     }
-    if (changed) this.ready.clear();
+    if (changed) {
+      for (const generation of this.invalidatedGenerations.values()) {
+        if (generation.cleanedThroughOrder === undefined
+          && ![...generation.itemKeys].some((key) => this.items.has(key))) {
+          generation.cleanedThroughOrder = this.latestRecordOrder;
+        }
+      }
+      this.evidenceByNormalizedKey.clear();
+      this.itemKeysByNormalizedKey.clear();
+      this.ready.clear();
+    }
   }
 
   private retireEvidence(evidence: Iterable<string>): void {
     for (const value of evidence) this.retiredEvidence.add(value);
+  }
+
+  private invalidateGeneration(
+    key: string,
+    itemKeys: Iterable<string>,
+    evidence: Iterable<string>,
+  ): void {
+    const generation = this.invalidatedGenerations.get(key) ?? {
+      evidence: new Set<string>(),
+      itemKeys: new Set<string>(),
+      cleanedThroughOrder: undefined,
+    };
+    for (const itemKey of itemKeys) generation.itemKeys.add(itemKey);
+    for (const value of evidence) generation.evidence.add(value);
+    generation.cleanedThroughOrder = undefined;
+    this.retireEvidence(generation.evidence);
+    this.invalidatedGenerations.set(key, generation);
+  }
+
+  private invalidatedGenerationBlocks(
+    key: string,
+    item: ItemRecord,
+    evidence: string,
+  ): boolean {
+    const generation = this.invalidatedGenerations.get(key);
+    if (generation === undefined) return false;
+
+    const generationHasLiveItems = [...generation.itemKeys].some((itemKey) => this.items.has(itemKey));
+    if (generationHasLiveItems
+      || generation.cleanedThroughOrder === undefined
+      || item.order <= generation.cleanedThroughOrder) {
+      generation.itemKeys.add(item.key);
+      generation.evidence.add(evidence);
+      generation.cleanedThroughOrder = undefined;
+      this.retiredEvidence.add(evidence);
+      return true;
+    }
+
+    for (const value of generation.evidence) this.retiredEvidence.delete(value);
+    this.invalidatedGenerations.delete(key);
+    return false;
   }
 }
