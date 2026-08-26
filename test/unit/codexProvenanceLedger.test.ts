@@ -346,6 +346,34 @@ describe('CodexProvenanceLedger', () => {
     });
   });
 
+  it('rejects a pre-cleanup alias that resolves only after a newer transition is consumed', () => {
+    let now = 1_000;
+    let acceptedText = 'old\n';
+    let aliasResolves = false;
+    const ledger = new CodexProvenanceLedger(100, () => now);
+    const resolveAcceptedPath = (path: string): ProvenanceFileState | undefined => {
+      if (path === 'alias/file.txt' && !aliasResolves) return undefined;
+      return { uri: fakeUri('file.txt'), exists: true, text: acceptedText };
+    };
+
+    ledger.record(completed([update('file.txt', 'different', 'final')], 'blocker'));
+    expect(ledger.completedTransitions(resolveAcceptedPath)).toEqual([]);
+
+    now = 1_050;
+    ledger.record(completed([update('alias/file.txt', 'new', 'final')], 'stale-alias'));
+    ledger.prune(1_100);
+
+    now = 1_101;
+    ledger.record(completed([update('file.txt', 'old', 'new')], 'fresh'));
+    const [fresh] = ledger.completedTransitions(resolveAcceptedPath);
+    expect(fresh.provenance.itemIds).toEqual(['fresh']);
+    expect(ledger.consume(fresh.key, NEW_HASH)).toBe(fresh);
+
+    acceptedText = 'new\n';
+    aliasResolves = true;
+    expect(ledger.completedTransitions(resolveAcceptedPath)).toEqual([]);
+  });
+
   it('combines raw-path aliases by normalized URI and rejects their conflicting chain', () => {
     const ledger = new CodexProvenanceLedger();
     ledger.record(completed([update('SRC/file.txt', 'old', 'new')], 'first'));

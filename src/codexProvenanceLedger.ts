@@ -58,7 +58,7 @@ interface NormalizedEvidenceGroup {
 interface InvalidatedGeneration {
   readonly evidence: Set<string>;
   readonly itemKeys: Set<string>;
-  cleanedThroughOrder: number | undefined;
+  cleanupWatermark: number;
 }
 
 const DEFAULT_RETENTION_MS = 5 * 60 * 1_000;
@@ -313,9 +313,11 @@ export class CodexProvenanceLedger {
     }
     if (changed) {
       for (const generation of this.invalidatedGenerations.values()) {
-        if (generation.cleanedThroughOrder === undefined
-          && ![...generation.itemKeys].some((key) => this.items.has(key))) {
-          generation.cleanedThroughOrder = this.latestRecordOrder;
+        if (![...generation.itemKeys].some((key) => this.items.has(key))) {
+          generation.cleanupWatermark = Math.max(
+            generation.cleanupWatermark,
+            this.latestRecordOrder,
+          );
         }
       }
       this.evidenceByNormalizedKey.clear();
@@ -336,11 +338,10 @@ export class CodexProvenanceLedger {
     const generation = this.invalidatedGenerations.get(key) ?? {
       evidence: new Set<string>(),
       itemKeys: new Set<string>(),
-      cleanedThroughOrder: undefined,
+      cleanupWatermark: 0,
     };
     for (const itemKey of itemKeys) generation.itemKeys.add(itemKey);
     for (const value of evidence) generation.evidence.add(value);
-    generation.cleanedThroughOrder = undefined;
     this.retireEvidence(generation.evidence);
     this.invalidatedGenerations.set(key, generation);
   }
@@ -353,19 +354,20 @@ export class CodexProvenanceLedger {
     const generation = this.invalidatedGenerations.get(key);
     if (generation === undefined) return false;
 
-    const generationHasLiveItems = [...generation.itemKeys].some((itemKey) => this.items.has(itemKey));
-    if (generationHasLiveItems
-      || generation.cleanedThroughOrder === undefined
-      || item.order <= generation.cleanedThroughOrder) {
-      generation.itemKeys.add(item.key);
+    if (item.order <= generation.cleanupWatermark) {
       generation.evidence.add(evidence);
-      generation.cleanedThroughOrder = undefined;
       this.retiredEvidence.add(evidence);
       return true;
     }
 
-    for (const value of generation.evidence) this.retiredEvidence.delete(value);
-    this.invalidatedGenerations.delete(key);
+    const generationHasLiveItems = [...generation.itemKeys].some((itemKey) => this.items.has(itemKey));
+    if (generationHasLiveItems) {
+      generation.itemKeys.add(item.key);
+      generation.evidence.add(evidence);
+      this.retiredEvidence.add(evidence);
+      return true;
+    }
+
     return false;
   }
 }
