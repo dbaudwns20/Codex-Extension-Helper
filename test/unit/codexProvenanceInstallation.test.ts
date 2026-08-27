@@ -5,6 +5,7 @@ import {
   readdir,
   rename as fsRename,
   rm as fsRm,
+  symlink,
   writeFile as fsWriteFile,
 } from 'node:fs/promises';
 import os from 'node:os';
@@ -29,6 +30,7 @@ const temporaryDirectories: string[] = [];
 type FileOperations = {
   rename?: (sourcePath: string, targetPath: string) => Promise<void>;
   rm?: (filePath: string, options?: { force?: boolean }) => Promise<void>;
+  syncDirectory?: (directoryPath: string) => Promise<void>;
   writeFile?: (filePath: string, data: string | Uint8Array, options: object) => Promise<void>;
 };
 
@@ -164,6 +166,23 @@ describe('Codex provenance installation discovery and inspection', () => {
       'Current Codex provenance target hash does not match patch metadata',
     );
     expect(await readFile(path.join(older, 'out/extension.js'))).toEqual(olderBefore);
+  });
+
+  it('propagates a newer target read failure instead of patching an older installation', async () => {
+    const { applyCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const older = await makeInstallation(root, '26.820.60940');
+    const newer = await makeInstallation(root, '26.826.11250');
+    const newerTarget = path.join(newer, 'out/extension.js');
+    await fsRm(newerTarget);
+    await mkdir(newerTarget);
+    const olderTarget = path.join(older, 'out/extension.js');
+    const olderBefore = await readFile(olderTarget);
+
+    await expect(applyCodexProvenancePatch({ roots: [root] })).rejects.toMatchObject({
+      code: 'EISDIR',
+    });
+    expect(await readFile(olderTarget)).toEqual(olderBefore);
   });
 
   it('reports clean and fully verified patched states without changing bytes', async () => {
@@ -373,6 +392,53 @@ describe('Codex provenance installation apply lifecycle', () => {
       .rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('rejects a final-leaf target symlink without replacing it or its destination', async () => {
+    const { applyCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const realTargetPath = path.join(extensionDir, 'out/real-extension.js');
+    const original = await readFile(targetPath);
+    await fsRename(targetPath, realTargetPath);
+    await symlink(realTargetPath, targetPath);
+
+    await expect(applyCodexProvenancePatch({ extensionDir })).rejects.toThrow(
+      /target.*symbolic link/iu,
+    );
+
+    expect(await readFile(realTargetPath)).toEqual(original);
+    expect(await readFile(targetPath)).toEqual(original);
+    expect(await readOptional(`${targetPath}.codex-extension-helper-provenance.original`))
+      .toBeUndefined();
+    expect(await readOptional(`${targetPath}.codex-extension-helper-provenance.json`))
+      .toBeUndefined();
+  });
+
+  it('preserves a backup that wins an exclusive-creation race', async () => {
+    const { applyCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
+    const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
+    const original = await readFile(targetPath);
+    const racedBackup = Buffer.from('backup created by another process');
+
+    await expect(applyCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        writeFile: async (filePath, data, options) => {
+          if (filePath === backupPath) await fsWriteFile(filePath, racedBackup, { flag: 'wx' });
+          await fsWriteFile(filePath, data, options);
+        },
+      },
+    })).rejects.toThrow(/EEXIST|exist/iu);
+
+    expect(await readFile(targetPath)).toEqual(original);
+    expect(await readFile(backupPath)).toEqual(racedBackup);
+    expect(await readOptional(metadataPath)).toBeUndefined();
+  });
+
   it('verifies newly created backup bytes before replacing the target', async () => {
     const { applyCodexProvenancePatch } = await installationModule();
     const root = await makeTemporaryDirectory();
@@ -399,6 +465,107 @@ describe('Codex provenance installation apply lifecycle', () => {
     expect(await readOptional(backupPath)).toBeUndefined();
     expect(await readOptional(metadataPath)).toBeUndefined();
     expect(await tempArtifacts(extensionDir)).toEqual([]);
+  });
+
+  it.each([
+    ['resolves', false],
+    ['throws after creation', true],
+  ])('rejects a truncated metadata temporary write that %s', async (_name, throwAfterWrite) => {
+    const { applyCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
+    const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
+    const original = await readFile(targetPath);
+
+    await expect(applyCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        writeFile: async (filePath, data, options) => {
+          if (filePath.startsWith(`${metadataPath}.tmp-`)) {
+            await fsWriteFile(filePath, '{"truncated":', options);
+            if (throwAfterWrite) throw new Error('metadata temp write reported failure');
+            return;
+          }
+          await fsWriteFile(filePath, data, options);
+        },
+      },
+    })).rejects.toThrow(/metadata temporary file is invalid|metadata temp write reported failure/iu);
+
+    expect(await readFile(targetPath)).toEqual(original);
+    expect(await readOptional(backupPath)).toBeUndefined();
+    expect(await readOptional(metadataPath)).toBeUndefined();
+    expect(await tempArtifacts(extensionDir)).toEqual([]);
+  });
+
+  it('verifies final metadata bytes and schema after the metadata rename', async () => {
+    const { applyCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
+    const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
+    const original = await readFile(targetPath);
+
+    await expect(applyCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        rename: async (sourcePath, destinationPath) => {
+          await fsRename(sourcePath, destinationPath);
+          if (destinationPath === metadataPath) {
+            await fsWriteFile(metadataPath, '{"malformed":true}\n');
+          }
+        },
+      },
+    })).rejects.toThrow('Codex provenance final metadata is invalid');
+
+    expect(await readFile(targetPath)).toEqual(original);
+    expect(await readOptional(backupPath)).toBeUndefined();
+    expect(await readOptional(metadataPath)).toBeUndefined();
+    expect(await tempArtifacts(extensionDir)).toEqual([]);
+  });
+
+  it('reports backup-only recovery when malformed metadata removal sync fails', async () => {
+    const { applyCodexProvenancePatch, inspectCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
+    const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
+    const original = await readFile(targetPath);
+    let metadataWasCorrupted = false;
+
+    await expect(applyCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        rename: async (sourcePath, destinationPath) => {
+          await fsRename(sourcePath, destinationPath);
+          if (destinationPath === metadataPath) {
+            await fsWriteFile(metadataPath, '{"malformed":true}\n');
+            metadataWasCorrupted = true;
+          }
+        },
+        syncDirectory: async () => {
+          if (
+            metadataWasCorrupted
+            && await readOptional(metadataPath) === undefined
+            && (await readFile(targetPath, 'utf8')).includes(
+              'codex-extension-helper:provenance:start',
+            )
+          ) {
+            throw new Error('malformed metadata removal directory sync failed');
+          }
+        },
+      },
+    })).rejects.toThrow(/metadata is absent.*backup retained.*manual cleanup/iu);
+
+    expect(await readFile(targetPath)).toEqual(original);
+    expect(await readFile(backupPath)).toEqual(original);
+    expect(await readOptional(metadataPath)).toBeUndefined();
+    await expect(inspectCodexProvenancePatch({ extensionDir })).rejects.toThrow(
+      /inconsistent.*artifacts/u,
+    );
   });
 
   it.each([
@@ -485,6 +652,98 @@ describe('Codex provenance installation apply lifecycle', () => {
       /inconsistent.*artifacts/u,
     );
   });
+
+  it('preserves a target changed while apply is writing temporary files', async () => {
+    const { applyCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
+    const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
+    const concurrentBytes = Buffer.from('concurrent apply-window target bytes');
+
+    await expect(applyCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        writeFile: async (filePath, data, options) => {
+          await fsWriteFile(filePath, data, options);
+          if (filePath.startsWith(`${metadataPath}.tmp-`)) {
+            await fsWriteFile(targetPath, concurrentBytes);
+          }
+        },
+      },
+    })).rejects.toThrow(/target changed.*backup retained/iu);
+
+    expect(await readFile(targetPath)).toEqual(concurrentBytes);
+    expect(await readFile(backupPath)).toBeDefined();
+    expect(await readOptional(metadataPath)).toBeUndefined();
+    expect(await tempArtifacts(extensionDir)).toEqual([]);
+  });
+
+  it('never rolls original bytes over a target changed after patched installation', async () => {
+    const { applyCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
+    const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
+    const concurrentBytes = Buffer.from('concurrent rollback-window target bytes');
+
+    await expect(applyCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        rename: async (sourcePath, destinationPath) => {
+          if (destinationPath === metadataPath) {
+            await fsWriteFile(targetPath, concurrentBytes);
+            throw new Error('metadata commit blocked after target mutation');
+          }
+          await fsRename(sourcePath, destinationPath);
+        },
+      },
+    })).rejects.toThrow(/target changed.*backup retained/iu);
+
+    expect(await readFile(targetPath)).toEqual(concurrentBytes);
+    expect(await readFile(backupPath)).toBeDefined();
+    expect(await readOptional(metadataPath)).toBeUndefined();
+    expect(await tempArtifacts(extensionDir)).toEqual([]);
+  });
+
+  it('reports an absent backup accurately when failed-apply cleanup directory sync fails', async () => {
+    const { applyCodexProvenancePatch, inspectCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
+    const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
+    const original = await readFile(targetPath);
+
+    await expect(applyCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        rename: async (_sourcePath, destinationPath) => {
+          if (destinationPath === targetPath) throw new Error('target install rename failed');
+        },
+        syncDirectory: async () => {
+          if (
+            await readOptional(backupPath) === undefined
+            && await readOptional(metadataPath) === undefined
+          ) {
+            throw new Error('failed-apply cleanup directory sync failed');
+          }
+        },
+      },
+    })).rejects.toThrow(/target remains original.*backup is absent.*durability.*re-run apply/iu);
+
+    expect(await readFile(targetPath)).toEqual(original);
+    expect(await readOptional(backupPath)).toBeUndefined();
+    expect(await readOptional(metadataPath)).toBeUndefined();
+    await expect(inspectCodexProvenancePatch({ extensionDir })).resolves.toMatchObject({
+      status: 'not-patched',
+    });
+    await expect(applyCodexProvenancePatch({ extensionDir })).resolves.toMatchObject({
+      status: 'patched',
+    });
+  });
 });
 
 describe('Codex provenance restore lifecycle', () => {
@@ -564,6 +823,57 @@ describe('Codex provenance restore lifecycle', () => {
     });
   });
 
+  it('preserves a target changed while restore is writing its temporary file', async () => {
+    const { applyCodexProvenancePatch, restoreCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const result = await applyCodexProvenancePatch({ extensionDir });
+    const concurrentBytes = Buffer.from('concurrent restore-window target bytes');
+
+    await expect(restoreCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        writeFile: async (filePath, data, options) => {
+          await fsWriteFile(filePath, data, options);
+          if (filePath.startsWith(`${result.targetPath}.tmp-`)) {
+            await fsWriteFile(result.targetPath, concurrentBytes);
+          }
+        },
+      },
+    })).rejects.toThrow(/target changed.*recovery artifacts retained/iu);
+
+    expect(await readFile(result.targetPath)).toEqual(concurrentBytes);
+    expect(await readFile(result.backupPath)).toBeDefined();
+    expect(await readFile(result.metadataPath)).toBeDefined();
+    expect(await tempArtifacts(extensionDir)).toEqual([]);
+  });
+
+  it('reports and preserves a target changed after the restore rename takes effect', async () => {
+    const { applyCodexProvenancePatch, restoreCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const result = await applyCodexProvenancePatch({ extensionDir });
+    const concurrentBytes = Buffer.from('concurrent post-restore target bytes');
+
+    await expect(restoreCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        rename: async (sourcePath, destinationPath) => {
+          await fsRename(sourcePath, destinationPath);
+          if (destinationPath === result.targetPath) {
+            await fsWriteFile(result.targetPath, concurrentBytes);
+            throw new Error('restore rename reported a late failure');
+          }
+        },
+      },
+    })).rejects.toThrow(/target changed.*recovery artifacts retained/iu);
+
+    expect(await readFile(result.targetPath)).toEqual(concurrentBytes);
+    expect(await readFile(result.backupPath)).toBeDefined();
+    expect(await readFile(result.metadataPath)).toBeDefined();
+    expect(await tempArtifacts(extensionDir)).toEqual([]);
+  });
+
   it('reports complete recovery artifacts after metadata cleanup fails and retries cleanup safely', async () => {
     const {
       applyCodexProvenancePatch,
@@ -586,7 +896,7 @@ describe('Codex provenance restore lifecycle', () => {
     })).rejects.toThrow(/target restored.*re-run restore.*metadata cleanup failure/iu);
 
     expect(await readFile(result.targetPath)).toEqual(original);
-    expect(await readFile(result.backupPath)).toEqual(original);
+    expect(await readOptional(result.backupPath)).toBeUndefined();
     expect(await readFile(result.metadataPath)).toBeDefined();
     await expect(inspectCodexProvenancePatch({ extensionDir })).resolves.toMatchObject({
       status: 'restored-pending-cleanup',
@@ -598,7 +908,7 @@ describe('Codex provenance restore lifecycle', () => {
     expect(await readOptional(result.metadataPath)).toBeUndefined();
   });
 
-  it('reports an orphan backup accurately when final cleanup fails and then fails closed', async () => {
+  it('retains complete recovery artifacts when backup cleanup fails and retries safely', async () => {
     const {
       applyCodexProvenancePatch,
       inspectCodexProvenancePatch,
@@ -617,16 +927,249 @@ describe('Codex provenance restore lifecycle', () => {
           await fsRm(filePath, options);
         },
       },
-    })).rejects.toThrow(/target restored.*backup retained.*manual cleanup/iu);
+    })).rejects.toThrow(/target restored.*re-run restore.*backup cleanup failure/iu);
 
     expect(await readFile(result.targetPath)).toEqual(original);
     expect(await readFile(result.backupPath)).toEqual(original);
-    expect(await readOptional(result.metadataPath)).toBeUndefined();
+    expect(await readFile(result.metadataPath)).toBeDefined();
+    await expect(inspectCodexProvenancePatch({ extensionDir })).resolves.toMatchObject({
+      status: 'restored-pending-cleanup',
+    });
+    await expect(restoreCodexProvenancePatch({ extensionDir })).resolves.toMatchObject({
+      status: 'already-restored',
+    });
+  });
+
+  it('does not recommend retry when metadata hashes change during cleanup failure', async () => {
+    const { applyCodexProvenancePatch, inspectCodexProvenancePatch, restoreCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const result = await applyCodexProvenancePatch({ extensionDir });
+
+    await expect(restoreCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        rm: async (filePath, options) => {
+          if (filePath === result.metadataPath) {
+            const metadata = JSON.parse(await readFile(filePath, 'utf8'));
+            metadata.patchedSha256 = 'f'.repeat(64);
+            await fsWriteFile(filePath, `${JSON.stringify(metadata, null, 2)}\n`);
+            throw new Error('metadata changed during cleanup');
+          }
+          await fsRm(filePath, options);
+        },
+      },
+    })).rejects.toThrow(/non-retryable metadata-changed.*manual cleanup/iu);
+
     await expect(inspectCodexProvenancePatch({ extensionDir })).rejects.toThrow(
-      /inconsistent.*artifacts/u,
+      'Codex provenance patch metadata is invalid',
     );
-    await expect(restoreCodexProvenancePatch({ extensionDir })).rejects.toThrow(
-      /inconsistent.*artifacts/u,
+  });
+
+  it.each([
+    ['backup', (result: LifecycleResult) => result.backupPath],
+    ['metadata', (result: LifecycleResult) => result.metadataPath],
+  ])('accepts a %s delete that takes effect before reporting failure', async (_name, selectedPath) => {
+    const { applyCodexProvenancePatch, restoreCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const result = await applyCodexProvenancePatch({ extensionDir });
+    const pathToFail = selectedPath(result);
+
+    await expect(restoreCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        rm: async (filePath, options) => {
+          await fsRm(filePath, options);
+          if (filePath === pathToFail) throw new Error(`${_name} delete reported after-effect failure`);
+        },
+      },
+    })).resolves.toMatchObject({ status: 'restored' });
+
+    expect(await readOptional(result.backupPath)).toBeUndefined();
+    expect(await readOptional(result.metadataPath)).toBeUndefined();
+    expect(await readFile(result.targetPath, 'utf8')).not.toContain(
+      'codex-extension-helper:provenance:start',
     );
+  });
+
+  it('fsyncs each committed apply and restore directory state in durable order', async () => {
+    const { applyCodexProvenancePatch, restoreCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
+    const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
+    const snapshots: Array<{ backup: boolean; metadata: boolean; target: string }> = [];
+    const syncDirectory = async (directoryPath: string) => {
+      expect(directoryPath).toBe(path.dirname(targetPath));
+      const targetSource = await readFile(targetPath, 'utf8');
+      snapshots.push({
+        backup: await readOptional(backupPath) !== undefined,
+        metadata: await readOptional(metadataPath) !== undefined,
+        target: targetSource.includes('codex-extension-helper:provenance:start')
+          ? 'patched'
+          : 'original',
+      });
+    };
+
+    await applyCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: { syncDirectory },
+    });
+    expect(snapshots.splice(0)).toEqual([
+      { backup: true, metadata: false, target: 'original' },
+      { backup: true, metadata: false, target: 'patched' },
+      { backup: true, metadata: true, target: 'patched' },
+    ]);
+
+    await restoreCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: { syncDirectory },
+    });
+    expect(snapshots).toEqual([
+      { backup: true, metadata: true, target: 'original' },
+      { backup: false, metadata: true, target: 'original' },
+      { backup: false, metadata: false, target: 'original' },
+    ]);
+  });
+
+  it('rolls apply back without claiming success when patched-target directory sync fails', async () => {
+    const { applyCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
+    const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
+    const original = await readFile(targetPath);
+
+    await expect(applyCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        syncDirectory: async () => {
+          const targetSource = await readFile(targetPath, 'utf8');
+          if (
+            targetSource.includes('codex-extension-helper:provenance:start')
+            && await readOptional(metadataPath) === undefined
+          ) {
+            throw new Error('patched target directory sync failed');
+          }
+        },
+      },
+    })).rejects.toThrow('patched target directory sync failed');
+
+    expect(await readFile(targetPath)).toEqual(original);
+    expect(await readOptional(backupPath)).toBeUndefined();
+    expect(await readOptional(metadataPath)).toBeUndefined();
+  });
+
+  it('reports an observably patched state when metadata directory sync cannot commit', async () => {
+    const { applyCodexProvenancePatch, inspectCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
+
+    await expect(applyCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        syncDirectory: async () => {
+          if (await readOptional(metadataPath) !== undefined) {
+            throw new Error('metadata directory sync failed');
+          }
+        },
+      },
+    })).rejects.toThrow(/observably patched.*durability.*re-run apply/iu);
+
+    await expect(inspectCodexProvenancePatch({ extensionDir })).resolves.toMatchObject({
+      status: 'patched',
+    });
+    await expect(applyCodexProvenancePatch({ extensionDir })).resolves.toMatchObject({
+      status: 'already-patched',
+    });
+  });
+
+  it('retains complete artifacts when restored-target directory sync fails', async () => {
+    const { applyCodexProvenancePatch, inspectCodexProvenancePatch, restoreCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const result = await applyCodexProvenancePatch({ extensionDir });
+
+    await expect(restoreCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        syncDirectory: async () => {
+          const targetSource = await readFile(result.targetPath, 'utf8');
+          if (!targetSource.includes('codex-extension-helper:provenance:start')) {
+            throw new Error('restored target directory sync failed');
+          }
+        },
+      },
+    })).rejects.toThrow(/target restored.*durability.*re-run restore/iu);
+
+    expect(await readFile(result.backupPath)).toBeDefined();
+    expect(await readFile(result.metadataPath)).toBeDefined();
+    await expect(inspectCodexProvenancePatch({ extensionDir })).resolves.toMatchObject({
+      status: 'restored-pending-cleanup',
+    });
+    await expect(restoreCodexProvenancePatch({ extensionDir })).resolves.toMatchObject({
+      status: 'already-restored',
+    });
+  });
+
+  it('supports retry when backup removal is visible but its directory sync fails', async () => {
+    const { applyCodexProvenancePatch, inspectCodexProvenancePatch, restoreCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const result = await applyCodexProvenancePatch({ extensionDir });
+
+    await expect(restoreCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        syncDirectory: async () => {
+          if (
+            await readOptional(result.backupPath) === undefined
+            && await readOptional(result.metadataPath) !== undefined
+          ) {
+            throw new Error('backup removal directory sync failed');
+          }
+        },
+      },
+    })).rejects.toThrow(/backup removed.*metadata remains.*re-run restore/iu);
+
+    await expect(inspectCodexProvenancePatch({ extensionDir })).resolves.toMatchObject({
+      status: 'restored-pending-cleanup',
+    });
+    await expect(restoreCodexProvenancePatch({ extensionDir })).resolves.toMatchObject({
+      status: 'already-restored',
+    });
+  });
+
+  it('reports both-gone cleanup after final metadata directory sync fails', async () => {
+    const { applyCodexProvenancePatch, inspectCodexProvenancePatch, restoreCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const result = await applyCodexProvenancePatch({ extensionDir });
+
+    await expect(restoreCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        syncDirectory: async () => {
+          if (
+            await readOptional(result.backupPath) === undefined
+            && await readOptional(result.metadataPath) === undefined
+          ) {
+            throw new Error('metadata removal directory sync failed');
+          }
+        },
+      },
+    })).rejects.toThrow(/cleanup observably complete.*re-run restore/iu);
+
+    await expect(inspectCodexProvenancePatch({ extensionDir })).resolves.toMatchObject({
+      status: 'not-patched',
+    });
+    await expect(restoreCodexProvenancePatch({ extensionDir })).resolves.toMatchObject({
+      status: 'already-restored',
+    });
   });
 });
