@@ -157,6 +157,59 @@ describe('Codex provenance host source transform', () => {
     expect(runtime.handlers).toHaveLength(2);
   });
 
+  it('rejects an exact notification anchor moved outside the activation function body', async () => {
+    const { patchCodexHostSource } = await sourceTransform();
+    const source = minifiedHostFixture().replace(
+      `${NOTIFICATION_ANCHOR}}globalThis`,
+      `}${NOTIFICATION_ANCHOR}globalThis`,
+    );
+
+    expect(() => patchCodexHostSource(source))
+      .toThrow(/inside the Codex activation function body/u);
+  });
+
+  it.each([
+    ['if control flow', 'if(i)'],
+    ['a label', 'bridgeLabel:'],
+    ['a comma expression', 'void 0,'],
+  ])('rejects a notification anchor attached to %s', async (_name, prefix) => {
+    const { patchCodexHostSource } = await sourceTransform();
+    const source = minifiedHostFixture().replace(
+      NOTIFICATION_ANCHOR,
+      `${prefix}${NOTIFICATION_ANCHOR}`,
+    );
+
+    expect(() => patchCodexHostSource(source))
+      .toThrow(/standalone statement boundary/u);
+  });
+
+  it('finds the activation boundary across nested and lexical brace traps', async () => {
+    const { patchCodexHostSource } = await sourceTransform();
+    const lexicalTraps = 'const lexicalTraps={nested:{close:"}"}},stringTrap="}",templateTrap=`literal } ${{value:"{"}.value}`,regexTrap=/[{}]/u;/* } */ // }\n;';
+    const source = minifiedHostFixture().replace(
+      NOTIFICATION_ANCHOR,
+      `${lexicalTraps}${NOTIFICATION_ANCHOR}`,
+    );
+
+    const runtime = await executePatchedFixture(patchCodexHostSource(source).source);
+    const event = { method: 'item/fileChange/patchUpdated', params: { itemId: 'patch' } };
+    runtime.handlers[0](event);
+    await Promise.resolve();
+
+    expect(runtime.provenanceCalls).toEqual([event]);
+  });
+
+  it('fails closed when the activation body cannot be lexically bounded', async () => {
+    const { patchCodexHostSource } = await sourceTransform();
+    const source = minifiedHostFixture().replace(
+      NOTIFICATION_ANCHOR,
+      `/* unclosed activation comment } ${NOTIFICATION_ANCHOR}`,
+    );
+
+    expect(() => patchCodexHostSource(source))
+      .toThrow(/Could not establish the Codex activation function boundary.*block comment/u);
+  });
+
   it('is exactly idempotent and restores the original bytes', async () => {
     const { patchCodexHostSource, unpatchCodexHostSource } = await sourceTransform();
     const original = minifiedHostFixture();

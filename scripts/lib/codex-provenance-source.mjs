@@ -78,7 +78,224 @@ function markerPair(source) {
   return { start: starts[0].index, end: ends[0].end };
 }
 
-function anchorsIn(source) {
+const CONTROL_PAREN_KEYWORDS = new Set(['catch', 'for', 'if', 'switch', 'while', 'with']);
+const EXPRESSION_PREFIX_KEYWORDS = new Set([
+  'await',
+  'case',
+  'delete',
+  'do',
+  'else',
+  'in',
+  'instanceof',
+  'new',
+  'of',
+  'return',
+  'throw',
+  'typeof',
+  'void',
+  'yield',
+]);
+
+function skipQuotedString(source, start, quote) {
+  let index = start + 1;
+  while (index < source.length) {
+    const character = source[index];
+    if (character === '\\') {
+      if (index + 1 >= source.length) throw new Error('unterminated string escape');
+      index += 2;
+      continue;
+    }
+    if (character === quote) return index + 1;
+    if (character === '\n' || character === '\r') throw new Error('unterminated string literal');
+    index += 1;
+  }
+  throw new Error('unterminated string literal');
+}
+
+function skipBlockComment(source, start) {
+  const end = source.indexOf('*/', start + 2);
+  if (end === -1) throw new Error('unterminated block comment');
+  return end + 2;
+}
+
+function skipLineComment(source, start) {
+  const lineFeed = source.indexOf('\n', start + 2);
+  const carriageReturn = source.indexOf('\r', start + 2);
+  if (lineFeed === -1) return carriageReturn === -1 ? source.length : carriageReturn;
+  if (carriageReturn === -1) return lineFeed;
+  return Math.min(lineFeed, carriageReturn);
+}
+
+function skipRegexLiteral(source, start) {
+  let index = start + 1;
+  let inCharacterClass = false;
+  while (index < source.length) {
+    const character = source[index];
+    if (character === '\\') {
+      if (index + 1 >= source.length) throw new Error('unterminated regular expression escape');
+      index += 2;
+      continue;
+    }
+    if (character === '\n' || character === '\r') {
+      throw new Error('unterminated regular expression literal');
+    }
+    if (character === '[') inCharacterClass = true;
+    else if (character === ']') inCharacterClass = false;
+    else if (character === '/' && inCharacterClass === false) {
+      index += 1;
+      while (/[A-Za-z]/u.test(source[index] ?? '')) index += 1;
+      return index;
+    }
+    index += 1;
+  }
+  throw new Error('unterminated regular expression literal');
+}
+
+function skipTemplateLiteral(source, start) {
+  let index = start + 1;
+  while (index < source.length) {
+    const character = source[index];
+    if (character === '\\') {
+      if (index + 1 >= source.length) throw new Error('unterminated template escape');
+      index += 2;
+      continue;
+    }
+    if (character === '`') return index + 1;
+    if (character === '$' && source[index + 1] === '{') {
+      index = matchingBraceIndex(source, index + 1) + 1;
+      continue;
+    }
+    index += 1;
+  }
+  throw new Error('unterminated template literal');
+}
+
+function matchingBraceIndex(source, openingBrace) {
+  if (source[openingBrace] !== '{') throw new Error('expected an opening brace');
+  let braceDepth = 1;
+  let bracketDepth = 0;
+  let index = openingBrace + 1;
+  let pendingControlParen = false;
+  const controlParens = [];
+  let regexState = 'allowed';
+
+  while (index < source.length) {
+    const character = source[index];
+    if (/\s/u.test(character)) {
+      index += 1;
+      continue;
+    }
+    if (character === '/' && source[index + 1] === '*') {
+      index = skipBlockComment(source, index);
+      continue;
+    }
+    if (character === '/' && source[index + 1] === '/') {
+      index = skipLineComment(source, index);
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      pendingControlParen = false;
+      index = skipQuotedString(source, index, character);
+      regexState = 'disallowed';
+      continue;
+    }
+    if (character === '`') {
+      pendingControlParen = false;
+      index = skipTemplateLiteral(source, index);
+      regexState = 'disallowed';
+      continue;
+    }
+    if (character === '/') {
+      pendingControlParen = false;
+      if (regexState === 'ambiguous') {
+        throw new Error('ambiguous slash after a closing brace');
+      }
+      if (regexState === 'allowed') {
+        index = skipRegexLiteral(source, index);
+        regexState = 'disallowed';
+      } else {
+        index += source[index + 1] === '=' ? 2 : 1;
+        regexState = 'allowed';
+      }
+      continue;
+    }
+    if (/[A-Za-z_$]/u.test(character)) {
+      let end = index + 1;
+      while (/[\w$]/u.test(source[end] ?? '')) end += 1;
+      const word = source.slice(index, end);
+      pendingControlParen = CONTROL_PAREN_KEYWORDS.has(word);
+      regexState = pendingControlParen || EXPRESSION_PREFIX_KEYWORDS.has(word)
+        ? 'allowed'
+        : 'disallowed';
+      index = end;
+      continue;
+    }
+    if (/[0-9]/u.test(character)) {
+      pendingControlParen = false;
+      let end = index + 1;
+      while (/[\w.]/u.test(source[end] ?? '')) end += 1;
+      index = end;
+      regexState = 'disallowed';
+      continue;
+    }
+
+    if (character !== '(') pendingControlParen = false;
+    if (character === '(') {
+      controlParens.push(pendingControlParen);
+      pendingControlParen = false;
+      regexState = 'allowed';
+    } else if (character === ')') {
+      if (controlParens.length === 0) throw new Error('unmatched closing parenthesis');
+      regexState = controlParens.pop() ? 'allowed' : 'disallowed';
+    } else if (character === '[') {
+      bracketDepth += 1;
+      regexState = 'allowed';
+    } else if (character === ']') {
+      if (bracketDepth === 0) throw new Error('unmatched closing bracket');
+      bracketDepth -= 1;
+      regexState = 'disallowed';
+    } else if (character === '{') {
+      braceDepth += 1;
+      regexState = 'allowed';
+    } else if (character === '}') {
+      braceDepth -= 1;
+      if (braceDepth === 0) {
+        if (controlParens.length !== 0 || bracketDepth !== 0) {
+          throw new Error('unbalanced delimiter before the closing brace');
+        }
+        return index;
+      }
+      regexState = 'ambiguous';
+    } else if (character === '.' && source.slice(index, index + 3) === '...') {
+      index += 2;
+      regexState = 'allowed';
+    } else if (character === '.') {
+      regexState = 'disallowed';
+    } else if ((character === '+' || character === '-') && source[index + 1] === character) {
+      index += 1;
+      regexState = regexState === 'disallowed' ? 'disallowed' : 'allowed';
+    } else {
+      regexState = 'allowed';
+    }
+    index += 1;
+  }
+  throw new Error('unterminated code block');
+}
+
+function activationBodyClosingBrace(source, activation) {
+  const relativeOpeningBrace = activation[0].indexOf('{');
+  if (relativeOpeningBrace === -1) {
+    throw new Error('Could not establish the Codex activation function boundary: missing opening brace');
+  }
+  try {
+    return matchingBraceIndex(source, activation.index + relativeOpeningBrace);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not establish the Codex activation function boundary: ${detail}`);
+  }
+}
+
+function anchorsIn(source, pair) {
   const activation = exactlyOne(source, ACTIVATION_ANCHOR, 'activation');
   const notification = exactlyOne(source, NOTIFICATION_ANCHOR, 'notification');
   const vscodeUsage = exactlyOne(source, VSCODE_USAGE_ANCHOR, 'VS Code usage');
@@ -88,6 +305,19 @@ function anchorsIn(source) {
   }
   if (activation.index >= vscodeUsage.index || vscodeUsage.index >= notification.index) {
     throw new Error('Expected exactly one Codex provenance activation anchor sequence');
+  }
+
+  const activationClose = activationBodyClosingBrace(source, activation);
+  const insertionIndex = pair?.start ?? notification.index;
+  if (
+    vscodeUsage.index >= activationClose
+    || notification.index >= activationClose
+    || insertionIndex >= activationClose
+  ) {
+    throw new Error('Expected the Codex provenance anchors and insertion point inside the Codex activation function body');
+  }
+  if (source[insertionIndex - 1] !== ';') {
+    throw new Error('Expected a standalone statement boundary before the Codex provenance insertion point');
   }
 
   const vscode = vscodeUsage.groups.vscode;
@@ -122,7 +352,7 @@ function assertExactBridgeBlock(source, pair, anchors) {
 
 export function patchCodexHostSource(source) {
   const pair = markerPair(source);
-  const anchors = anchorsIn(source);
+  const anchors = anchorsIn(source, pair);
   if (pair !== undefined) {
     assertExactBridgeBlock(source, pair, anchors);
     return { status: 'already-patched', source };
@@ -140,7 +370,7 @@ export function patchCodexHostSource(source) {
 export function unpatchCodexHostSource(source) {
   const pair = markerPair(source);
   if (pair === undefined) return { status: 'not-patched', source };
-  const anchors = anchorsIn(source);
+  const anchors = anchorsIn(source, pair);
   assertExactBridgeBlock(source, pair, anchors);
   return {
     status: 'restored',
