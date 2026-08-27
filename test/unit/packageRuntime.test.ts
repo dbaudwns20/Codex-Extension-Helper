@@ -170,6 +170,64 @@ function completedUpdate(before: string, after: string, itemId = 'item-1') {
   };
 }
 
+function completedPathUpdate(
+  relativePath: string,
+  before: string,
+  after: string,
+  itemId = 'item-1',
+) {
+  return {
+    method: 'item/completed',
+    params: {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      item: {
+        id: itemId,
+        type: 'fileChange',
+        status: 'completed',
+        changes: [{
+          path: relativePath,
+          kind: { type: 'update', move_path: null },
+          diff: [
+            `--- a/${relativePath}`,
+            `+++ b/${relativePath}`,
+            '@@ -1 +1 @@',
+            `-${before}`,
+            `+${after}`,
+            '',
+          ].join('\n'),
+        }],
+      },
+    },
+  };
+}
+
+function completedAdd(relativePath: string, text: string, itemId = 'item-add') {
+  return {
+    method: 'item/completed',
+    params: {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      item: {
+        id: itemId,
+        type: 'fileChange',
+        status: 'completed',
+        changes: [{
+          path: relativePath,
+          kind: { type: 'add' },
+          diff: [
+            '--- /dev/null',
+            `+++ b/${relativePath}`,
+            '@@ -0,0 +1 @@',
+            `+${text}`,
+            '',
+          ].join('\n'),
+        }],
+      },
+    },
+  };
+}
+
 function updatedUpdate(before: string, after: string, itemId = 'item-1') {
   const completed = completedUpdate(before, after, itemId);
   return {
@@ -1169,6 +1227,67 @@ describe('packaged runtime', () => {
         provenance: undefined,
       });
       expect(runtime.comparisonCount).toBe(0);
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears notification-first evidence for an untracked add across workspace reset', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const untrackedUri = {
+        ...fake.uri,
+        path: '/workspace/untracked.ts',
+        fsPath: '/workspace/untracked.ts',
+        toString: () => 'file:///workspace/untracked.ts',
+      };
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: true, warningShown: false });
+
+      await sendCodexNotification(
+        fake,
+        completedAdd('untracked.ts', 'stale', 'old-item'),
+      );
+      const removed = fake.workspace.workspaceFolders.splice(0);
+      await fake.callbacks.get('workspaceFolders')!({ added: [], removed });
+      fake.workspace.workspaceFolders.push(...removed);
+      await fake.callbacks.get('workspaceFolders')!({ added: removed, removed: [] });
+
+      fake.writeFile('stale\n', untrackedUri);
+      fake.callbacks.get('watcherCreate')!(untrackedUri);
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(0);
+      expect((runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(untrackedUri.toString())).toMatchObject({
+        baselineText: 'stale\n',
+        provenance: undefined,
+      });
+
+      await sendCodexNotification(
+        fake,
+        completedPathUpdate('untracked.ts', 'stale', 'fresh', 'new-item'),
+      );
+      fake.writeFile('fresh\n', untrackedUri);
+      fake.callbacks.get('watcherChange')!(untrackedUri);
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(1);
+      expect((runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(untrackedUri.toString())).toMatchObject({
+        baselineText: 'stale\n',
+        currentText: 'fresh\n',
+        provenance: expect.objectContaining({ confidence: 'exact' }),
+      });
       runtime.dispose();
     } finally {
       vi.useRealTimers();

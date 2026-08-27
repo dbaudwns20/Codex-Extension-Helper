@@ -1208,9 +1208,9 @@ export class ExtensionRuntime implements vscode.Disposable {
       return;
     }
 
+    await this.gate.invalidateAll();
     for (const [key, uri] of [...this.trackedUris]) {
       if (event.removed.some((folder) => this.isWithin(uri, folder.uri))) {
-        await this.gate.invalidate(key);
         this.deleteKey(key);
       }
     }

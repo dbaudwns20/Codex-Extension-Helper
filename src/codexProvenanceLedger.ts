@@ -314,31 +314,27 @@ export class CodexProvenanceLedger {
       ...(this.evidenceByNormalizedKey.get(key) ?? []),
       ...(this.invalidatedGenerations.get(key)?.evidence ?? []),
     ]);
-    const affectedKeys = new Set([key]);
-    for (const [normalizedKey, mappedItemKeys] of this.itemKeysByNormalizedKey) {
-      if ([...mappedItemKeys].some((itemKey) => itemKeys.has(itemKey))) {
-        affectedKeys.add(normalizedKey);
-      }
-    }
-    for (const normalizedKey of affectedKeys) {
-      for (const value of this.evidenceByNormalizedKey.get(normalizedKey) ?? []) {
-        evidence.add(value);
-      }
-    }
     if (itemKeys.size > 0 || evidence.size > 0) {
       this.invalidateGeneration(key, itemKeys, evidence);
     }
-    for (const itemKey of itemKeys) this.items.delete(itemKey);
     const generation = this.invalidatedGenerations.get(key);
     if (generation !== undefined) {
       generation.cleanupWatermark = Math.max(generation.cleanupWatermark, this.latestRecordOrder);
       generation.cleanupComplete = true;
     }
-    for (const normalizedKey of affectedKeys) {
-      this.ready.delete(normalizedKey);
-      this.evidenceByNormalizedKey.delete(normalizedKey);
-      this.itemKeysByNormalizedKey.delete(normalizedKey);
-    }
+    this.ready.delete(key);
+    this.evidenceByNormalizedKey.delete(key);
+    this.itemKeysByNormalizedKey.delete(key);
+  }
+
+  clear(): void {
+    this.items.clear();
+    this.retiredEvidence.clear();
+    this.evidenceByNormalizedKey.clear();
+    this.itemKeysByNormalizedKey.clear();
+    this.invalidatedGenerations.clear();
+    this.ready.clear();
+    this.latestRecordOrder = 0;
   }
 
   prune(now: number): void {
@@ -402,8 +398,7 @@ export class CodexProvenanceLedger {
       return true;
     }
 
-    const generationHasLiveItems = [...generation.itemKeys].some((itemKey) => this.items.has(itemKey));
-    if (!generation.cleanupComplete || generationHasLiveItems) {
+    if (!generation.cleanupComplete) {
       generation.itemKeys.add(item.key);
       generation.evidence.add(evidence);
       this.retiredEvidence.add(evidence);

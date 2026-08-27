@@ -34,6 +34,20 @@ function update(path: string, before: string, after: string): CodexFileUpdateCha
   };
 }
 
+function add(path: string, text: string): CodexFileUpdateChange {
+  return {
+    path,
+    kind: { type: 'add' },
+    diff: [
+      '--- /dev/null',
+      `+++ b/${path}`,
+      '@@ -0,0 +1 @@',
+      `+${text}`,
+      '',
+    ].join('\n'),
+  };
+}
+
 function remove(path: string, text: string): CodexFileUpdateChange {
   return {
     path,
@@ -620,6 +634,89 @@ describe('CodexChangeGate', () => {
     await gate.handleCandidate(candidate);
 
     expect(proven).toEqual([]);
+  });
+
+  it('globally invalidates untracked eligible evidence and pending candidates silently', async () => {
+    const acceptedStates: Record<string, ProvenanceFileState> = {
+      'new.txt': state('new.txt', false),
+      'pending.txt': state('pending.txt', true, 'old\n'),
+    };
+    const { clock, gate, proven, unproven, flush } = setup(acceptedStates);
+    await gate.handleNotification(completed([add('new.txt', 'stale')], 'old-item'));
+    await gate.handleCandidate(present('pending.txt', 'pending\n'));
+
+    const invalidateAll = (gate as CodexChangeGate & {
+      invalidateAll(): Promise<void>;
+    }).invalidateAll;
+    expect(invalidateAll).toBeTypeOf('function');
+    if (invalidateAll === undefined) return;
+    await invalidateAll.call(gate);
+    clock.advance(100);
+    await flush();
+
+    expect(proven).toEqual([]);
+    expect(unproven).toEqual([]);
+
+    const stale = present('new.txt', 'stale\n');
+    const fresh = present('new.txt', 'fresh\n');
+    await gate.handleCandidate(stale);
+    expect(proven).toEqual([]);
+    await gate.handleCandidate(fresh);
+    acceptedStates['new.txt'] = state('new.txt', true, 'stale\n');
+    await gate.handleNotification(completed(
+      [update('new.txt', 'stale', 'fresh')],
+      'new-item',
+    ));
+
+    expect(proven).toEqual([expect.objectContaining({
+      key: fresh.key,
+      after: expect.objectContaining({ text: 'fresh\n' }),
+    })]);
+    expect(unproven).toEqual([stale]);
+  });
+
+  it('globally invalidates rejected item tombstones', async () => {
+    const candidate = present('new.txt', 'new\n');
+    let workspaceUri: vscode.Uri | undefined;
+    const { gate, proven } = setup({
+      'new.txt': state('new.txt', false),
+    }, {
+      resolveWorkspacePath: () => workspaceUri,
+    });
+    const notification = completed([add('new.txt', 'new')], 'reused-item');
+    await gate.handleNotification(notification);
+
+    const invalidateAll = (gate as CodexChangeGate & {
+      invalidateAll(): Promise<void>;
+    }).invalidateAll;
+    expect(invalidateAll).toBeTypeOf('function');
+    if (invalidateAll === undefined) return;
+    await invalidateAll.call(gate);
+    workspaceUri = candidate.uri;
+    await gate.handleNotification(notification);
+    await gate.handleCandidate(candidate);
+
+    expect(proven).toHaveLength(1);
+  });
+
+  it('globally invalidates proven identities and their same-byte shadows', async () => {
+    const candidate = present('file.txt', 'new\n');
+    const notification = completed([update('file.txt', 'old', 'new')]);
+    const { gate, proven, unproven } = setup({
+      'file.txt': state('file.txt', true, 'old\n'),
+    });
+    await gate.handleNotification(notification);
+    await gate.handleCandidate(candidate);
+    await gate.handleCandidate(candidate);
+    expect(proven).toHaveLength(1);
+
+    await gate.invalidateAll();
+    await gate.handleNotification(notification);
+    expect(proven).toHaveLength(1);
+    await gate.handleCandidate(candidate);
+
+    expect(proven).toHaveLength(2);
+    expect(unproven).toEqual([]);
   });
 
   it('keeps default completed evidence beyond the maximum configured watcher debounce', async () => {

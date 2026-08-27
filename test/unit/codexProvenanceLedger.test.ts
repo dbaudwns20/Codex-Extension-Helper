@@ -474,6 +474,52 @@ describe('CodexProvenanceLedger', () => {
     );
   });
 
+  it('retires only one file from a shared multi-file item', () => {
+    const ledger = new CodexProvenanceLedger();
+    ledger.record(completed([
+      update('a.txt', 'old-a', 'new'),
+      update('b.txt', 'old-b', 'new'),
+    ], 'shared-item'));
+    const resolveAcceptedPath = accepted({
+      'a.txt': state('a.txt', true, 'old-a\n'),
+      'b.txt': state('b.txt', true, 'old-b\n'),
+    });
+    ledger.completedTransitions(resolveAcceptedPath);
+
+    ledger.retireKey(
+      'file:///workspace/a.txt',
+      ['thread-1\0turn-1\0shared-item'],
+    );
+
+    expect(ledger.consume('file:///workspace/a.txt', NEW_HASH)).toBeUndefined();
+    expect(ledger.consume('file:///workspace/b.txt', NEW_HASH)).toEqual(
+      expect.objectContaining({
+        key: 'file:///workspace/b.txt',
+        provenance: expect.objectContaining({ itemIds: ['shared-item'] }),
+      }),
+    );
+  });
+
+  it('clears ready, retired, and generation evidence for a workspace reset', () => {
+    const ledger = new CodexProvenanceLedger();
+    const resolveAcceptedPath = accepted({
+      'file.txt': state('file.txt', true, 'old\n'),
+    });
+    const notification = completed([update('file.txt', 'old', 'new')]);
+    ledger.record(notification);
+    ledger.completedTransitions(resolveAcceptedPath);
+    ledger.invalidate('file:///workspace/file.txt');
+
+    const clear = (ledger as CodexProvenanceLedger & { clear(): void }).clear;
+    expect(clear).toBeTypeOf('function');
+    if (clear === undefined) return;
+    clear.call(ledger);
+
+    expect(ledger.completedTransitions(resolveAcceptedPath)).toEqual([]);
+    ledger.record(notification);
+    expect(ledger.completedTransitions(resolveAcceptedPath)).toHaveLength(1);
+  });
+
   it('prunes expired entries without turning elapsed time into proof', () => {
     let now = 1_000;
     const ledger = new CodexProvenanceLedger(100, () => now);

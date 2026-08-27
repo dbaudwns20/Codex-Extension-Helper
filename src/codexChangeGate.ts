@@ -231,6 +231,11 @@ export class CodexChangeGate implements vscode.Disposable {
         } catch (error) {
           firstError ??= error;
         }
+        if (terminal
+          && !this.eligibleTransitions.has(key)
+          && !this.provenCandidateIdentities.get(key)?.itemKeys.has(itemKey)) {
+          this.ledger.retireKey(key, [itemKey]);
+        }
       }
       this.armTimer();
       if (firstError !== undefined) throw firstError;
@@ -331,6 +336,21 @@ export class CodexChangeGate implements vscode.Disposable {
       this.inProgressItemKeys.delete(key);
       this.ledger.retireKey(key, retiredItemKeys);
       this.armTimer();
+    });
+  }
+
+  invalidateAll(): Promise<void> {
+    return this.enqueue(async () => {
+      if (this.disposeRequested) return;
+
+      this.cancelTimer();
+      this.pendingCandidates.clear();
+      this.shadowCandidates.clear();
+      this.provenCandidateIdentities.clear();
+      this.eligibleTransitions.clear();
+      this.inProgressItemKeys.clear();
+      this.rejectedItems.clear();
+      this.ledger.clear();
     });
   }
 
