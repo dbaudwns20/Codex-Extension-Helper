@@ -23,6 +23,8 @@ export interface ReviewHost {
   ): Promise<boolean>;
   replaceAll(document: LiveReviewDocument, text: string): Promise<boolean>;
   deleteToTrash(uri: vscode.Uri): Promise<void>;
+  isFileAbsent(uri: vscode.Uri): Promise<boolean>;
+  restoreDeletedFile(uri: vscode.Uri, text: string): Promise<boolean>;
   reveal(document: LiveReviewDocument, line: number): void;
   showError(message: string): void;
   log(scope: string, error: unknown): void;
@@ -30,7 +32,13 @@ export interface ReviewHost {
 
 type ReviewCoordinator = Pick<
   ComparisonCoordinator,
-  'state' | 'resolveHunk' | 'approveHunk' | 'approveAll' | 'delete'
+  | 'state'
+  | 'resolveHunk'
+  | 'approveHunk'
+  | 'approveAll'
+  | 'approveDeleted'
+  | 'rejectDeleted'
+  | 'delete'
 >;
 
 interface ResolvedHunkAction {
@@ -42,6 +50,8 @@ interface ResolvedHunkAction {
 const REJECT_ERROR = 'Could not reject Codex changes.';
 const REJECT_SCOPE = 'Reject Codex changes';
 const SYNCHRONIZE_SCOPE = 'Synchronize Codex review state';
+const APPROVE_DELETED_ERROR = 'Could not approve the deleted Codex file.';
+const APPROVE_DELETED_SCOPE = 'Approve deleted Codex file';
 
 export class ReviewController implements vscode.Disposable {
   private readonly mutationTails = new Map<string, Promise<void>>();
@@ -161,6 +171,11 @@ export class ReviewController implements vscode.Disposable {
   async approveFile(uri: vscode.Uri): Promise<void> {
     const key = uri.toString();
     await this.serializeMutation(key, async () => {
+      const deleted = this.deletedState(key);
+      if (deleted !== undefined) {
+        await this.approveDeletedFile(uri, deleted);
+        return;
+      }
       if (!await this.prepareCanonicalDocument(key)) {
         return;
       }
@@ -247,6 +262,11 @@ export class ReviewController implements vscode.Disposable {
   async rejectFile(uri: vscode.Uri): Promise<void> {
     const key = uri.toString();
     await this.serializeMutation(key, async () => {
+      const deleted = this.deletedState(key);
+      if (deleted !== undefined) {
+        await this.rejectDeletedFile(uri, deleted);
+        return;
+      }
       if (!await this.prepareCanonicalDocument(key)) {
         return;
       }
@@ -432,6 +452,69 @@ export class ReviewController implements vscode.Disposable {
       return;
     }
     this.host.reveal(document, reviewAnchor(state.hunks[index]));
+  }
+
+  private deletedState(
+    key: string,
+    expectedRevision?: number,
+  ): FileComparisonState | undefined {
+    const state = this.coordinator.state(key);
+    return state !== undefined
+      && state.lifecycle === 'deleted'
+      && state.comparisonActive
+      && state.pending
+      && state.currentText === ''
+      && (expectedRevision === undefined || state.sourceRevision === expectedRevision)
+      ? state
+      : undefined;
+  }
+
+  private async approveDeletedFile(
+    uri: vscode.Uri,
+    initial: FileComparisonState,
+  ): Promise<void> {
+    try {
+      if (!await this.host.isFileAbsent(uri)) {
+        throw new Error('The deleted path now exists.');
+      }
+      const result = this.coordinator.approveDeleted(uri.toString(), initial.sourceRevision);
+      if (result !== 'approved') {
+        throw new Error(`The deleted comparison is ${result}.`);
+      }
+    } catch (error) {
+      this.host.log(APPROVE_DELETED_SCOPE, error);
+      if (!this.disposed) {
+        this.host.showError(APPROVE_DELETED_ERROR);
+      }
+      return;
+    }
+    this.synchronize(uri.toString());
+  }
+
+  private async rejectDeletedFile(
+    uri: vscode.Uri,
+    initial: FileComparisonState,
+  ): Promise<void> {
+    try {
+      if (!await this.host.isFileAbsent(uri)) {
+        throw new Error('The deleted path now exists.');
+      }
+      const current = this.deletedState(uri.toString(), initial.sourceRevision);
+      if (current === undefined) {
+        throw new Error('The deleted comparison changed before restoration.');
+      }
+      if (!await this.host.restoreDeletedFile(uri, current.baselineText)) {
+        throw new Error('The deleted path could not be restored without overwriting a file.');
+      }
+      const result = this.coordinator.rejectDeleted(uri.toString(), current.sourceRevision);
+      if (result !== 'approved') {
+        throw new Error(`The deleted comparison is ${result} after restoration.`);
+      }
+    } catch (error) {
+      this.reportRejectionFailure(error);
+      return;
+    }
+    this.synchronize(uri.toString());
   }
 
   private synchronize(key: string): void {

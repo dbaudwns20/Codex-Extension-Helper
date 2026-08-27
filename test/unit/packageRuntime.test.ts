@@ -153,11 +153,15 @@ function installRuntimeVscode(initialText = 'before\n') {
     toString: () => 'file:///workspace/file.ts',
     with(changes: Record<string, string>) {
       const scheme = changes.scheme ?? this.scheme;
+      const uriPath = changes.path ?? this.path;
+      const query = changes.query ?? '';
       return {
         ...this,
         ...changes,
         scheme,
-        toString: () => `${scheme}:///workspace/file.ts?${changes.query ?? ''}`,
+        path: uriPath,
+        fsPath: uriPath,
+        toString: () => `${scheme}://${uriPath}${query === '' ? '' : `?${query}`}`,
       };
     },
   };
@@ -207,6 +211,12 @@ function installRuntimeVscode(initialText = 'before\n') {
     setDecorations: vi.fn(),
     revealRange: vi.fn(),
   };
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const files = new Map<string, Uint8Array>([
+    [uri.toString(), encoder.encode(initialText)],
+    [secondUri.toString(), encoder.encode('second\n')],
+  ]);
   const disposables: { dispose(): void }[] = [];
   const disposable = () => {
     const value = { dispose: vi.fn() };
@@ -239,7 +249,7 @@ function installRuntimeVscode(initialText = 'before\n') {
     dispose: vi.fn(),
   };
   const createSourceControl = vi.fn(() => sourceControl);
-  let contentProvider: { provideTextDocumentContent(uri: unknown): string } | undefined;
+  const contentProviders = new Map<string, { provideTextDocumentContent(uri: unknown): string }>();
   let codeLensProvider: { provideCodeLenses(document: unknown): FakeCodeLens[] } | undefined;
   const window = {
     activeTextEditor: editor as typeof editor | typeof secondEditor | undefined,
@@ -260,6 +270,9 @@ function installRuntimeVscode(initialText = 'before\n') {
   const workspace = {
     textDocuments: [document] as Array<typeof document | typeof secondDocument>,
     openTextDocument: vi.fn(async (resource: typeof uri) => {
+      if (!files.has(resource.toString())) {
+        throw Object.assign(new Error('File not found'), { code: 'FileNotFound' });
+      }
       const opened = resource.toString() === secondUri.toString() ? secondDocument : document;
       if (!workspace.textDocuments.includes(opened)) {
         workspace.textDocuments.push(opened);
@@ -267,8 +280,40 @@ function installRuntimeVscode(initialText = 'before\n') {
       return opened;
     }),
     fs: {
-      readFile: vi.fn(async () => new TextEncoder().encode(text)),
-      delete: vi.fn().mockResolvedValue(undefined),
+      readFile: vi.fn(async (resource: typeof uri) => {
+        const contents = files.get(resource.toString());
+        if (contents === undefined) {
+          throw Object.assign(new Error('File not found'), { code: 'FileNotFound' });
+        }
+        return contents;
+      }),
+      stat: vi.fn(async (resource: typeof uri) => {
+        if (!files.has(resource.toString())) {
+          throw Object.assign(new Error('File not found'), { code: 'FileNotFound' });
+        }
+        return { type: 1, ctime: 0, mtime: 0, size: files.get(resource.toString())!.byteLength };
+      }),
+      writeFile: vi.fn(async (resource: typeof uri, contents: Uint8Array) => {
+        files.set(resource.toString(), contents);
+      }),
+      rename: vi.fn(async (
+        source: typeof uri,
+        target: typeof uri,
+        options: { overwrite?: boolean } = {},
+      ) => {
+        const contents = files.get(source.toString());
+        if (contents === undefined) {
+          throw Object.assign(new Error('File not found'), { code: 'FileNotFound' });
+        }
+        if (!options.overwrite && files.has(target.toString())) {
+          throw Object.assign(new Error('File exists'), { code: 'FileExists' });
+        }
+        files.set(target.toString(), contents);
+        files.delete(source.toString());
+      }),
+      delete: vi.fn(async (resource: typeof uri) => {
+        files.delete(resource.toString());
+      }),
     },
     applyEdit: vi.fn(async (edit: FakeWorkspaceEdit) => {
       if (edit.replacements.length === 0) {
@@ -282,6 +327,7 @@ function installRuntimeVscode(initialText = 'before\n') {
         const replacementText = String(replacement[2]);
         text = text.slice(0, startOffset) + replacementText + text.slice(endOffset);
       }
+      files.set(uri.toString(), encoder.encode(text));
       version += 1;
       callbacks.get('documentChange')?.({
         document,
@@ -291,9 +337,17 @@ function installRuntimeVscode(initialText = 'before\n') {
       return true;
     }),
     createFileSystemWatcher: vi.fn(() => watcher),
-    registerTextDocumentContentProvider: vi.fn((_scheme: string, provider: typeof contentProvider) => {
-      contentProvider = provider;
-      return disposable();
+    registerTextDocumentContentProvider: vi.fn((scheme: string, provider: { provideTextDocumentContent(uri: unknown): string }) => {
+      contentProviders.set(scheme, provider);
+      const registration = disposable();
+      const disposeRegistration = registration.dispose;
+      registration.dispose = vi.fn(() => {
+        if (contentProviders.get(scheme) === provider) {
+          contentProviders.delete(scheme);
+        }
+        disposeRegistration();
+      });
+      return registration;
     }),
     getConfiguration: vi.fn(() => ({
       get: (key: string) => ({
@@ -358,10 +412,23 @@ function installRuntimeVscode(initialText = 'before\n') {
     currentText() {
       return text;
     },
+    deleteFile(resource: typeof uri = uri) {
+      files.delete(resource.toString());
+      workspace.textDocuments = workspace.textDocuments.filter(
+        (candidate) => candidate.uri.toString() !== resource.toString(),
+      );
+      window.visibleTextEditors = window.visibleTextEditors.filter(
+        (candidate) => candidate.document.uri.toString() !== resource.toString(),
+      );
+    },
     document,
     editor,
     executeCommand,
     output,
+    fileText(resource: typeof uri = uri): string | undefined {
+      const contents = files.get(resource.toString());
+      return contents === undefined ? undefined : decoder.decode(contents);
+    },
     quickDiffBaseline(): string | undefined {
       const provider = sourceControl.quickDiffProvider as {
         provideOriginalResource(uri: unknown): unknown;
@@ -369,14 +436,19 @@ function installRuntimeVscode(initialText = 'before\n') {
       const baseline = provider?.provideOriginalResource(uri);
       return baseline === undefined
         ? undefined
-        : contentProvider?.provideTextDocumentContent(baseline);
+        : contentProviders.get((baseline as { scheme: string }).scheme)
+          ?.provideTextDocumentContent(baseline);
     },
     secondDocument,
     secondEditor,
     setText(value: string, isDirty = false) {
       text = value;
+      files.set(uri.toString(), encoder.encode(value));
       version += 1;
       dirty = isDirty;
+    },
+    writeFile(value: string, resource: typeof uri = uri) {
+      files.set(resource.toString(), encoder.encode(value));
     },
     setEnabled(value: boolean) {
       enabled = value;
@@ -385,6 +457,9 @@ function installRuntimeVscode(initialText = 'before\n') {
     uri,
     window,
     workspace,
+    virtualContent(resource: { scheme: string }): string | undefined {
+      return contentProviders.get(resource.scheme)?.provideTextDocumentContent(resource);
+    },
   };
 }
 
@@ -530,6 +605,184 @@ describe('packaged runtime', () => {
       await settleRuntime();
 
       expect(fake.changesGroup.resourceStates).toEqual([]);
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('lists a deleted file and opens its exact baseline against a virtual empty current document', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\r\nexact\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+      fake.deleteFile();
+      fake.window.activeTextEditor = fake.secondEditor;
+
+      await runtime.simulateExternalChange(fake.uri as never, 'before\r\nexact\n', '', 'deleted');
+      await settleRuntime();
+
+      expect(fake.changesGroup.resourceStates).toEqual([
+        expect.objectContaining({ resourceUri: fake.uri }),
+      ]);
+      expect(runtime.comparisonCount).toBe(1);
+      expect(runtime.renderedComparisonCount).toBe(0);
+      expect(fake.codeLenses()).toEqual([]);
+      expect(fake.workspace.applyEdit).not.toHaveBeenCalled();
+      expect(fake.workspace.openTextDocument).not.toHaveBeenCalled();
+
+      await runtime.openActiveDiff(fake.uri as never);
+      const diffCall = fake.executeCommand.mock.calls.find(([command]) => command === 'vscode.diff');
+      expect(diffCall).toBeDefined();
+      const [, baseline, current] = diffCall!;
+      expect(baseline).toMatchObject({ scheme: 'codex-baseline' });
+      expect(current).toMatchObject({ scheme: 'codex-current' });
+      expect(fake.virtualContent(baseline)).toBe('before\r\nexact\n');
+      expect(fake.virtualContent(current)).toBe('');
+
+      await runtime.shutdown();
+      expect(fake.virtualContent(baseline)).toBeUndefined();
+      expect(fake.virtualContent(current)).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('lists an empty deleted file even though its semantic comparison has zero text hunks', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+      fake.deleteFile();
+      fake.window.activeTextEditor = fake.secondEditor;
+
+      await runtime.simulateExternalChange(fake.uri as never, '', '', 'deleted');
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(1);
+      expect(fake.sourceControl.count).toBe(1);
+      expect(fake.changesGroup.resourceStates).toHaveLength(1);
+      expect(runtime.renderedComparisonCount).toBe(0);
+      expect(fake.codeLenses()).toEqual([]);
+      expect(fake.workspace.applyEdit).not.toHaveBeenCalled();
+      expect(fake.workspace.openTextDocument).not.toHaveBeenCalled();
+
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bulk-approves a deleted file while keeping its filesystem path absent', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+      fake.deleteFile();
+      await runtime.simulateExternalChange(fake.uri as never, 'before\n', '', 'deleted');
+      await settleRuntime();
+
+      await fake.commands.get('codexExtensionHelper.approveAllFiles')!();
+      await settleRuntime();
+
+      expect(fake.fileText()).toBeUndefined();
+      expect(runtime.comparisonCount).toBe(0);
+      expect(fake.workspace.openTextDocument).not.toHaveBeenCalled();
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects a deleted file by recreating its exact baseline without activating an editor', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\r\nexact\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+      fake.deleteFile();
+      fake.window.activeTextEditor = fake.secondEditor;
+      await runtime.simulateExternalChange(fake.uri as never, 'before\r\nexact\n', '', 'deleted');
+      await settleRuntime();
+      await runtime.openActiveDiff(fake.uri as never);
+      const diffCall = fake.executeCommand.mock.calls.find(([command]) => command === 'vscode.diff');
+      const [, baseline, current] = diffCall!;
+
+      await fake.commands.get('codexExtensionHelper.rejectFile')!([{ resourceUri: fake.uri }]);
+      await settleRuntime();
+
+      expect(fake.fileText()).toBe('before\r\nexact\n');
+      expect(runtime.comparisonCount).toBe(0);
+      expect(fake.window.activeTextEditor).toBe(fake.secondEditor);
+      expect(fake.workspace.openTextDocument).not.toHaveBeenCalled();
+      expect(fake.virtualContent(baseline)).toBeUndefined();
+      expect(fake.virtualContent(current)).toBeUndefined();
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refuses to overwrite a deleted path that was recreated before rejection', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+      fake.deleteFile();
+      await runtime.simulateExternalChange(fake.uri as never, 'before\n', '', 'deleted');
+      await settleRuntime();
+      fake.writeFile('new owner\n');
+
+      await fake.commands.get('codexExtensionHelper.rejectFile')!([{ resourceUri: fake.uri }]);
+      await settleRuntime();
+
+      expect(fake.fileText()).toBe('new owner\n');
+      expect(runtime.comparisonCount).toBe(1);
+      expect(fake.window.showErrorMessage).toHaveBeenCalled();
       runtime.dispose();
     } finally {
       vi.useRealTimers();
@@ -808,6 +1061,119 @@ describe('stable review runtime boundaries', () => {
       version: 7,
     });
     expect(api.window.activeTextEditor.document).toBe(activeDocument);
+  });
+
+  it('restores a deleted file through an exclusive in-memory filesystem move', async () => {
+    const { createReviewHost } = await import('../../src/extension');
+    const decoder = new TextDecoder();
+    const targetKey = 'file:///workspace/deleted.ts';
+    const target = {
+      path: '/workspace/deleted.ts',
+      toString: () => targetKey,
+      with(changes: { path?: string }) {
+        const changedPath = changes.path ?? this.path;
+        return {
+          ...this,
+          path: changedPath,
+          toString: () => `file://${changedPath}`,
+        };
+      },
+    };
+    const files = new Map<string, Uint8Array>();
+    const fs = {
+      async stat(resource: typeof target) {
+        if (!files.has(resource.toString())) {
+          throw Object.assign(new Error('File not found'), { code: 'FileNotFound' });
+        }
+        return { type: 1, ctime: 0, mtime: 0, size: files.get(resource.toString())!.byteLength };
+      },
+      async writeFile(resource: typeof target, contents: Uint8Array) {
+        files.set(resource.toString(), contents);
+      },
+      async rename(source: typeof target, destination: typeof target, options: { overwrite?: boolean }) {
+        const contents = files.get(source.toString());
+        if (contents === undefined) throw new Error('missing temporary restore');
+        if (!options.overwrite && files.has(destination.toString())) {
+          throw Object.assign(new Error('File exists'), { code: 'FileExists' });
+        }
+        files.set(destination.toString(), contents);
+        files.delete(source.toString());
+      },
+      async delete(resource: typeof target) {
+        files.delete(resource.toString());
+      },
+    };
+    const api = {
+      window: { activeTextEditor: undefined, showErrorMessage: vi.fn() },
+      workspace: { applyEdit: vi.fn(), openTextDocument: vi.fn(), textDocuments: [], fs },
+      WorkspaceEdit: FakeWorkspaceEdit,
+      Range: FakeRange,
+      Selection: FakeSelection,
+      TextEditorRevealType: { InCenter: 9 },
+    };
+    const host = createReviewHost(api as never, { appendLine: vi.fn() });
+
+    await expect(host.restoreDeletedFile(target as never, 'before\r\nexact\n'))
+      .resolves.toBe(true);
+    expect(decoder.decode(files.get(targetKey))).toBe('before\r\nexact\n');
+  });
+
+  it('never overwrites a path recreated while a deleted baseline is being restored', async () => {
+    const { createReviewHost } = await import('../../src/extension');
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    const targetKey = 'file:///workspace/deleted.ts';
+    const target = {
+      path: '/workspace/deleted.ts',
+      toString: () => targetKey,
+      with(changes: { path?: string }) {
+        const changedPath = changes.path ?? this.path;
+        return {
+          ...this,
+          path: changedPath,
+          toString: () => `file://${changedPath}`,
+        };
+      },
+    };
+    const files = new Map<string, Uint8Array>();
+    const fs = {
+      async stat(resource: typeof target) {
+        if (!files.has(resource.toString())) {
+          throw Object.assign(new Error('File not found'), { code: 'FileNotFound' });
+        }
+        return { type: 1, ctime: 0, mtime: 0, size: files.get(resource.toString())!.byteLength };
+      },
+      async writeFile(resource: typeof target, contents: Uint8Array) {
+        if (resource.toString() === targetKey) {
+          files.set(targetKey, encoder.encode('new owner\n'));
+        }
+        files.set(resource.toString(), contents);
+      },
+      async rename(source: typeof target, destination: typeof target, options: { overwrite?: boolean }) {
+        files.set(targetKey, encoder.encode('new owner\n'));
+        if (!options.overwrite && files.has(destination.toString())) {
+          throw Object.assign(new Error('File exists'), { code: 'FileExists' });
+        }
+        files.set(destination.toString(), files.get(source.toString())!);
+        files.delete(source.toString());
+      },
+      async delete(resource: typeof target) {
+        files.delete(resource.toString());
+      },
+    };
+    const api = {
+      window: { activeTextEditor: undefined, showErrorMessage: vi.fn() },
+      workspace: { applyEdit: vi.fn(), openTextDocument: vi.fn(), textDocuments: [], fs },
+      WorkspaceEdit: FakeWorkspaceEdit,
+      Range: FakeRange,
+      Selection: FakeSelection,
+      TextEditorRevealType: { InCenter: 9 },
+    };
+    const host = createReviewHost(api as never, { appendLine: vi.fn() });
+
+    await expect(host.restoreDeletedFile(target as never, 'before\n')).resolves.toBe(false);
+    expect(decoder.decode(files.get(targetKey))).toBe('new owner\n');
+    expect([...files.keys()]).toEqual([targetKey]);
   });
 
   it('consumes two separated edit spans in either event array order', async () => {
@@ -1346,6 +1712,43 @@ describe('stable review runtime boundaries', () => {
       'file:///workspace/active.ts',
       activeState,
     );
+  });
+
+  it('presents deleted state only through SCM and disables all active-editor review UI', async () => {
+    const { synchronizeReviewViews } = await import('../../src/extension');
+    const key = 'file:///workspace/deleted.ts';
+    const resource = { toString: () => key };
+    const state = reviewState({
+      baselineText: 'before\n',
+      currentText: '',
+      lifecycle: 'deleted',
+    });
+    const views = {
+      renderer: { render: vi.fn(), clear: vi.fn() },
+      deletedLines: { update: vi.fn(), clear: vi.fn() },
+      quickDiff: { update: vi.fn(), clear: vi.fn() },
+      activeContext: { update: vi.fn().mockResolvedValue(undefined) },
+      spacers: {
+        install: vi.fn(),
+        presentation: vi.fn(),
+        clear: vi.fn().mockResolvedValue(undefined),
+      },
+    };
+
+    await synchronizeReviewViews({
+      key,
+      state,
+      resource: resource as never,
+      activeKey: key,
+      activeState: state,
+      views,
+    });
+
+    expect(views.spacers.install).not.toHaveBeenCalled();
+    expect(views.renderer.render).not.toHaveBeenCalled();
+    expect(views.deletedLines.update).not.toHaveBeenCalled();
+    expect(views.quickDiff.update).toHaveBeenCalledWith(key, resource, 'before\n', 'deleted');
+    expect(views.activeContext.update).toHaveBeenCalledWith(key, undefined);
   });
 
   it('does not repaint stale review views after external acceptance during spacer installation', async () => {

@@ -295,6 +295,40 @@ export class ComparisonCoordinator {
     return 'approved';
   }
 
+  approveDeleted(
+    key: string,
+    expectedRevision: number,
+  ): 'approved' | 'missing' | 'stale' {
+    const resolved = this.resolveDeleted(key, expectedRevision);
+    if (resolved.status !== 'ok') {
+      return resolved.status;
+    }
+
+    this.nextRevision(key);
+    this.snapshots.delete(key);
+    this.view.clear(key);
+    return 'approved';
+  }
+
+  rejectDeleted(
+    key: string,
+    expectedRevision: number,
+  ): 'approved' | 'missing' | 'stale' {
+    const resolved = this.resolveDeleted(key, expectedRevision);
+    if (resolved.status !== 'ok') {
+      return resolved.status;
+    }
+
+    const sourceRevision = this.nextRevision(key);
+    this.snapshots.setAcceptedText(key, resolved.state.baselineText);
+    this.snapshots.setComparison(
+      key,
+      this.inactiveExistingState(resolved.state.baselineText, sourceRevision),
+    );
+    this.view.clear(key);
+    return 'approved';
+  }
+
   delete(key: string): void {
     if (this.disposed) {
       return;
@@ -419,6 +453,28 @@ export class ComparisonCoordinator {
       this.snapshots.setComparison(key, this.inactiveExistingState(currentText, sourceRevision));
     }
     this.view.clear(key);
+  }
+
+  private resolveDeleted(
+    key: string,
+    expectedRevision: number,
+  ):
+    | { status: 'ok'; state: FileComparisonState }
+    | { status: 'missing' | 'stale' } {
+    const state = this.snapshots.get(key);
+    if (state === undefined) {
+      return { status: 'missing' };
+    }
+    if (
+      state.sourceRevision !== expectedRevision
+      || state.lifecycle !== 'deleted'
+      || state.currentText !== ''
+      || !state.comparisonActive
+      || !state.pending
+    ) {
+      return { status: 'stale' };
+    }
+    return { status: 'ok', state };
   }
 
   private provenTransitionMatchesAcceptedState(

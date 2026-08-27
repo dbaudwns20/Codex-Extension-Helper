@@ -54,6 +54,7 @@ type QueuedActiveDocument = ActiveDocumentResult | (() => ActiveDocumentResult);
 class RecordingHost implements ReviewHost {
   document: LiveReviewDocument | undefined;
   readonly documents = new Map<string, LiveReviewDocument>();
+  readonly files = new Map<string, string>();
   readonly replacementCalls: Array<{
     document: LiveReviewDocument;
     replacement: TextReplacement;
@@ -69,6 +70,10 @@ class RecordingHost implements ReviewHost {
   replaceAllError: unknown;
   deleteError: unknown;
   deleteResult: Promise<void> | undefined;
+  restoreError: unknown;
+  restoreResult: boolean | Promise<boolean> = true;
+  afterAbsenceCheck: (() => void) | undefined;
+  afterRestore: (() => void) | undefined;
   private readonly activeQueue: QueuedActiveDocument[] = [];
 
   activeDocument(): LiveReviewDocument | undefined {
@@ -112,6 +117,29 @@ class RecordingHost implements ReviewHost {
       throw this.deleteError;
     }
     await this.deleteResult;
+    this.files.delete(uri.toString());
+  }
+
+  async isFileAbsent(uri: vscode.Uri): Promise<boolean> {
+    const absent = !this.files.has(uri.toString());
+    this.afterAbsenceCheck?.();
+    return absent;
+  }
+
+  async restoreDeletedFile(uri: vscode.Uri, text: string): Promise<boolean> {
+    const fileKey = uri.toString();
+    if (this.files.has(fileKey)) {
+      return false;
+    }
+    if (this.restoreError !== undefined) {
+      throw this.restoreError;
+    }
+    if (!await this.restoreResult || this.files.has(fileKey)) {
+      return false;
+    }
+    this.files.set(fileKey, text);
+    this.afterRestore?.();
+    return true;
   }
 
   reveal(document: LiveReviewDocument, line: number): void {
@@ -196,8 +224,11 @@ function setup(
   const coordinator = new ComparisonCoordinator(new LineDiffEngine(), store, view);
   const state = installState(store, key, baselineText, currentText, overrides);
   const host = new RecordingHost();
-  host.document = liveDocument(key, currentText);
-  host.documents.set(key, host.document);
+  if (state.lifecycle !== 'deleted') {
+    host.files.set(key, currentText);
+    host.document = liveDocument(key, currentText);
+    host.documents.set(key, host.document);
+  }
   const changed: string[] = [];
   const controller = new ReviewController(coordinator, host, (changedKey) => {
     changed.push(changedKey);
@@ -838,6 +869,141 @@ describe('ReviewController created-file rejection', () => {
 
     expect(host.deleteCalls).toHaveLength(1);
     expect(coordinator.state(key)).toBeUndefined();
+  });
+});
+
+describe('ReviewController deleted-file decisions', () => {
+  function setupDeleted(baselineText = 'before\n', reviewResources: () => readonly vscode.Uri[] = () => []) {
+    return setup(
+      baselineText,
+      '',
+      { lifecycle: 'deleted' },
+      undefined,
+      reviewResources,
+    );
+  }
+
+  it('approves an absent deletion without acquiring a review document', async () => {
+    const { changed, controller, coordinator, host, view } = setupDeleted();
+    const reviewDocument = vi.spyOn(host, 'reviewDocument');
+
+    await controller.approveFile(fakeUri(key));
+
+    expect(host.files.has(key)).toBe(false);
+    expect(coordinator.state(key)).toBeUndefined();
+    expect(view.cleared).toEqual([key]);
+    expect(changed).toEqual([key]);
+    expect(reviewDocument).not.toHaveBeenCalled();
+    expectNoHostMutation(host);
+  });
+
+  it('keeps deletion review active when approval finds a recreated path', async () => {
+    const { changed, controller, coordinator, host, state } = setupDeleted();
+    host.files.set(key, 'recreated elsewhere\n');
+
+    await controller.approveFile(fakeUri(key));
+
+    expect(host.files.get(key)).toBe('recreated elsewhere\n');
+    expect(coordinator.state(key)).toEqual(state);
+    expect(changed).toEqual([]);
+    expect(host.errors).toHaveLength(1);
+    expect(host.logs).toHaveLength(1);
+    expectNoHostMutation(host);
+  });
+
+  it('keeps deletion review active when approval becomes stale after the absence check', async () => {
+    const { changed, controller, coordinator, host } = setupDeleted();
+    host.afterAbsenceCheck = () => coordinator.invalidate(key);
+
+    await controller.approveFile(fakeUri(key));
+
+    expect(host.files.has(key)).toBe(false);
+    expect(coordinator.state(key)).toMatchObject({
+      lifecycle: 'deleted',
+      comparisonActive: true,
+      sourceRevision: 9,
+    });
+    expect(changed).toEqual([]);
+    expect(host.errors).toHaveLength(1);
+    expect(host.logs).toHaveLength(1);
+  });
+
+  it.each([
+    { name: 'non-empty', baselineText: 'before\r\nexact\n' },
+    { name: 'empty zero-hunk', baselineText: '' },
+  ])('rejects a $name deletion by recreating its exact baseline', async ({ baselineText }) => {
+    const { changed, controller, coordinator, host, view } = setupDeleted(baselineText);
+
+    await controller.rejectFile(fakeUri(key));
+
+    expect(host.files.get(key)).toBe(baselineText);
+    expect(coordinator.state(key)).toMatchObject({
+      baselineText,
+      currentText: baselineText,
+      hunks: [],
+      comparisonActive: false,
+      pending: false,
+      lifecycle: 'existing',
+    });
+    expect(view.cleared).toEqual([key]);
+    expect(changed).toEqual([key]);
+    expect(host.errors).toEqual([]);
+    expectNoHostMutation(host);
+  });
+
+  it('refuses to overwrite a path recreated before deletion rejection', async () => {
+    const { changed, controller, coordinator, host, state } = setupDeleted();
+    host.files.set(key, 'new owner\n');
+
+    await controller.rejectFile(fakeUri(key));
+
+    expect(host.files.get(key)).toBe('new owner\n');
+    expect(coordinator.state(key)).toEqual(state);
+    expect(changed).toEqual([]);
+    expect(host.errors).toHaveLength(1);
+    expect(host.logs).toHaveLength(1);
+  });
+
+  it('leaves review active and reports a restore write failure', async () => {
+    const { changed, controller, coordinator, host, state } = setupDeleted();
+    const failure = new Error('write denied');
+    host.restoreError = failure;
+
+    await controller.rejectFile(fakeUri(key));
+
+    expect(host.files.has(key)).toBe(false);
+    expect(coordinator.state(key)).toEqual(state);
+    expect(changed).toEqual([]);
+    expect(host.errors).toHaveLength(1);
+    expect(host.logs).toEqual([{ scope: 'Reject Codex changes', error: failure }]);
+  });
+
+  it('leaves restored deletion review active when its revision becomes stale during the write', async () => {
+    const { changed, controller, coordinator, host } = setupDeleted();
+    host.afterRestore = () => coordinator.invalidate(key);
+
+    await controller.rejectFile(fakeUri(key));
+
+    expect(host.files.get(key)).toBe('before\n');
+    expect(coordinator.state(key)).toMatchObject({
+      lifecycle: 'deleted',
+      comparisonActive: true,
+      pending: true,
+      sourceRevision: 9,
+    });
+    expect(changed).toEqual([]);
+    expect(host.errors).toHaveLength(1);
+    expect(host.logs).toHaveLength(1);
+  });
+
+  it('routes bulk deleted-file rejection through the filesystem decision', async () => {
+    const uri = fakeUri(key);
+    const { controller, coordinator, host } = setupDeleted('bulk\n', () => [uri]);
+
+    await controller.rejectAllFiles();
+
+    expect(host.files.get(key)).toBe('bulk\n');
+    expect(coordinator.state(key)?.comparisonActive).toBe(false);
   });
 });
 

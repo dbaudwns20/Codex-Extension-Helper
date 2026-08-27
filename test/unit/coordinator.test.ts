@@ -219,6 +219,46 @@ describe('ComparisonCoordinator', () => {
     });
   });
 
+  it('approves a deleted file only at the exact comparison revision', async () => {
+    const { coordinator, engine, store, view } = setup();
+    coordinator.seed(key, 'before\n');
+    engine.queue(newerHunks);
+    await coordinator.provenChange(key, 'before\n', '', 'deleted', provenance);
+    const revision = store.get(key)!.sourceRevision;
+
+    expect(coordinator.approveDeleted(key, revision - 1)).toBe('stale');
+    expect(store.get(key)?.comparisonActive).toBe(true);
+
+    expect(coordinator.approveDeleted(key, revision)).toBe('approved');
+    expect(store.get(key)).toBeUndefined();
+    expect(store.acceptedText(key)).toBeUndefined();
+    expect(view.clear).toHaveBeenCalledWith(key);
+  });
+
+  it('accepts a restored deleted baseline only at the exact comparison revision', async () => {
+    const { coordinator, engine, store, view } = setup();
+    coordinator.seed(key, 'before\n');
+    engine.queue(newerHunks);
+    await coordinator.provenChange(key, 'before\n', '', 'deleted', provenance);
+    const revision = store.get(key)!.sourceRevision;
+
+    expect(coordinator.rejectDeleted(key, revision - 1)).toBe('stale');
+    expect(store.get(key)?.comparisonActive).toBe(true);
+
+    expect(coordinator.rejectDeleted(key, revision)).toBe('approved');
+    expect(store.acceptedText(key)).toBe('before\n');
+    expect(store.get(key)).toMatchObject({
+      baselineText: 'before\n',
+      currentText: 'before\n',
+      hunks: [],
+      comparisonActive: false,
+      pending: false,
+      lifecycle: 'existing',
+      provenance: undefined,
+    });
+    expect(view.clear).toHaveBeenCalledWith(key);
+  });
+
   it('accepts non-empty deletion as absence after approving its final hunk', async () => {
     const { coordinator, engine, store } = setup();
     const deletedHunk: ChangeHunk = {

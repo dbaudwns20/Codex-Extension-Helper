@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ActiveReviewContext } from './activeReviewContext';
@@ -76,7 +77,7 @@ interface TestExtensionApi {
     uri: vscode.Uri,
     baselineText: string,
     currentText: string,
-    lifecycle?: Exclude<FileLifecycle, 'deleted'>,
+    lifecycle?: FileLifecycle,
   ): Promise<void>;
 }
 
@@ -91,7 +92,7 @@ interface StableReviewHostApi {
     typeof vscode.workspace,
     'applyEdit' | 'openTextDocument' | 'textDocuments'
   > & {
-    readonly fs: Pick<typeof vscode.workspace.fs, 'delete'>;
+    readonly fs: Pick<typeof vscode.workspace.fs, 'delete' | 'stat' | 'writeFile' | 'rename'>;
   };
   readonly WorkspaceEdit: typeof vscode.WorkspaceEdit;
   readonly Range: typeof vscode.Range;
@@ -221,7 +222,12 @@ interface SynchronizedReviewViews {
     clear(key: string): void;
   };
   readonly quickDiff: {
-    update(key: string, resource: vscode.Uri, baselineText: string): void;
+    update(
+      key: string,
+      resource: vscode.Uri,
+      baselineText: string,
+      lifecycle?: FileLifecycle,
+    ): void;
     clear(key: string, acceptedText?: string): void;
   };
   readonly activeContext: Pick<ActiveReviewContext, 'update'>;
@@ -331,6 +337,22 @@ export function createReviewHost(
       finishReviewEdit();
     }
   };
+  const isFileAbsent = async (uri: vscode.Uri): Promise<boolean> => {
+    try {
+      await api.workspace.fs.stat(uri);
+      return false;
+    } catch (error) {
+      if (
+        typeof error === 'object'
+        && error !== null
+        && 'code' in error
+        && error.code === 'FileNotFound'
+      ) {
+        return true;
+      }
+      throw error;
+    }
+  };
 
   return {
     activeDocument(): LiveReviewDocument | undefined {
@@ -357,6 +379,38 @@ export function createReviewHost(
     },
     async deleteToTrash(uri): Promise<void> {
       await api.workspace.fs.delete(uri, { useTrash: true });
+    },
+    isFileAbsent(uri): Promise<boolean> {
+      return isFileAbsent(uri);
+    },
+    async restoreDeletedFile(uri, text): Promise<boolean> {
+      if (!await isFileAbsent(uri)) {
+        return false;
+      }
+      const temporary = uri.with({
+        path: `${uri.path}.codex-restore-${randomUUID()}`,
+        query: '',
+        fragment: '',
+      });
+      await api.workspace.fs.writeFile(temporary, new TextEncoder().encode(text));
+      try {
+        await api.workspace.fs.rename(temporary, uri, { overwrite: false });
+        return true;
+      } catch (error) {
+        try {
+          await api.workspace.fs.delete(temporary);
+        } catch (cleanupError) {
+          try {
+            output.appendLine(`[Restore deleted file cleanup] ${errorDetail(cleanupError)}`);
+          } catch {
+            // Cleanup reporting must not hide the original restore result.
+          }
+        }
+        if (!await isFileAbsent(uri)) {
+          return false;
+        }
+        throw error;
+      }
     },
     reveal(document, line): void {
       const editor = currentEditor(document);
@@ -503,31 +557,42 @@ export async function synchronizeReviewViews({
 }: SynchronizeReviewViewsOptions): Promise<void> {
   const pending: PromiseLike<void>[] = [];
   if (key !== undefined) {
-    if (state !== undefined && state.hunks.length > 0) {
-      const presentation = await views.spacers?.install({
-        key,
-        canonicalText: state.currentText,
-        hunks: state.hunks,
-      });
-      if (!isCurrent()) {
-        if (
-          presentation !== undefined
-          && views.spacers?.presentation(key) === presentation
-        ) {
-          await views.spacers.clear(key);
+    if (state !== undefined && state.comparisonActive && state.pending) {
+      if (state.lifecycle === 'deleted' || state.hunks.length === 0) {
+        await views.spacers?.clear(key);
+        if (!isCurrent()) {
+          return;
         }
-        return;
+        views.renderer.clear(key);
+        views.deletedLines.clear(key);
+      } else {
+        const presentation = await views.spacers?.install({
+          key,
+          canonicalText: state.currentText,
+          hunks: state.hunks,
+        });
+        if (!isCurrent()) {
+          if (
+            presentation !== undefined
+            && views.spacers?.presentation(key) === presentation
+          ) {
+            await views.spacers.clear(key);
+          }
+          return;
+        }
+        pending.push(views.renderer.render(key, state.hunks, presentation));
+        views.deletedLines.update({
+          key,
+          sourceRevision: state.sourceRevision,
+          currentText: state.currentText,
+          hunks: state.hunks,
+          actionLines: presentation?.plan.hunks.map((hunk) => hunk.actionLine),
+        });
       }
-      pending.push(views.renderer.render(key, state.hunks, presentation));
-      views.deletedLines.update({
-        key,
-        sourceRevision: state.sourceRevision,
-        currentText: state.currentText,
-        hunks: state.hunks,
-        actionLines: presentation?.plan.hunks.map((hunk) => hunk.actionLine),
-      });
       if (resource === undefined) {
         views.quickDiff.clear(key);
+      } else if (state.lifecycle === 'deleted') {
+        views.quickDiff.update(key, resource, state.baselineText, 'deleted');
       } else {
         views.quickDiff.update(key, resource, state.baselineText);
       }
@@ -538,7 +603,10 @@ export async function synchronizeReviewViews({
       views.quickDiff.clear(key, state?.currentText);
     }
   }
-  pending.push(views.activeContext.update(activeKey, activeState));
+  pending.push(views.activeContext.update(
+    activeKey,
+    activeState?.lifecycle === 'deleted' ? undefined : activeState,
+  ));
   await Promise.all(pending);
 }
 
@@ -753,7 +821,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     uri: vscode.Uri,
     baselineText: string,
     currentText: string,
-    lifecycle: Exclude<FileLifecycle, 'deleted'> = 'existing',
+    lifecycle: FileLifecycle = 'existing',
   ): Promise<void> {
     if (this.disposed) {
       return;
@@ -1097,7 +1165,7 @@ export class ExtensionRuntime implements vscode.Disposable {
 
   private syncComparison(key: string): void {
     const state = this.snapshots.get(key);
-    if (state !== undefined && state.hunks.length > 0) {
+    if (state !== undefined && state.comparisonActive && state.pending) {
       this.comparisonKeys.add(key);
     } else {
       this.comparisonKeys.delete(key);
@@ -1336,7 +1404,7 @@ export class ExtensionController implements vscode.Disposable {
     uri: vscode.Uri,
     baselineText: string,
     currentText: string,
-    lifecycle: Exclude<FileLifecycle, 'deleted'> = 'existing',
+    lifecycle: FileLifecycle = 'existing',
   ): Promise<void> {
     await this.runtime?.simulateExternalChange(uri, baselineText, currentText, lifecycle);
   }
