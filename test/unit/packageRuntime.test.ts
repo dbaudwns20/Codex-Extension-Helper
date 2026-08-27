@@ -621,6 +621,9 @@ function installRuntimeVscode(initialText = 'before\n') {
     writeFile(value: string, resource: typeof uri = uri) {
       files.set(resource.toString(), encoder.encode(value));
     },
+    writeBytes(value: Uint8Array, resource: typeof uri = uri) {
+      files.set(resource.toString(), value);
+    },
     setEnabled(value: boolean) {
       enabled = value;
     },
@@ -1057,6 +1060,94 @@ describe('packaged runtime', () => {
     }
   });
 
+  it('never proves an exact transition from matching unsaved document text alone', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: true, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'unsaved'));
+      fake.editText('unsaved\n');
+      await settleRuntime();
+
+      const state = (runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString());
+      expect(runtime.comparisonCount).toBe(0);
+      expect(state).toMatchObject({ baselineText: 'unsaved\n', provenance: undefined });
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rereads saved bytes instead of proving from disagreeing document text', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: true, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'document'));
+      fake.writeFile('disk\n');
+      fake.setDocumentText('document\n', false);
+      fake.workspace.fs.readFile.mockClear();
+      fake.callbacks.get('documentSave')!(fake.document);
+      await settleRuntime();
+
+      const state = (runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString());
+      expect(fake.workspace.fs.readFile).toHaveBeenCalledWith(fake.uri);
+      expect(runtime.comparisonCount).toBe(0);
+      expect(state).toMatchObject({ baselineText: 'disk\n', provenance: undefined });
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects BOM-prefixed disk bytes even when decoded text matches the replay output', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: true, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'after'));
+      fake.writeBytes(new Uint8Array([
+        0xef, 0xbb, 0xbf,
+        ...new TextEncoder().encode('after\n'),
+      ]));
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(0);
+      expect((runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString())).toBeUndefined();
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('proves exact disk bytes before a differing dirty document candidate clears them', async () => {
     vi.useFakeTimers();
     try {
@@ -1151,6 +1242,110 @@ describe('packaged runtime', () => {
       }).coordinator.state(fake.uri.toString());
       expect(runtime.comparisonCount).toBe(0);
       expect(state).toMatchObject({ baselineText: 'unknown\n', provenance: undefined });
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears SCM visibility when exact diff computation fails and rebaselines', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1_024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: true, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'after', 'first-item'));
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+      expect(runtime.comparisonCount).toBe(1);
+
+      const internals = runtime as unknown as {
+        coordinator: {
+          diffEngine: { compute(...args: unknown[]): unknown };
+          state(key: string): FileComparisonState | undefined;
+        };
+      };
+      vi.spyOn(internals.coordinator.diffEngine, 'compute')
+        .mockRejectedValueOnce(new Error('injected diff failure'));
+      await sendCodexNotification(fake, completedUpdate('before', 'final', 'second-item'));
+      fake.setText('final\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      expect(internals.coordinator.state(fake.uri.toString())).toMatchObject({
+        baselineText: 'final\n',
+        currentText: 'final\n',
+        comparisonActive: false,
+        provenance: undefined,
+      });
+      expect(runtime.comparisonCount).toBe(0);
+      expect(fake.changesGroup.resourceStates).toHaveLength(0);
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    {
+      name: 'NUL-containing binary bytes',
+      observe: (fake: ReturnType<typeof installRuntimeVscode>) => {
+        fake.writeBytes(new TextEncoder().encode('binary\0payload'));
+      },
+    },
+    {
+      name: 'oversized bytes',
+      observe: (fake: ReturnType<typeof installRuntimeVscode>) => {
+        fake.writeBytes(new TextEncoder().encode('x'.repeat(1_025)));
+      },
+    },
+    {
+      name: 'invalid UTF-8 bytes',
+      observe: (fake: ReturnType<typeof installRuntimeVscode>) => {
+        fake.writeBytes(new Uint8Array([0xc3, 0x28]));
+      },
+    },
+    {
+      name: 'not-found read race',
+      observe: (fake: ReturnType<typeof installRuntimeVscode>) => {
+        fake.workspace.fs.readFile.mockRejectedValueOnce(
+          Object.assign(new Error('vanished'), { code: 'FileNotFound' }),
+        );
+      },
+    },
+  ])('clears an active exact review after an untrackable $name observation', async ({ observe }) => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1_024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: true, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'after'));
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+      expect(runtime.comparisonCount).toBe(1);
+
+      observe(fake);
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(0);
+      expect((runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString())).toBeUndefined();
       runtime.dispose();
     } finally {
       vi.useRealTimers();
@@ -3220,6 +3415,7 @@ describe('stable review runtime boundaries', () => {
 
       gateCandidate.mockClear();
       fake.editText('real user edit\n');
+      fake.writeFile('real user edit\n');
       fake.callbacks.get('documentSave')!(fake.document);
       await settleRuntime();
       expect(gateCandidate).toHaveBeenCalledWith(expect.objectContaining({

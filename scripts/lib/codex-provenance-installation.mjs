@@ -4,6 +4,7 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   stat,
@@ -76,10 +77,88 @@ async function assertNotSymbolicLink(filePath, label, lstatFile = lstat) {
   }
 }
 
-async function readManifest(extensionDir) {
+function isContainedPath(parentPath, childPath) {
+  const relative = path.relative(parentPath, childPath);
+  return relative === ''
+    || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+}
+
+async function assertContainedExistingPath(
+  realExtensionDir,
+  filePath,
+  label,
+  lstatFile = lstat,
+  allowMissing = false,
+) {
+  try {
+    await assertNotSymbolicLink(filePath, label, lstatFile);
+    const resolvedPath = await realpath(filePath);
+    if (!isContainedPath(realExtensionDir, resolvedPath)) {
+      throw new Error(`Codex provenance ${label} resolves outside the extension directory`);
+    }
+    return resolvedPath;
+  } catch (error) {
+    if (allowMissing && error?.code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+async function assertRealExtensionDirectory(extensionDir, lstatFile = lstat) {
+  await assertNotSymbolicLink(extensionDir, 'extension directory', lstatFile);
+  return realpath(extensionDir);
+}
+
+async function assertInstallationBoundary(target, paths, lstatFile = lstat) {
+  const extensionDir = path.resolve(target.extensionDir);
+  const realExtensionDir = await assertRealExtensionDirectory(extensionDir, lstatFile);
+  const outPath = path.join(extensionDir, 'out');
+  const realOutPath = await assertContainedExistingPath(
+    realExtensionDir,
+    outPath,
+    'out directory',
+    lstatFile,
+  );
+  if (path.dirname(target.targetPath) !== outPath) {
+    throw new Error('Codex provenance target path is outside the expected out directory');
+  }
+  const realTargetPath = await assertContainedExistingPath(
+    realExtensionDir,
+    target.targetPath,
+    'target',
+    lstatFile,
+  );
+  if (!isContainedPath(realOutPath, realTargetPath)) {
+    throw new Error('Codex provenance target resolves outside the extension out directory');
+  }
+  for (const [filePath, label] of paths === undefined ? [] : [
+    [paths.backupPath, 'backup'],
+    [paths.metadataPath, 'metadata'],
+  ]) {
+    const resolvedPath = await assertContainedExistingPath(
+      realExtensionDir,
+      filePath,
+      label,
+      lstatFile,
+      true,
+    );
+    if (resolvedPath !== undefined && !isContainedPath(realOutPath, resolvedPath)) {
+      throw new Error(`Codex provenance ${label} resolves outside the extension out directory`);
+    }
+  }
+}
+
+async function readManifest(extensionDir, realExtensionDir) {
+  const manifestPath = path.join(extensionDir, 'package.json');
+  await assertContainedExistingPath(
+    realExtensionDir,
+    manifestPath,
+    'manifest',
+    lstat,
+    true,
+  );
   let source;
   try {
-    source = await readFile(path.join(extensionDir, 'package.json'), 'utf8');
+    source = await readFile(manifestPath, 'utf8');
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
     return undefined;
@@ -94,7 +173,8 @@ async function readManifest(extensionDir) {
 
 async function asInstallation(extensionDir) {
   const absoluteExtensionDir = path.resolve(extensionDir);
-  const manifest = await readManifest(absoluteExtensionDir);
+  const realExtensionDir = await assertRealExtensionDirectory(absoluteExtensionDir);
+  const manifest = await readManifest(absoluteExtensionDir, realExtensionDir);
   const directoryName = path.basename(absoluteExtensionDir);
   if (
     manifest === undefined
@@ -104,11 +184,13 @@ async function asInstallation(extensionDir) {
   ) {
     return undefined;
   }
-  return {
+  const installation = {
     extensionDir: absoluteExtensionDir,
     extensionVersion: manifest.version,
     targetPath: path.join(absoluteExtensionDir, 'out', 'extension.js'),
   };
+  await assertInstallationBoundary(installation, patchPaths(installation.targetPath));
+  return installation;
 }
 
 async function discoverInstallations(roots) {
@@ -142,14 +224,14 @@ async function resolveTarget(options = {}) {
     if (installation === undefined) {
       throw new Error(`No compatible Codex installation found at ${path.resolve(options.extensionDir)}`);
     }
-    await assertNotSymbolicLink(installation.targetPath, 'target');
+    await assertInstallationBoundary(installation, patchPaths(installation.targetPath));
     return installation;
   }
 
   const installations = await discoverInstallations(options.roots ?? defaultRoots());
   for (const installation of installations) {
-    await assertNotSymbolicLink(installation.targetPath, 'target');
     const paths = patchPaths(installation.targetPath);
+    await assertInstallationBoundary(installation, paths);
     if (await fileExists(paths.backupPath) || await fileExists(paths.metadataPath)) {
       return installation;
     }
@@ -265,6 +347,7 @@ function expectedPatchFromBackup(backupBytes, metadata) {
 async function analyze(options = {}) {
   const target = await resolveTarget(options);
   const paths = patchPaths(target.targetPath);
+  await assertInstallationBoundary(target, paths);
   await Promise.all([
     assertNotSymbolicLink(target.targetPath, 'target'),
     assertNotSymbolicLink(paths.backupPath, 'backup'),
@@ -422,8 +505,9 @@ async function removeDurably(filePath, operations, options) {
   await syncParentDirectory(filePath, operations);
 }
 
-async function removeNewBackup(paths, operations) {
+async function removeNewBackup(paths, operations, assertBoundary) {
   try {
+    await assertBoundary();
     await removeDurably(paths.backupPath, operations, { force: true });
     return undefined;
   } catch (error) {
@@ -449,10 +533,12 @@ async function atomicReplace(
   expectedCurrentBytes,
   expectedCurrentSha256,
   changedMessage,
+  assertBoundary,
 ) {
   const tempPath = temporaryPath(filePath);
   temporaryPaths.push(tempPath);
   await operations.writeFile(tempPath, bytes, { flag: 'wx', mode });
+  await assertBoundary();
   if (expectedCurrentBytes !== undefined) {
     await assertNotSymbolicLink(filePath, 'target', operations.lstat);
     const currentBytes = await readFile(filePath).catch(() => undefined);
@@ -473,6 +559,11 @@ export async function inspectCodexProvenancePatch(options = {}) {
 export async function applyCodexProvenancePatch(options = {}) {
   const operations = fileOperationsFor(options);
   const analysis = await analyze(options);
+  const assertTransactionBoundary = () => assertInstallationBoundary(
+    analysis.target,
+    analysis.paths,
+    operations.lstat,
+  );
   if (analysis.state === 'patched') {
     try {
       await syncParentDirectory(analysis.paths.metadataPath, operations);
@@ -502,6 +593,7 @@ export async function applyCodexProvenancePatch(options = {}) {
   let backupOwned = false;
 
   try {
+    await assertTransactionBoundary();
     await operations.writeFile(analysis.paths.backupPath, analysis.targetBytes, {
       flag: 'wx',
       mode: targetMode,
@@ -520,6 +612,7 @@ export async function applyCodexProvenancePatch(options = {}) {
     const targetTempPath = temporaryPath(analysis.target.targetPath);
     const metadataTempPath = temporaryPath(analysis.paths.metadataPath);
     temporaryPaths.push(targetTempPath, metadataTempPath);
+    await assertTransactionBoundary();
     await operations.writeFile(targetTempPath, analysis.patchedBytes, {
       flag: 'wx',
       mode: targetMode,
@@ -533,7 +626,7 @@ export async function applyCodexProvenancePatch(options = {}) {
       'Codex provenance metadata temporary file is invalid',
     );
 
-    await assertNotSymbolicLink(analysis.target.targetPath, 'target', operations.lstat);
+    await assertTransactionBoundary();
     const currentImmediatelyBeforeInstall = await readFile(analysis.target.targetPath)
       .catch(() => undefined);
     if (!matchesExactBytes(
@@ -549,6 +642,7 @@ export async function applyCodexProvenancePatch(options = {}) {
       throw new Error('Codex provenance target verification failed after installation');
     }
 
+    await assertTransactionBoundary();
     await operations.rename(metadataTempPath, analysis.paths.metadataPath);
     await verifyMetadataFile(
       analysis.paths.metadataPath,
@@ -599,6 +693,7 @@ export async function applyCodexProvenancePatch(options = {}) {
     let metadataCleanupFailure;
     if (metadataMatchesTransaction) {
       try {
+        await assertTransactionBoundary();
         await verifyMetadataFile(
           analysis.paths.metadataPath,
           metadataBytes,
@@ -625,6 +720,7 @@ export async function applyCodexProvenancePatch(options = {}) {
           analysis.patchedBytes,
           patchedSha256,
           'Codex provenance target changed before install rollback',
+          assertTransactionBoundary,
         );
       } catch (rollbackError) {
         rollbackFailure = errorMessage(rollbackError);
@@ -700,7 +796,7 @@ export async function applyCodexProvenancePatch(options = {}) {
     }
 
     const backupCleanupFailure = backupOwned
-      ? await removeNewBackup(analysis.paths, operations)
+      ? await removeNewBackup(analysis.paths, operations, assertTransactionBoundary)
       : undefined;
     if (backupCleanupFailure !== undefined) {
       if (!backupCleanupFailure.backupExists) {
@@ -794,15 +890,17 @@ async function cleanupFailure(analysis, label, error) {
   );
 }
 
-async function cleanupRestoredArtifacts(analysis, operations) {
+async function cleanupRestoredArtifacts(analysis, operations, assertBoundary) {
   if (await fileExists(analysis.paths.backupPath)) {
     try {
+      await assertBoundary();
       await removeDurably(analysis.paths.backupPath, operations);
     } catch (error) {
       throw await cleanupFailure(analysis, 'backup', error);
     }
   }
   try {
+    await assertBoundary();
     await removeDurably(analysis.paths.metadataPath, operations);
   } catch (error) {
     throw await cleanupFailure(analysis, 'metadata', error);
@@ -812,6 +910,11 @@ async function cleanupRestoredArtifacts(analysis, operations) {
 export async function restoreCodexProvenancePatch(options = {}) {
   const operations = fileOperationsFor(options);
   const analysis = await analyze(options);
+  const assertTransactionBoundary = () => assertInstallationBoundary(
+    analysis.target,
+    analysis.paths,
+    operations.lstat,
+  );
   if (analysis.state === 'clean') {
     try {
       await syncParentDirectory(analysis.target.targetPath, operations);
@@ -838,6 +941,7 @@ export async function restoreCodexProvenancePatch(options = {}) {
         analysis.patchedBytes,
         analysis.metadata.patchedSha256,
         'Codex provenance target changed during restore',
+        assertTransactionBoundary,
       );
     } catch (error) {
       const currentTarget = await readFile(analysis.target.targetPath).catch(() => undefined);
@@ -899,6 +1003,6 @@ export async function restoreCodexProvenancePatch(options = {}) {
     }
   }
 
-  await cleanupRestoredArtifacts(analysis, operations);
+  await cleanupRestoredArtifacts(analysis, operations, assertTransactionBoundary);
   return resultFor(wasPatched ? 'restored' : 'already-restored', analysis.target, analysis.paths);
 }

@@ -158,6 +158,13 @@ installed-extension modification:
 - **Codex Helper: Remove Exact Provenance Bridge**
 - **Codex Helper: Show Exact Provenance Bridge Status**
 
+The bridge invokes `codexExtensionHelper.internal.codexProvenance`, a private
+local command that is an instrumentation boundary, not an authentication or
+authorization boundary. Other installed extensions can invoke VS Code commands,
+so the helper treats every payload as untrusted: strict schema, workspace-path,
+size, lifecycle, patch-replay, and raw filesystem-byte checks must all pass
+before any exact provenance is published.
+
 After a successful install or removal, accept the separate **Reload VS Code**
 prompt before expecting the new bridge state to take effect. Repository scripts
 provide the same manual lifecycle for development:

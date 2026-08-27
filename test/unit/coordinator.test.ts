@@ -360,6 +360,68 @@ describe('ComparisonCoordinator', () => {
     expect(view.renders).toEqual([]);
   });
 
+  it.each([
+    {
+      name: 'update',
+      before: 'before\n',
+      after: 'after\n',
+      lifecycle: 'existing' as const,
+      seed: 'before\n',
+      expected: 'after\n',
+    },
+    {
+      name: 'create',
+      before: '',
+      after: 'created\n',
+      lifecycle: 'created' as const,
+      seed: undefined,
+      expected: 'created\n',
+    },
+    {
+      name: 'delete',
+      before: 'before\n',
+      after: '',
+      lifecycle: 'deleted' as const,
+      seed: 'before\n',
+      expected: undefined,
+    },
+  ])('never publishes exact provenance when a proven $name diff fails', async ({
+    before,
+    after,
+    lifecycle,
+    seed,
+    expected,
+  }) => {
+    const { coordinator, engine, store, view } = setup();
+    const failure = new Error('diff failed');
+    if (seed !== undefined) coordinator.seed(key, seed);
+    engine.queue(Promise.reject(failure));
+
+    await expect(coordinator.provenChange(
+      key,
+      before,
+      after,
+      lifecycle,
+      provenance,
+    )).rejects.toBe(failure);
+
+    if (expected === undefined) {
+      expect(store.get(key)).toBeUndefined();
+      expect(store.acceptedText(key)).toBeUndefined();
+    } else {
+      expect(store.acceptedText(key)).toBe(expected);
+      expect(store.get(key)).toMatchObject({
+        baselineText: expected,
+        currentText: expected,
+        comparisonActive: false,
+        pending: false,
+        lifecycle: 'existing',
+        provenance: undefined,
+      });
+    }
+    expect(view.clear).toHaveBeenCalledWith(key);
+  });
+
   it('clears stale exact rendering after an unknown state is accepted', async () => {
     const { coordinator, engine, store, view } = setup();
     const render = deferred<void>();

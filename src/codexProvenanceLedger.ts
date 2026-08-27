@@ -1,4 +1,5 @@
 import type * as vscode from 'vscode';
+import { createHash } from 'node:crypto';
 import type {
   CodexFileChangeStatus,
   CodexFileUpdateChange,
@@ -60,9 +61,63 @@ interface InvalidatedGeneration {
   readonly itemKeys: Set<string>;
   cleanupWatermark: number;
   cleanupComplete: boolean;
+  expiresAt: number;
+  order: number;
+}
+
+interface EvidenceTombstone {
+  readonly expiresAt: number;
+  readonly order: number;
+}
+
+export interface CodexProvenanceLedgerTombstoneOptions {
+  readonly maxEvidenceTombstones?: number;
+  readonly tombstoneLifetimeMs?: number;
 }
 
 const DEFAULT_RETENTION_MS = 5 * 60 * 1_000;
+const DEFAULT_MAX_EVIDENCE_TOMBSTONES = 4_096;
+const DEFAULT_TOMBSTONE_LIFETIME_MS = 5 * 60 * 1_000;
+const ARCHIVED_TOMBSTONE_BITS = 65_536;
+
+class ArchivedTombstoneFilter {
+  private readonly bytes = new Uint8Array(ARCHIVED_TOMBSTONE_BITS / 8);
+
+  add(value: string): void {
+    for (const bit of this.bits(value)) {
+      this.bytes[Math.floor(bit / 8)] |= 1 << (bit % 8);
+    }
+  }
+
+  has(value: string): boolean {
+    return this.bits(value).every((bit) => (
+      (this.bytes[Math.floor(bit / 8)] & (1 << (bit % 8))) !== 0
+    ));
+  }
+
+  clear(): void {
+    this.bytes.fill(0);
+  }
+
+  private bits(value: string): number[] {
+    const digest = createHash('sha256').update(value, 'utf8').digest();
+    return [0, 4, 8, 12].map((offset) => digest.readUInt32BE(offset) % ARCHIVED_TOMBSTONE_BITS);
+  }
+}
+
+function nonNegativeFinite(value: number, name: string): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new RangeError(`${name} must be a non-negative finite number`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(value: number, name: string): number {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new RangeError(`${name} must be a non-negative integer`);
+  }
+  return value;
+}
 
 function itemKey(threadId: string, turnId: string, itemId: string): string {
   return `${threadId}\0${turnId}\0${itemId}`;
@@ -113,20 +168,31 @@ function nextState(
 
 export class CodexProvenanceLedger {
   private readonly items = new Map<string, ItemRecord>();
-  private readonly retiredEvidence = new Set<string>();
+  private readonly retiredEvidence = new Map<string, EvidenceTombstone>();
+  private readonly archivedTombstones = new ArchivedTombstoneFilter();
   private readonly evidenceByNormalizedKey = new Map<string, Set<string>>();
   private readonly itemKeysByNormalizedKey = new Map<string, Set<string>>();
   private readonly invalidatedGenerations = new Map<string, InvalidatedGeneration>();
   private readonly ready = new Map<string, ReadyTransition>();
+  private readonly maxEvidenceTombstones: number;
+  private readonly tombstoneLifetimeMs: number;
   private latestRecordOrder = 0;
+  private latestTombstoneOrder = 0;
 
   constructor(
     private readonly retentionMs = DEFAULT_RETENTION_MS,
     private readonly now: () => number = Date.now,
+    tombstones: CodexProvenanceLedgerTombstoneOptions = {},
   ) {
-    if (!Number.isFinite(retentionMs) || retentionMs < 0) {
-      throw new RangeError('retentionMs must be a non-negative finite number');
-    }
+    nonNegativeFinite(retentionMs, 'retentionMs');
+    this.maxEvidenceTombstones = nonNegativeInteger(
+      tombstones.maxEvidenceTombstones ?? DEFAULT_MAX_EVIDENCE_TOMBSTONES,
+      'maxEvidenceTombstones',
+    );
+    this.tombstoneLifetimeMs = nonNegativeFinite(
+      tombstones.tombstoneLifetimeMs ?? DEFAULT_TOMBSTONE_LIFETIME_MS,
+      'tombstoneLifetimeMs',
+    );
   }
 
   record(notification: CodexProvenanceNotification): void {
@@ -136,6 +202,7 @@ export class CodexProvenanceLedger {
       ? notification.params.item.id
       : notification.params.itemId;
     const key = itemKey(threadId, turnId, itemId);
+    if (this.archivedTombstones.has(`item:${key}`)) return;
     const changes = notification.method === 'item/completed'
       ? notification.params.item.changes
       : notification.params.changes;
@@ -201,7 +268,9 @@ export class CodexProvenanceLedger {
     const groups = new Map<string, NormalizedEvidenceGroup>();
 
     for (const item of this.items.values()) {
-      if (item.invalid || item.terminalStatus !== 'completed') continue;
+      if (item.invalid
+        || item.terminalStatus !== 'completed'
+        || this.archivedTombstones.has(`item:${item.key}`)) continue;
       for (const change of item.changes) {
         const evidence = evidenceKey(item, change.path);
         const accepted = resolveAcceptedPath(change.path);
@@ -214,7 +283,7 @@ export class CodexProvenanceLedger {
         this.evidenceByNormalizedKey.set(key, currentEvidence);
         this.itemKeysByNormalizedKey.set(key, currentItemKeys);
         if (this.invalidatedGenerationBlocks(key, item, evidence)) continue;
-        if (this.retiredEvidence.has(evidence)) continue;
+        if (this.isRetiredEvidence(evidence)) continue;
         const existing = groups.get(key);
         const group = existing ?? {
           accepted,
@@ -330,11 +399,13 @@ export class CodexProvenanceLedger {
   clear(): void {
     this.items.clear();
     this.retiredEvidence.clear();
+    this.archivedTombstones.clear();
     this.evidenceByNormalizedKey.clear();
     this.itemKeysByNormalizedKey.clear();
     this.invalidatedGenerations.clear();
     this.ready.clear();
     this.latestRecordOrder = 0;
+    this.latestTombstoneOrder = 0;
   }
 
   prune(now: number): void {
@@ -360,10 +431,12 @@ export class CodexProvenanceLedger {
       this.itemKeysByNormalizedKey.clear();
       this.ready.clear();
     }
+    this.pruneEvidenceTombstones(now);
   }
 
   private retireEvidence(evidence: Iterable<string>): void {
-    for (const value of evidence) this.retiredEvidence.add(value);
+    for (const value of evidence) this.rememberRetiredEvidence(value);
+    this.enforceEvidenceTombstoneBound();
   }
 
   private invalidateGeneration(
@@ -376,12 +449,18 @@ export class CodexProvenanceLedger {
       itemKeys: new Set<string>(),
       cleanupWatermark: 0,
       cleanupComplete: false,
+      expiresAt: this.now() + this.tombstoneLifetimeMs,
+      order: ++this.latestTombstoneOrder,
     };
     for (const itemKey of itemKeys) generation.itemKeys.add(itemKey);
     for (const value of evidence) generation.evidence.add(value);
     generation.cleanupComplete = false;
-    this.retireEvidence(generation.evidence);
+    generation.expiresAt = this.now() + this.tombstoneLifetimeMs;
+    generation.order = ++this.latestTombstoneOrder;
+    for (const value of generation.evidence) this.rememberRetiredEvidence(value);
+    this.invalidatedGenerations.delete(key);
     this.invalidatedGenerations.set(key, generation);
+    this.enforceEvidenceTombstoneBound();
   }
 
   private invalidatedGenerationBlocks(
@@ -394,17 +473,89 @@ export class CodexProvenanceLedger {
 
     if (item.order <= generation.cleanupWatermark) {
       generation.evidence.add(evidence);
-      this.retiredEvidence.add(evidence);
+      this.rememberRetiredEvidence(evidence);
+      this.touchGeneration(key, generation);
+      this.enforceEvidenceTombstoneBound();
       return true;
     }
 
     if (!generation.cleanupComplete) {
       generation.itemKeys.add(item.key);
       generation.evidence.add(evidence);
-      this.retiredEvidence.add(evidence);
+      this.rememberRetiredEvidence(evidence);
+      this.touchGeneration(key, generation);
+      this.enforceEvidenceTombstoneBound();
       return true;
     }
 
     return false;
+  }
+
+  private isRetiredEvidence(evidence: string): boolean {
+    return this.retiredEvidence.has(evidence)
+      || this.archivedTombstones.has(`evidence:${evidence}`);
+  }
+
+  private rememberRetiredEvidence(evidence: string): void {
+    this.retiredEvidence.delete(evidence);
+    this.retiredEvidence.set(evidence, {
+      expiresAt: this.now() + this.tombstoneLifetimeMs,
+      order: ++this.latestTombstoneOrder,
+    });
+  }
+
+  private touchGeneration(key: string, generation: InvalidatedGeneration): void {
+    generation.expiresAt = this.now() + this.tombstoneLifetimeMs;
+    generation.order = ++this.latestTombstoneOrder;
+    this.invalidatedGenerations.delete(key);
+    this.invalidatedGenerations.set(key, generation);
+  }
+
+  private pruneEvidenceTombstones(now: number): void {
+    for (const [evidence, tombstone] of [...this.retiredEvidence]) {
+      if (tombstone.expiresAt <= now) this.archiveEvidence(evidence);
+    }
+    for (const [key, generation] of [...this.invalidatedGenerations]) {
+      if (generation.expiresAt <= now) this.archiveGeneration(key, generation);
+    }
+    this.enforceEvidenceTombstoneBound();
+  }
+
+  private enforceEvidenceTombstoneBound(): void {
+    while (this.evidenceTombstoneCount() > this.maxEvidenceTombstones) {
+      const evidenceEntry = [...this.retiredEvidence.entries()][0];
+      const generationEntry = [...this.invalidatedGenerations.entries()][0];
+      if (evidenceEntry === undefined && generationEntry === undefined) return;
+      if (generationEntry === undefined
+        || (evidenceEntry !== undefined && evidenceEntry[1].order <= generationEntry[1].order)) {
+        this.archiveEvidence(evidenceEntry![0]);
+      } else {
+        this.archiveGeneration(generationEntry[0], generationEntry[1]);
+      }
+    }
+  }
+
+  private evidenceTombstoneCount(): number {
+    let count = this.retiredEvidence.size + this.invalidatedGenerations.size;
+    for (const generation of this.invalidatedGenerations.values()) {
+      count += generation.itemKeys.size;
+    }
+    return count;
+  }
+
+  private archiveEvidence(evidence: string): void {
+    this.archivedTombstones.add(`evidence:${evidence}`);
+    this.retiredEvidence.delete(evidence);
+  }
+
+  private archiveGeneration(key: string, generation: InvalidatedGeneration): void {
+    for (const item of generation.itemKeys) {
+      this.archivedTombstones.add(`item:${item}`);
+    }
+    for (const evidence of generation.evidence) {
+      this.archivedTombstones.add(`evidence:${evidence}`);
+      this.retiredEvidence.delete(evidence);
+    }
+    this.invalidatedGenerations.delete(key);
   }
 }

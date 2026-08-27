@@ -81,6 +81,15 @@ describe('applyUnifiedFilePatch', () => {
     expect(applyUnifiedFilePatch('one', patch)).toBe('one\n');
   });
 
+  it('applies a final-newline removal exactly', () => {
+    const patch = [
+      '--- a/file.txt', '+++ b/file.txt',
+      '@@ -1 +1 @@', '-one', '+one', '\\ No newline at end of file', '',
+    ].join('\n');
+
+    expect(applyUnifiedFilePatch('one\n', patch)).toBe('one');
+  });
+
   it('returns undefined for malformed headers', () => {
     const patch = ['--- a/file.txt', '+++ b/file.txt', '@@ malformed @@', ' one', ''].join('\n');
 

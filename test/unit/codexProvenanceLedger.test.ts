@@ -533,4 +533,32 @@ describe('CodexProvenanceLedger', () => {
     ledger.prune(now);
     expect(ledger.completedTransitions(resolveAcceptedPath)).toEqual([]);
   });
+
+  it('bounds retired evidence with TTL/LRU while old evidence remains fail-closed', () => {
+    let now = 1_000;
+    const ledger = new CodexProvenanceLedger(10_000, () => now, {
+      maxEvidenceTombstones: 1,
+      tombstoneLifetimeMs: 100,
+    });
+    const states = accepted({
+      'a.txt': state('a.txt', true, 'old-a\n'),
+      'b.txt': state('b.txt', true, 'old-b\n'),
+    });
+    ledger.record(completed([update('a.txt', 'old-a', 'new')], 'item-a'));
+    const first = ledger.completedTransitions(states)[0];
+    expect(ledger.consume(first.key, NEW_HASH)).toBe(first);
+
+    now = 1_050;
+    ledger.record(completed([update('b.txt', 'old-b', 'new')], 'item-b'));
+    const second = ledger.completedTransitions(states)[0];
+    expect(ledger.consume(second.key, NEW_HASH)).toBe(second);
+
+    now = 1_151;
+    ledger.prune(now);
+    expect(ledger.completedTransitions(states)).toEqual([]);
+
+    ledger.clear();
+    ledger.record(completed([update('a.txt', 'old-a', 'new')], 'item-a'));
+    expect(ledger.completedTransitions(states)).toHaveLength(1);
+  });
 });

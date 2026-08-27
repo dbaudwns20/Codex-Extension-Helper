@@ -653,7 +653,7 @@ Confirm no unrelated changes, no placeholder text (`TODO`, `FIXME`, `stub`, `lat
 
 Run the provenance patch CLI against the discovered installed Codex extension. Because this writes outside the repository, request escalation at execution time. Reload VS Code, trigger one Codex file edit and one manual/Git edit, and verify only the exact Codex edit appears. Then run status inspection and ensure recorded hashes match.
 
-- [ ] **Step 5: Commit final regression adjustments**
+- [x] **Step 5: Commit final regression adjustments**
 
 ```bash
 git add test/unit/packageRuntime.test.ts test/unit/gitChangeGuard.test.ts docs/superpowers/plans/2026-08-26-codex-change-provenance.md

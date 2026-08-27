@@ -83,6 +83,7 @@ describe('ExternalChangeDetector', () => {
       key: file.toString(),
       uri: file,
       text: 'changed',
+      bytes: encoder.encode('changed'),
     });
   });
 
@@ -102,6 +103,7 @@ describe('ExternalChangeDetector', () => {
       key: file.toString(),
       uri: file,
       text: 'changed',
+      bytes: encoder.encode('changed'),
     });
   });
 
@@ -117,8 +119,20 @@ describe('ExternalChangeDetector', () => {
     await vi.advanceTimersByTimeAsync(100);
 
     expect(onCandidate.mock.calls).toEqual([
-      [{ kind: 'present', key: first.toString(), uri: first, text: first.path }],
-      [{ kind: 'present', key: second.toString(), uri: second, text: second.path }],
+      [{
+        kind: 'present',
+        key: first.toString(),
+        uri: first,
+        text: first.path,
+        bytes: encoder.encode(first.path),
+      }],
+      [{
+        kind: 'present',
+        key: second.toString(),
+        uri: second,
+        text: second.path,
+        bytes: encoder.encode(second.path),
+      }],
     ]);
   });
 
@@ -158,7 +172,7 @@ describe('ExternalChangeDetector', () => {
     expect(onCandidate).not.toHaveBeenCalled();
   });
 
-  it('skips excluded and non-file URIs without reading them', async () => {
+  it('invalidates excluded and non-file observations without reading them', async () => {
     vi.useFakeTimers();
     const excluded = uri('node_modules/package/index.js');
     const untitled = uri('scratch.ts', 'untitled');
@@ -171,7 +185,10 @@ describe('ExternalChangeDetector', () => {
     await vi.advanceTimersByTimeAsync(100);
 
     expect(readFile).not.toHaveBeenCalled();
-    expect(onCandidate).not.toHaveBeenCalled();
+    expect(onCandidate.mock.calls).toEqual([
+      [{ kind: 'untrackable', key: excluded.toString(), uri: excluded }],
+      [{ kind: 'untrackable', key: untitled.toString(), uri: untitled }],
+    ]);
   });
 
   it('enforces the byte limit before attempting UTF-8 decoding', async () => {
@@ -185,21 +202,30 @@ describe('ExternalChangeDetector', () => {
     instance.handleChange(uri('large.bin'));
     await vi.advanceTimersByTimeAsync(100);
 
-    expect(onCandidate).not.toHaveBeenCalled();
+    expect(onCandidate).toHaveBeenCalledWith({
+      kind: 'untrackable',
+      key: 'file:///workspace/large.bin',
+      uri: expect.objectContaining({ path: '/workspace/large.bin' }),
+    });
     expect(onError).not.toHaveBeenCalled();
   });
 
   it.each([
     ['NUL-containing binary content', encoder.encode('left\0right')],
     ['invalid UTF-8 content', new Uint8Array([0xc3, 0x28])],
-  ])('skips %s', async (_description, bytes) => {
+  ])('invalidates %s', async (_description, bytes) => {
     vi.useFakeTimers();
+    const file = uri('binary.dat');
     const { instance, onCandidate } = detector({ readFile: vi.fn(async () => bytes) });
 
-    instance.handleChange(uri('binary.dat'));
+    instance.handleChange(file);
     await vi.advanceTimersByTimeAsync(100);
 
-    expect(onCandidate).not.toHaveBeenCalled();
+    expect(onCandidate).toHaveBeenCalledWith({
+      kind: 'untrackable',
+      key: file.toString(),
+      uri: file,
+    });
   });
 
   it('emits a present candidate for an unseen created file without assigning provenance', async () => {
@@ -215,6 +241,7 @@ describe('ExternalChangeDetector', () => {
       key: file.toString(),
       uri: file,
       text: 'changed',
+      bytes: encoder.encode('changed'),
     });
   });
 
@@ -277,6 +304,7 @@ describe('ExternalChangeDetector', () => {
       key: file.toString(),
       uri: file,
       text: 'changed',
+      bytes: encoder.encode('changed'),
     });
   });
 
@@ -324,20 +352,90 @@ describe('ExternalChangeDetector', () => {
     pendingRead.resolve(encoder.encode('changed'));
     await settleAsyncWork();
 
-    expect(onCandidate).not.toHaveBeenCalled();
+    expect(onCandidate).toHaveBeenCalledWith({
+      kind: 'untrackable',
+      key: file.toString(),
+      uri: file,
+    });
   });
 
-  it('reports read failures without throwing from the timer callback', async () => {
+  it.each(['ENOENT', 'FileNotFound'])(
+    'turns a %s present-read race into an absent observation',
+    async (code) => {
+      vi.useFakeTimers();
+      const file = uri('vanished.ts');
+      const failure = Object.assign(new Error('file vanished'), { code });
+      const { instance, onCandidate, onError } = detector({
+        readFile: vi.fn(async () => { throw failure; }),
+      });
+
+      instance.handleChange(file);
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(onCandidate).toHaveBeenCalledWith({
+        kind: 'absent',
+        key: file.toString(),
+        uri: file,
+      });
+      expect(onError).not.toHaveBeenCalled();
+    },
+  );
+
+  it('reports and invalidates other read failures without throwing from the timer callback', async () => {
     vi.useFakeTimers();
     const failure = new Error('read failed');
+    const file = uri('unreadable.ts');
     const { instance, onCandidate, onError } = detector({
       readFile: vi.fn(async () => { throw failure; }),
     });
 
-    instance.handleChange(uri('unreadable.ts'));
+    instance.handleChange(file);
     await vi.advanceTimersByTimeAsync(100);
 
-    expect(onCandidate).not.toHaveBeenCalled();
+    expect(onCandidate).toHaveBeenCalledWith({
+      kind: 'untrackable',
+      key: file.toString(),
+      uri: file,
+    });
     expect(onError).toHaveBeenCalledWith(failure);
+  });
+
+  it('rereads a save even when its matching watcher event is suppressed', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const file = uri('saved.ts');
+    const saves = new RecentSaveRegistry();
+    const { instance, onCandidate, readFile } = detector({ recentSaves: saves });
+
+    instance.markRecentSave(file);
+    instance.handleSave(file);
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(readFile).toHaveBeenCalledOnce();
+    expect(onCandidate).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'present',
+      key: file.toString(),
+      bytes: encoder.encode('changed'),
+    }));
+  });
+
+  it('keeps the direct save read when its matching watcher event arrives afterward', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const file = uri('saved-first.ts');
+    const saves = new RecentSaveRegistry();
+    const { instance, onCandidate, readFile } = detector({ recentSaves: saves });
+
+    instance.markRecentSave(file);
+    instance.handleSave(file);
+    instance.handleChange(file);
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(readFile).toHaveBeenCalledOnce();
+    expect(onCandidate).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'present',
+      key: file.toString(),
+      bytes: encoder.encode('changed'),
+    }));
   });
 });

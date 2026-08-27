@@ -106,6 +106,15 @@ async function readOptional(filePath: string) {
   }
 }
 
+async function rejectionOf(operation: () => Promise<unknown>): Promise<unknown> {
+  try {
+    await operation();
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+}
+
 async function tempArtifacts(extensionDir: string) {
   return (await readdir(path.join(extensionDir, 'out'))).filter((entry) => entry.includes('.tmp-'));
 }
@@ -414,6 +423,69 @@ describe('Codex provenance installation apply lifecycle', () => {
       .toBeUndefined();
     expect(await readOptional(`${targetPath}.codex-extension-helper-provenance.json`))
       .toBeUndefined();
+  });
+
+  it.each(['inspect', 'apply'] as const)(
+    'rejects a symlinked out ancestor during %s without touching outside bytes',
+    async (operation) => {
+      const {
+        applyCodexProvenancePatch,
+        inspectCodexProvenancePatch,
+      } = await installationModule();
+      const root = await makeTemporaryDirectory();
+      const extensionDir = await makeInstallation(root, '26.826.11250');
+      const outPath = path.join(extensionDir, 'out');
+      const outsideOut = path.join(root, `outside-${operation}`);
+      await fsRename(outPath, outsideOut);
+      await symlink(outsideOut, outPath, 'dir');
+      const outsideTarget = path.join(outsideOut, 'extension.js');
+      const targetBefore = await readFile(outsideTarget);
+
+      const error = await rejectionOf(() => operation === 'inspect'
+        ? inspectCodexProvenancePatch({ extensionDir })
+        : applyCodexProvenancePatch({ extensionDir }));
+
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/out.*symbolic link/iu);
+      expect(await readFile(outsideTarget)).toEqual(targetBefore);
+      expect(await readOptional(`${outsideTarget}.codex-extension-helper-provenance.original`))
+        .toBeUndefined();
+      expect(await readOptional(`${outsideTarget}.codex-extension-helper-provenance.json`))
+        .toBeUndefined();
+    },
+  );
+
+  it('rejects a symlinked out ancestor during restore without touching outside bytes', async () => {
+    const {
+      applyCodexProvenancePatch,
+      restoreCodexProvenancePatch,
+    } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const installed = await applyCodexProvenancePatch({ extensionDir });
+    const outPath = path.join(extensionDir, 'out');
+    const outsideOut = path.join(root, 'outside-restore');
+    await fsRename(outPath, outsideOut);
+    await symlink(outsideOut, outPath, 'dir');
+    const outsideTarget = path.join(outsideOut, 'extension.js');
+    const outsideBackup = `${outsideTarget}.codex-extension-helper-provenance.original`;
+    const outsideMetadata = `${outsideTarget}.codex-extension-helper-provenance.json`;
+    const before = await Promise.all([
+      readFile(outsideTarget),
+      readFile(outsideBackup),
+      readFile(outsideMetadata),
+    ]);
+
+    const error = await rejectionOf(() => restoreCodexProvenancePatch({ extensionDir }));
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/out.*symbolic link/iu);
+    expect(await Promise.all([
+      readFile(outsideTarget),
+      readFile(outsideBackup),
+      readFile(outsideMetadata),
+    ])).toEqual(before);
+    expect(installed.targetPath).toBe(path.join(outPath, 'extension.js'));
   });
 
   it('preserves a backup that wins an exclusive-creation race', async () => {

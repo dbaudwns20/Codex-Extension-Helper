@@ -653,6 +653,7 @@ export class ExtensionRuntime implements vscode.Disposable {
   private readonly documentDebouncer: PerKeyDebouncer<string>;
   private readonly ownership: DisposableStore;
   private readonly trackedUris = new Map<string, vscode.Uri>();
+  private readonly untrackableKeys = new Set<string>();
   private readonly comparisonKeys = new Set<string>();
   private readonly documentFence = new DocumentChangeFence();
   private readonly displayEditFence = new DisplayEditFence();
@@ -760,7 +761,9 @@ export class ExtensionRuntime implements vscode.Disposable {
         resolveAcceptedPath: (relativePath) => {
           const uri = this.resolveWorkspacePath(relativePath);
           if (uri === undefined) return undefined;
-          const text = snapshots.acceptedText(normalizeUriKey(uri));
+          const key = normalizeUriKey(uri);
+          if (this.untrackableKeys.has(key)) return undefined;
+          const text = snapshots.acceptedText(key);
           return {
             uri,
             exists: text !== undefined,
@@ -772,6 +775,7 @@ export class ExtensionRuntime implements vscode.Disposable {
           onProven: (transition) => this.applyProvenTransition(transition),
           onUnproven: (candidate) => this.acceptUnprovenCandidate(candidate),
         },
+        onDiagnostic: (message) => this.log('CodexProvenanceNotification', message),
         transitionLifetimeMs: DEFAULT_CODEX_TRANSITION_LIFETIME_MS,
       }));
       ownership.use(vscode.commands.registerCommand(
@@ -919,6 +923,7 @@ export class ExtensionRuntime implements vscode.Disposable {
       await this.spacers.clearAll();
       this.ownership.dispose();
       this.trackedUris.clear();
+      this.untrackableKeys.clear();
       this.comparisonKeys.clear();
       this.visibleKeys.clear();
       this.reviewEditSaves.clear();
@@ -1075,6 +1080,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     this.detector.invalidate(key);
     this.coordinator.invalidate(key);
     this.documentDebouncer.cancel(key);
+    void this.run('DocumentEditProofInvalidation', () => this.gate.invalidate(key));
     if (!this.isEligible(uri, text)) {
       this.deleteKey(key);
       return;
@@ -1082,12 +1088,11 @@ export class ExtensionRuntime implements vscode.Disposable {
 
     this.trackedUris.set(key, uri);
     this.documentDebouncer.schedule(key, this.settingsValue.debounceMs, () => {
-      void this.run('DocumentEditCandidate', () => this.gate.handleCandidate({
-        kind: 'present',
-        key,
-        uri,
-        text,
-      }));
+      void this.run('DocumentEditRebaseline', async () => {
+        this.untrackableKeys.delete(key);
+        await this.coordinator.acceptExternalState(key, text);
+        this.syncComparison(key);
+      });
     });
   }
 
@@ -1143,12 +1148,7 @@ export class ExtensionRuntime implements vscode.Disposable {
       this.syncComparison(key);
       return;
     }
-    void this.run('DocumentSaveCandidate', () => this.gate.handleCandidate({
-      kind: 'present',
-      key,
-      uri: document.uri,
-      text,
-    }));
+    this.detector.handleSave(document.uri);
   }
 
   private handleDocumentClose(document: vscode.TextDocument): void {
@@ -1214,6 +1214,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
 
     await this.gate.invalidateAll();
+    this.untrackableKeys.clear();
     for (const [key, uri] of [...this.trackedUris]) {
       if (event.removed.some((folder) => this.isWithin(uri, folder.uri))) {
         this.deleteKey(key);
@@ -1234,6 +1235,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     this.coordinator.delete(key);
     this.syncComparison(key);
     this.trackedUris.delete(key);
+    this.untrackableKeys.delete(key);
   }
 
   private syncComparison(key: string): void {
@@ -1300,7 +1302,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     return valid;
   }
 
-  private handleFileSystemCandidate(candidate: ExternalChangeCandidate): Promise<void> {
+  private async handleFileSystemCandidate(candidate: ExternalChangeCandidate): Promise<void> {
     if (this.disposed) return Promise.resolve();
     const uri = candidate.uri as vscode.Uri;
     const key = normalizeUriKey(uri);
@@ -1309,11 +1311,26 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
 
     this.trackedUris.set(key, uri);
+    if (candidate.kind === 'untrackable') {
+      await this.gate.invalidate(key);
+      this.untrackableKeys.add(key);
+      await this.coordinator.acceptExternalState(key, undefined);
+      this.syncComparison(key);
+      return;
+    }
+    this.untrackableKeys.delete(key);
     if (candidate.kind === 'absent') {
-      return this.gate.handleCandidate({ kind: 'absent', key, uri });
+      await this.gate.handleCandidate({ kind: 'absent', key, uri });
+      return;
     }
 
-    return this.gate.handleCandidate({ kind: 'present', key, uri, text: candidate.text });
+    await this.gate.handleCandidate({
+      kind: 'present',
+      key,
+      uri,
+      text: candidate.text,
+      bytes: candidate.bytes,
+    });
   }
 
   private async applyProvenTransition(transition: ExactCodexTransition): Promise<void> {
@@ -1346,14 +1363,17 @@ export class ExtensionRuntime implements vscode.Disposable {
       : !transition.after.exists
         ? 'deleted'
         : 'existing';
-    await this.coordinator.provenChange(
-      transition.key,
-      transition.before.text,
-      transition.after.text,
-      lifecycle,
-      transition.provenance,
-    );
-    this.syncComparison(transition.key);
+    try {
+      await this.coordinator.provenChange(
+        transition.key,
+        transition.before.text,
+        transition.after.text,
+        lifecycle,
+        transition.provenance,
+      );
+    } finally {
+      this.syncComparison(transition.key);
+    }
   }
 
   private async acceptUnprovenCandidate(candidate: FileSystemCandidate): Promise<void> {
@@ -1368,6 +1388,7 @@ export class ExtensionRuntime implements vscode.Disposable {
       return;
     }
     if (candidate.kind === 'present') {
+      this.untrackableKeys.delete(candidate.key);
       this.trackedUris.set(candidate.key, candidate.uri);
       await this.coordinator.acceptExternalState(candidate.key, candidate.text);
       this.syncComparison(candidate.key);
@@ -1375,6 +1396,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
 
     await this.coordinator.acceptExternalState(candidate.key, undefined);
+    this.untrackableKeys.delete(candidate.key);
     this.syncComparison(candidate.key);
     this.trackedUris.delete(candidate.key);
   }

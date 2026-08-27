@@ -1,4 +1,5 @@
 import type * as vscode from 'vscode';
+import { createHash } from 'node:crypto';
 import {
   CodexProvenanceLedger,
   type AcceptedStateResolver,
@@ -11,7 +12,13 @@ import {
 import { sha256Text } from './unifiedFilePatch';
 
 export type FileSystemCandidate =
-  | { readonly kind: 'present'; readonly key: string; readonly uri: vscode.Uri; readonly text: string }
+  | {
+    readonly kind: 'present';
+    readonly key: string;
+    readonly uri: vscode.Uri;
+    readonly text: string;
+    readonly bytes: Uint8Array;
+  }
   | { readonly kind: 'absent'; readonly key: string; readonly uri: vscode.Uri };
 
 export interface CodexChangeGateCallbacks {
@@ -27,6 +34,8 @@ export interface CodexChangeGateOptions {
   readonly transitionLifetimeMs?: number;
   readonly maxPendingCandidates?: number;
   readonly maxEligibleTransitions?: number;
+  readonly diagnosticIntervalMs?: number;
+  readonly onDiagnostic?: (message: string) => void;
   readonly now?: () => number;
   readonly setTimer?: (callback: () => void, delayMs: number) => unknown;
   readonly clearTimer?: (handle: unknown) => void;
@@ -47,6 +56,12 @@ interface EligibleTransition {
 interface ProvenCandidateIdentity {
   readonly identity: string;
   readonly itemKeys: ReadonlySet<string>;
+  readonly expiresAt: number;
+}
+
+interface RejectedItemTombstone {
+  readonly expiresAt: number;
+  readonly order: number;
 }
 
 interface NotificationKeyResolution {
@@ -60,6 +75,36 @@ const DEFAULT_QUARANTINE_MS = 1_000;
 export const DEFAULT_CODEX_TRANSITION_LIFETIME_MS = 15_000;
 const DEFAULT_MAX_PENDING_CANDIDATES = 256;
 const DEFAULT_MAX_ELIGIBLE_TRANSITIONS = 256;
+const DEFAULT_DIAGNOSTIC_INTERVAL_MS = 30_000;
+const MALFORMED_NOTIFICATION_DIAGNOSTIC =
+  'Rejected a malformed Codex provenance notification.';
+const REJECTED_ITEM_ARCHIVE_BITS = 65_536;
+
+class RejectedItemArchive {
+  private readonly bytes = new Uint8Array(REJECTED_ITEM_ARCHIVE_BITS / 8);
+
+  add(value: string): void {
+    for (const bit of this.bits(value)) {
+      this.bytes[Math.floor(bit / 8)] |= 1 << (bit % 8);
+    }
+  }
+
+  has(value: string): boolean {
+    return this.bits(value).every((bit) => (
+      (this.bytes[Math.floor(bit / 8)] & (1 << (bit % 8))) !== 0
+    ));
+  }
+
+  clear(): void {
+    this.bytes.fill(0);
+  }
+
+  private bits(value: string): number[] {
+    const digest = createHash('sha256').update(value, 'utf8').digest();
+    return [0, 4, 8, 12]
+      .map((offset) => digest.readUInt32BE(offset) % REJECTED_ITEM_ARCHIVE_BITS);
+  }
+}
 
 function nonNegativeFinite(value: number, name: string): number {
   if (!Number.isFinite(value) || value < 0) {
@@ -88,12 +133,10 @@ function notificationItemKey(notification: CodexProvenanceNotification): string 
   return `${notification.params.threadId}\0${notification.params.turnId}\0${itemId}`;
 }
 
-function candidateExists(candidate: FileSystemCandidate): boolean {
-  return candidate.kind === 'present';
-}
-
 function candidateHash(candidate: FileSystemCandidate): string {
-  return sha256Text(candidate.kind === 'present' ? candidate.text : '');
+  return candidate.kind === 'present'
+    ? createHash('sha256').update(candidate.bytes).digest('hex')
+    : sha256Text('');
 }
 
 function candidateIdentity(candidate: FileSystemCandidate): string {
@@ -113,23 +156,36 @@ function transitionIdentity(transition: ExactCodexTransition): string {
   ]);
 }
 
+function candidateMatchesTransition(
+  candidate: FileSystemCandidate,
+  transition: ExactCodexTransition,
+): boolean {
+  if (candidate.kind === 'absent') return !transition.after.exists;
+  return transition.after.exists
+    && Buffer.from(candidate.bytes).equals(Buffer.from(transition.after.text, 'utf8'));
+}
+
 export class CodexChangeGate implements vscode.Disposable {
   private readonly pendingCandidates = new Map<string, PendingCandidate>();
   private readonly shadowCandidates = new Map<string, PendingCandidate>();
   private readonly provenCandidateIdentities = new Map<string, ProvenCandidateIdentity>();
   private readonly eligibleTransitions = new Map<string, EligibleTransition>();
   private readonly inProgressItemKeys = new Map<string, Set<string>>();
-  private readonly rejectedItems = new Set<string>();
+  private readonly rejectedItems = new Map<string, RejectedItemTombstone>();
+  private readonly archivedRejectedItems = new RejectedItemArchive();
   private readonly quarantineMs: number;
   private readonly transitionLifetimeMs: number;
   private readonly maxPendingCandidates: number;
   private readonly maxEligibleTransitions: number;
+  private readonly diagnosticIntervalMs: number;
   private readonly now: () => number;
   private readonly setTimer: (callback: () => void, delayMs: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
   private readonly ledger: CodexProvenanceLedger;
   private operationTail: Promise<void> = Promise.resolve();
   private timer: unknown;
+  private nextMalformedDiagnosticAt = Number.NEGATIVE_INFINITY;
+  private latestRejectedItemOrder = 0;
   private disposeRequested = false;
 
   constructor(private readonly options: CodexChangeGateOptions) {
@@ -149,6 +205,10 @@ export class CodexChangeGate implements vscode.Disposable {
       options.maxEligibleTransitions ?? DEFAULT_MAX_ELIGIBLE_TRANSITIONS,
       'maxEligibleTransitions',
     );
+    this.diagnosticIntervalMs = nonNegativeFinite(
+      options.diagnosticIntervalMs ?? DEFAULT_DIAGNOSTIC_INTERVAL_MS,
+      'diagnosticIntervalMs',
+    );
     this.now = options.now ?? Date.now;
     this.setTimer = options.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
     this.clearTimer = options.clearTimer ?? ((handle) => clearTimeout(handle as NodeJS.Timeout));
@@ -162,7 +222,10 @@ export class CodexChangeGate implements vscode.Disposable {
     return this.enqueue(async () => {
       if (this.disposeRequested) return;
       const notification = parseCodexProvenanceNotification(value);
-      if (notification === undefined) return;
+      if (notification === undefined) {
+        this.diagnoseMalformedNotification();
+        return;
+      }
 
       let firstError: unknown;
       try {
@@ -188,8 +251,8 @@ export class CodexChangeGate implements vscode.Disposable {
       } catch (error) {
         firstError ??= error;
       }
-      if (resolution.resolverAgreementFailed || this.rejectedItems.has(itemKey)) {
-        this.rejectedItems.add(itemKey);
+      if (resolution.resolverAgreementFailed || this.isRejectedItem(itemKey)) {
+        this.rejectItem(itemKey);
         for (const key of resolution.relevantKeys) {
           this.eligibleTransitions.delete(key);
           this.ledger.invalidate(key);
@@ -314,19 +377,19 @@ export class CodexChangeGate implements vscode.Disposable {
 
       const retiredItemKeys = new Set(this.inProgressItemKeys.get(key) ?? []);
       for (const itemKey of retiredItemKeys) {
-        this.rejectedItems.add(itemKey);
+        this.rejectItem(itemKey);
       }
       const eligible = this.eligibleTransitions.get(key);
       if (eligible !== undefined) {
         for (const itemId of eligible.transition.provenance.itemIds) {
           const itemKey = `${eligible.transition.provenance.threadId}\0${eligible.transition.provenance.turnId}\0${itemId}`;
           retiredItemKeys.add(itemKey);
-          this.rejectedItems.add(itemKey);
+          this.rejectItem(itemKey);
         }
       }
       for (const itemKey of this.provenCandidateIdentities.get(key)?.itemKeys ?? []) {
         retiredItemKeys.add(itemKey);
-        this.rejectedItems.add(itemKey);
+        this.rejectItem(itemKey);
       }
 
       this.pendingCandidates.delete(key);
@@ -350,6 +413,8 @@ export class CodexChangeGate implements vscode.Disposable {
       this.eligibleTransitions.clear();
       this.inProgressItemKeys.clear();
       this.rejectedItems.clear();
+      this.archivedRejectedItems.clear();
+      this.latestRejectedItemOrder = 0;
       this.ledger.clear();
     });
   }
@@ -366,6 +431,7 @@ export class CodexChangeGate implements vscode.Disposable {
       this.eligibleTransitions.clear();
       this.inProgressItemKeys.clear();
       this.rejectedItems.clear();
+      this.archivedRejectedItems.clear();
       let firstError: unknown;
       for (const { candidate } of pending) {
         try {
@@ -406,7 +472,7 @@ export class CodexChangeGate implements vscode.Disposable {
     const previous = new Map(this.eligibleTransitions);
     const refreshed = new Map<string, EligibleTransition>();
     for (const transition of this.ledger.completedTransitions(this.options.resolveAcceptedPath)) {
-      const rejected = transition.provenance.itemIds.some((itemId) => this.rejectedItems.has(
+      const rejected = transition.provenance.itemIds.some((itemId) => this.isRejectedItem(
         `${transition.provenance.threadId}\0${transition.provenance.turnId}\0${itemId}`,
       ));
       if (rejected) {
@@ -442,15 +508,14 @@ export class CodexChangeGate implements vscode.Disposable {
     }
 
     const { transition } = eligible;
-    if (candidateExists(pending.candidate) !== transition.after.exists
-      || candidateHash(pending.candidate) !== sha256Text(transition.after.text)) {
+    if (!candidateMatchesTransition(pending.candidate, transition)) {
       await this.unproveAndInvalidate(key, pending);
       return;
     }
 
     this.pendingCandidates.delete(key);
     this.eligibleTransitions.delete(key);
-    const consumed = this.ledger.consume(key, candidateHash(pending.candidate));
+    const consumed = this.ledger.consume(key, sha256Text(transition.after.text));
     if (consumed === undefined) {
       this.ledger.invalidate(key);
       await this.options.callbacks.onUnproven(pending.candidate);
@@ -462,7 +527,9 @@ export class CodexChangeGate implements vscode.Disposable {
       itemKeys: new Set(consumed.provenance.itemIds.map((itemId) => (
         `${consumed.provenance.threadId}\0${consumed.provenance.turnId}\0${itemId}`
       ))),
+      expiresAt: this.now() + this.transitionLifetimeMs,
     });
+    this.enforceProvenIdentityBound();
   }
 
   private async unproveAndInvalidate(key: string, pending: PendingCandidate): Promise<void> {
@@ -491,6 +558,37 @@ export class CodexChangeGate implements vscode.Disposable {
     }
   }
 
+  private enforceProvenIdentityBound(): void {
+    while (this.provenCandidateIdentities.size > this.maxEligibleTransitions) {
+      const oldestKey = this.provenCandidateIdentities.keys().next().value as string | undefined;
+      if (oldestKey === undefined) return;
+      this.provenCandidateIdentities.delete(oldestKey);
+      this.shadowCandidates.delete(oldestKey);
+    }
+  }
+
+  private rejectItem(itemKey: string): void {
+    this.rejectedItems.delete(itemKey);
+    this.rejectedItems.set(itemKey, {
+      expiresAt: this.now() + this.transitionLifetimeMs,
+      order: ++this.latestRejectedItemOrder,
+    });
+    while (this.rejectedItems.size > this.maxEligibleTransitions) {
+      const oldestKey = this.rejectedItems.keys().next().value as string | undefined;
+      if (oldestKey === undefined) return;
+      this.archiveRejectedItem(oldestKey);
+    }
+  }
+
+  private isRejectedItem(itemKey: string): boolean {
+    return this.rejectedItems.has(itemKey) || this.archivedRejectedItems.has(itemKey);
+  }
+
+  private archiveRejectedItem(itemKey: string): void {
+    this.archivedRejectedItems.add(itemKey);
+    this.rejectedItems.delete(itemKey);
+  }
+
   private async sweep(now: number): Promise<void> {
     const expiredCandidates = [...this.pendingCandidates.entries()]
       .filter(([, pending]) => pending.expiresAt <= now);
@@ -513,6 +611,15 @@ export class CodexChangeGate implements vscode.Disposable {
     for (const [key, shadow] of this.shadowCandidates) {
       if (shadow.expiresAt <= now) this.shadowCandidates.delete(key);
     }
+    for (const [key, proven] of this.provenCandidateIdentities) {
+      if (proven.expiresAt <= now) {
+        this.provenCandidateIdentities.delete(key);
+        this.shadowCandidates.delete(key);
+      }
+    }
+    for (const [itemKey, tombstone] of this.rejectedItems) {
+      if (tombstone.expiresAt <= now) this.archiveRejectedItem(itemKey);
+    }
     this.ledger.prune(now);
     if (firstError !== undefined) throw firstError;
   }
@@ -524,6 +631,8 @@ export class CodexChangeGate implements vscode.Disposable {
       ...[...this.pendingCandidates.values()].map(({ expiresAt }) => expiresAt),
       ...[...this.shadowCandidates.values()].map(({ expiresAt }) => expiresAt),
       ...[...this.eligibleTransitions.values()].map(({ expiresAt }) => expiresAt),
+      ...[...this.provenCandidateIdentities.values()].map(({ expiresAt }) => expiresAt),
+      ...[...this.rejectedItems.values()].map(({ expiresAt }) => expiresAt),
     ];
     if (expiries.length === 0) return;
     const delayMs = Math.max(0, Math.min(...expiries) - this.now());
@@ -543,5 +652,17 @@ export class CodexChangeGate implements vscode.Disposable {
     if (this.timer === undefined) return;
     this.clearTimer(this.timer);
     this.timer = undefined;
+  }
+
+  private diagnoseMalformedNotification(): void {
+    if (this.options.onDiagnostic === undefined || this.now() < this.nextMalformedDiagnosticAt) {
+      return;
+    }
+    this.nextMalformedDiagnosticAt = this.now() + this.diagnosticIntervalMs;
+    try {
+      this.options.onDiagnostic(MALFORMED_NOTIFICATION_DIAGNOSTIC);
+    } catch {
+      // Diagnostic sinks must not alter provenance state or escape the command boundary.
+    }
   }
 }

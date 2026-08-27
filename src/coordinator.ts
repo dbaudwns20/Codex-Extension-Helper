@@ -86,31 +86,35 @@ export class ComparisonCoordinator {
     }
 
     this.debouncer.cancel(key);
+    const startingState = this.snapshots.get(key);
     const sourceRevision = this.nextRevision(key);
     const exactProvenance = this.immutableProvenance(provenance);
     const baselineText = lifecycle === 'created' ? '' : beforeText;
     const currentText = lifecycle === 'deleted' ? '' : afterText;
-    this.snapshots.setComparison(key, {
-      baselineText,
-      currentText,
-      hunks: [],
+    let hunks: readonly ChangeHunk[];
+    try {
+      hunks = await this.diffEngine.compute(baselineText, currentText);
+    } catch (error) {
+      if (this.provenComputationIsCurrent(
+        key,
+        sourceRevision,
+        beforeText,
+        afterText,
+        lifecycle,
+        startingState,
+      )) {
+        this.acceptExternalStateNow(key, lifecycle === 'deleted' ? undefined : afterText);
+      }
+      throw error;
+    }
+    if (!this.provenComputationIsCurrent(
+      key,
       sourceRevision,
-      comparisonActive: false,
-      pending: false,
+      beforeText,
+      afterText,
       lifecycle,
-      provenance: exactProvenance,
-    });
-
-    const hunks = await this.diffEngine.compute(baselineText, currentText);
-    const current = this.snapshots.get(key);
-    if (
-      this.disposed
-      || current?.sourceRevision !== sourceRevision
-      || current.baselineText !== baselineText
-      || current.currentText !== currentText
-      || current.lifecycle !== lifecycle
-      || current.provenance !== exactProvenance
-    ) {
+      startingState,
+    )) {
       return;
     }
 
@@ -122,10 +126,14 @@ export class ComparisonCoordinator {
     }
 
     this.snapshots.setComparison(key, {
-      ...current,
+      baselineText,
+      currentText,
       hunks,
+      sourceRevision,
       comparisonActive: true,
       pending: true,
+      lifecycle,
+      provenance: exactProvenance,
     });
     if (hunks.length === 0) {
       return;
@@ -491,6 +499,20 @@ export class ComparisonCoordinator {
       return false;
     }
     return lifecycle !== 'deleted' || afterText === '';
+  }
+
+  private provenComputationIsCurrent(
+    key: string,
+    sourceRevision: number,
+    beforeText: string,
+    afterText: string,
+    lifecycle: FileLifecycle,
+    startingState: FileComparisonState | undefined,
+  ): boolean {
+    return !this.disposed
+      && this.revisions.get(key) === sourceRevision
+      && this.snapshots.get(key) === startingState
+      && this.provenTransitionMatchesAcceptedState(key, beforeText, afterText, lifecycle);
   }
 
   private inactiveExistingState(text: string, sourceRevision: number): FileComparisonState {

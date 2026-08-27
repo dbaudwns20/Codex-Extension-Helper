@@ -114,9 +114,13 @@ class FakeClock {
   }
 }
 
-function present(path: string, text: string): FileSystemCandidate {
+function present(
+  path: string,
+  text: string,
+  bytes: Uint8Array = new TextEncoder().encode(text),
+): FileSystemCandidate {
   const uri = fakeUri(path);
-  return { kind: 'present', key: uri.toString(), uri, text };
+  return { kind: 'present', key: uri.toString(), uri, text, bytes } as FileSystemCandidate;
 }
 
 function absent(path: string): FileSystemCandidate {
@@ -774,6 +778,21 @@ describe('CodexChangeGate', () => {
     expect(unproven).toEqual([candidate]);
   });
 
+  it('rejects raw disk bytes that differ from the canonical replay bytes', async () => {
+    const canonical = new TextEncoder().encode('new\n');
+    const bomPrefixed = new Uint8Array([0xef, 0xbb, 0xbf, ...canonical]);
+    const candidate = present('file.txt', 'new\n', bomPrefixed);
+    const { gate, proven, unproven } = setup({
+      'file.txt': state('file.txt', true, 'old\n'),
+    });
+
+    await gate.handleNotification(completed([update('file.txt', 'old', 'new')]));
+    await gate.handleCandidate(candidate);
+
+    expect(proven).toEqual([]);
+    expect(unproven).toEqual([candidate]);
+  });
+
   it('fails closed when completed evidence cannot replay against accepted state', async () => {
     const candidate = present('file.txt', 'new\n');
     const invalidChange: CodexFileUpdateChange = {
@@ -828,6 +847,101 @@ describe('CodexChangeGate', () => {
 
     await gate.handleNotification(completed([update('file.txt', 'old', 'new')]));
     expect(proven).toHaveLength(1);
+  });
+
+  it('emits only a static rate-limited diagnostic for malformed bridge payloads', async () => {
+    const diagnostics: string[] = [];
+    const secretPatch = 'SECRET PATCH CONTENT';
+    const { clock, gate } = setup({}, {
+      diagnosticIntervalMs: 100,
+      onDiagnostic: (message) => { diagnostics.push(message); },
+    });
+    const malformed = {
+      method: 'item/completed',
+      params: { patch: secretPatch },
+    };
+
+    await gate.handleNotification(malformed);
+    await gate.handleNotification(malformed);
+    clock.elapseWithoutTimers(100);
+    await gate.handleNotification(malformed);
+
+    expect(diagnostics).toEqual([
+      'Rejected a malformed Codex provenance notification.',
+      'Rejected a malformed Codex provenance notification.',
+    ]);
+    expect(diagnostics.join('\n')).not.toContain(secretPatch);
+  });
+
+  it('expires a proven candidate identity into a conservative unproven result', async () => {
+    const candidate = present('file.txt', 'new\n');
+    const { clock, gate, proven, unproven, flush } = setup({
+      'file.txt': state('file.txt', true, 'old\n'),
+    }, {
+      quarantineMs: 10,
+      transitionLifetimeMs: 50,
+    });
+
+    await gate.handleNotification(completed([update('file.txt', 'old', 'new')]));
+    await gate.handleCandidate(candidate);
+    expect(proven).toHaveLength(1);
+
+    clock.advance(50);
+    await flush();
+    await gate.handleCandidate(candidate);
+    clock.advance(10);
+    await flush();
+
+    expect(unproven).toEqual([candidate]);
+  });
+
+  it('evicts the least-recent proven identity at the configured evidence bound', async () => {
+    const first = present('a.txt', 'new-a\n');
+    const second = present('b.txt', 'new-b\n');
+    const { clock, gate, proven, unproven, flush } = setup({
+      'a.txt': state('a.txt', true, 'old-a\n'),
+      'b.txt': state('b.txt', true, 'old-b\n'),
+    }, {
+      quarantineMs: 10,
+      maxEligibleTransitions: 1,
+    });
+
+    await gate.handleNotification(completed([update('a.txt', 'old-a', 'new-a')], 'item-a'));
+    await gate.handleCandidate(first);
+    await gate.handleNotification(completed([update('b.txt', 'old-b', 'new-b')], 'item-b'));
+    await gate.handleCandidate(second);
+    expect(proven).toHaveLength(2);
+
+    await gate.handleCandidate(first);
+    clock.advance(10);
+    await flush();
+
+    expect(unproven).toEqual([first]);
+  });
+
+  it('never reuses a rejected item after its detailed tombstone expires', async () => {
+    const acceptedStates: Record<string, ProvenanceFileState> = {};
+    const candidate = present('file.txt', 'new\n');
+    const workspaceUri = candidate.uri;
+    const { clock, gate, proven, unproven, flush } = setup(acceptedStates, {
+      quarantineMs: 10,
+      transitionLifetimeMs: 20,
+      resolveWorkspacePath: () => workspaceUri,
+    });
+    const notification = completed([update('file.txt', 'old', 'new')], 'rejected-item');
+
+    await gate.handleNotification(notification);
+    clock.advance(20);
+    await flush();
+    acceptedStates['file.txt'] = state('file.txt', true, 'old\n');
+
+    await gate.handleNotification(notification);
+    await gate.handleCandidate(candidate);
+    clock.advance(10);
+    await flush();
+
+    expect(proven).toEqual([]);
+    expect(unproven).toEqual([candidate]);
   });
 
   it('unproves every pending candidate once on disposal and cancels later expiry', async () => {

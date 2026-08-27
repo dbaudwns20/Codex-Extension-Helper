@@ -13,9 +13,15 @@ export type ExternalChangeCandidate =
     readonly key: string;
     readonly uri: ExternalChangeUri;
     readonly text: string;
+    readonly bytes: Uint8Array;
   }
   | {
     readonly kind: 'absent';
+    readonly key: string;
+    readonly uri: ExternalChangeUri;
+  }
+  | {
+    readonly kind: 'untrackable';
     readonly key: string;
     readonly uri: ExternalChangeUri;
   };
@@ -35,6 +41,13 @@ export interface ExternalChangeDetectorOptions {
 
 export function normalizeUriKey(uri: ExternalChangeUri): string {
   return uri.toString();
+}
+
+function isNotFoundError(error: unknown): boolean {
+  const code = error !== null && typeof error === 'object'
+    ? (error as { code?: unknown }).code
+    : undefined;
+  return code === 'ENOENT' || code === 'FileNotFound';
 }
 
 export class ExternalChangeDetector {
@@ -66,6 +79,11 @@ export class ExternalChangeDetector {
     this.schedule(uri, 'present');
   }
 
+  handleSave(uri: ExternalChangeUri): void {
+    this.recentSaves.consume(normalizeUriKey(uri), this.now());
+    this.schedule(uri, 'present', false);
+  }
+
   handleDelete(uri: ExternalChangeUri): void {
     this.schedule(uri, 'absent');
   }
@@ -89,13 +107,17 @@ export class ExternalChangeDetector {
     this.revisions.clear();
   }
 
-  private schedule(uri: ExternalChangeUri, kind: ExternalChangeCandidate['kind']): void {
+  private schedule(
+    uri: ExternalChangeUri,
+    kind: 'present' | 'absent',
+    consumeRecentSave = true,
+  ): void {
     if (this.disposed) {
       return;
     }
 
     const key = normalizeUriKey(uri);
-    if (kind === 'present' && this.recentSaves.consume(key, this.now())) {
+    if (kind === 'present' && consumeRecentSave && this.recentSaves.consume(key, this.now())) {
       this.invalidate(key);
       return;
     }
@@ -127,10 +149,23 @@ export class ExternalChangeDetector {
         text: '',
         sizeBytes: 0,
       }, initialSettings)) {
+        await this.options.onCandidate({ kind: 'untrackable', key, uri });
         return;
       }
 
-      const bytes = await this.options.readFile(uri);
+      let bytes: Uint8Array;
+      try {
+        bytes = await this.options.readFile(uri);
+      } catch (error) {
+        if (!this.isCurrent(key, revision)) return;
+        if (isNotFoundError(error)) {
+          await this.options.onCandidate({ kind: 'absent', key, uri });
+          return;
+        }
+        this.report(error);
+        await this.options.onCandidate({ kind: 'untrackable', key, uri });
+        return;
+      }
       if (!this.isCurrent(key, revision)) {
         return;
       }
@@ -143,6 +178,7 @@ export class ExternalChangeDetector {
         text: '',
         sizeBytes: 0,
       }, currentSettings) || bytes.byteLength > currentSettings.maxFileSizeBytes) {
+        await this.options.onCandidate({ kind: 'untrackable', key, uri });
         return;
       }
 
@@ -150,6 +186,13 @@ export class ExternalChangeDetector {
       try {
         text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
       } catch {
+        await this.options.onCandidate({ kind: 'untrackable', key, uri });
+        return;
+      }
+
+      const stableBytes = Uint8Array.from(bytes);
+      if (!Buffer.from(text, 'utf8').equals(Buffer.from(stableBytes))) {
+        await this.options.onCandidate({ kind: 'untrackable', key, uri });
         return;
       }
 
@@ -159,10 +202,13 @@ export class ExternalChangeDetector {
         text,
         sizeBytes: bytes.byteLength,
       }, currentSettings) || !this.isCurrent(key, revision)) {
+        if (this.isCurrent(key, revision)) {
+          await this.options.onCandidate({ kind: 'untrackable', key, uri });
+        }
         return;
       }
 
-      await this.options.onCandidate({ kind: 'present', key, uri, text });
+      await this.options.onCandidate({ kind: 'present', key, uri, text, bytes: stableBytes });
     } catch (error) {
       if (this.isCurrent(key, revision)) {
         this.report(error);

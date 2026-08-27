@@ -31,11 +31,20 @@ describe('parseCodexProvenanceNotification', () => {
     });
   });
 
-  it('accepts completed and terminal invalidation file-change items', () => {
-    expect(parseCodexProvenanceNotification(completed())).toMatchObject({ method: 'item/completed' });
-    for (const status of ['failed', 'declined', 'interrupted']) {
-      expect(parseCodexProvenanceNotification(completed(status))).toMatchObject({ method: 'item/completed' });
-    }
+  it.each(['completed', 'failed', 'declined', 'interrupted'] as const)(
+    'retains the exact %s terminal file-change status',
+    (status) => {
+      const parsed = parseCodexProvenanceNotification(completed(status));
+
+      expect(parsed).toMatchObject({
+        method: 'item/completed',
+        params: { item: { status } },
+      });
+      expect(parsed?.method === 'item/completed' && parsed.params.item.status).toBe(status);
+    },
+  );
+
+  it('rejects non-terminal and non-file completed items', () => {
     expect(parseCodexProvenanceNotification(completed('in_progress'))).toBeUndefined();
     expect(parseCodexProvenanceNotification(completed('completed', { type: 'commandExecution' }))).toBeUndefined();
   });
