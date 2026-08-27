@@ -743,6 +743,176 @@ describe('packaged runtime', () => {
   });
 
   it.each([
+    {
+      name: 'exact create',
+      initialExists: false,
+      notification: completedAdd('file.ts', 'created'),
+      candidate: 'create',
+      observedText: 'created\n',
+      expectedShown: true,
+      expectedLifecycle: 'created',
+    },
+    {
+      name: 'exact update',
+      initialExists: true,
+      notification: completedUpdate('before', 'updated'),
+      candidate: 'change',
+      observedText: 'updated\n',
+      expectedShown: true,
+      expectedLifecycle: 'existing',
+    },
+    {
+      name: 'exact delete',
+      initialExists: true,
+      notification: completedDelete('before'),
+      candidate: 'delete',
+      observedText: undefined,
+      expectedShown: true,
+      expectedLifecycle: 'deleted',
+    },
+    {
+      name: 'create with mismatched completed bytes',
+      initialExists: false,
+      notification: completedAdd('file.ts', 'Codex bytes'),
+      candidate: 'create',
+      observedText: 'different bytes\n',
+      expectedShown: false,
+    },
+    {
+      name: 'update with mismatched completed bytes',
+      initialExists: true,
+      notification: completedUpdate('before', 'Codex bytes'),
+      candidate: 'change',
+      observedText: 'different bytes\n',
+      expectedShown: false,
+    },
+    {
+      name: 'delete with mismatched completed bytes',
+      initialExists: true,
+      notification: completedDelete('different baseline'),
+      candidate: 'delete',
+      observedText: undefined,
+      expectedShown: false,
+    },
+    {
+      name: 'merge result without completed proof',
+      initialExists: true,
+      notification: undefined,
+      candidate: 'change',
+      observedText: 'merge result\n',
+      expectedShown: false,
+    },
+    {
+      name: 'revert result without completed proof',
+      initialExists: true,
+      notification: undefined,
+      candidate: 'change',
+      observedText: 'revert result\n',
+      expectedShown: false,
+    },
+    {
+      name: 'Git write without completed proof',
+      initialExists: true,
+      notification: undefined,
+      candidate: 'change',
+      observedText: 'Git write\n',
+      expectedShown: false,
+    },
+    {
+      name: 'shell-command write without completed proof',
+      initialExists: true,
+      notification: undefined,
+      candidate: 'change',
+      observedText: 'shell-command write\n',
+      expectedShown: false,
+    },
+    {
+      name: 'user write without completed proof',
+      initialExists: true,
+      notification: undefined,
+      candidate: 'document',
+      observedText: 'user write\n',
+      expectedShown: false,
+    },
+    {
+      name: 'formatter write without completed proof',
+      initialExists: true,
+      notification: undefined,
+      candidate: 'document',
+      observedText: 'formatter write\n',
+      expectedShown: false,
+    },
+  ] as const)(
+    'shows only exact completed fileChange proof for $name',
+    async ({
+      initialExists,
+      notification,
+      candidate,
+      observedText,
+      expectedShown,
+      expectedLifecycle,
+    }) => {
+      vi.useFakeTimers();
+      try {
+        const fake = installRuntimeVscode('before\n');
+        if (!initialExists) {
+          fake.deleteFile();
+          fake.window.activeTextEditor = undefined;
+        }
+        const { ExtensionRuntime } = await import('../../src/extension');
+        const runtime = new ExtensionRuntime({
+          enabled: true,
+          debounceMs: 0,
+          maxFileSizeBytes: 1024,
+          exclude: [],
+        }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+        if (notification !== undefined) {
+          await sendCodexNotification(fake, notification);
+        }
+        if (candidate === 'delete') {
+          fake.deleteFile();
+          fake.callbacks.get('watcherDelete')!(fake.uri);
+        } else if (candidate === 'document') {
+          fake.editText(observedText);
+        } else {
+          if (candidate === 'create') fake.writeFile(observedText);
+          else fake.setText(observedText);
+          fake.callbacks.get(candidate === 'create' ? 'watcherCreate' : 'watcherChange')!(fake.uri);
+        }
+        await settleRuntime();
+
+        const state = (runtime as unknown as {
+          coordinator: { state(key: string): FileComparisonState | undefined };
+        }).coordinator.state(fake.uri.toString());
+        expect(runtime.comparisonCount).toBe(expectedShown ? 1 : 0);
+        expect(fake.changesGroup.resourceStates).toHaveLength(expectedShown ? 1 : 0);
+        if (expectedShown) {
+          expect(state).toMatchObject({
+            baselineText: initialExists ? 'before\n' : '',
+            currentText: observedText ?? '',
+            comparisonActive: true,
+            lifecycle: expectedLifecycle,
+            provenance: { confidence: 'exact' },
+          });
+        } else if (observedText === undefined) {
+          expect(state).toBeUndefined();
+        } else {
+          expect(state).toMatchObject({
+            baselineText: observedText,
+            currentText: observedText,
+            comparisonActive: false,
+            provenance: undefined,
+          });
+        }
+        runtime.dispose();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each([
     'merge result',
     'revert result',
     'checkout result',

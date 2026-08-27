@@ -614,7 +614,7 @@ git commit -m "feat: expose exact Codex provenance bridge"
 - Modify: `test/unit/gitChangeGuard.test.ts` (remove attribution expectations or delete only if the module is now unused)
 - Modify: `docs/superpowers/plans/2026-08-26-codex-change-provenance.md` (checkbox tracking only)
 
-- [ ] **Step 1: Add the final regression matrix**
+- [x] **Step 1: Add the final regression matrix**
 
 Create one table-driven runtime test that asserts visibility for all combinations:
 
@@ -626,7 +626,7 @@ Create one table-driven runtime test that asserts visibility for all combination
 | shell command write | no | n/a | hidden/rebaseline |
 | user/formatter write | no | n/a | hidden/rebaseline |
 
-- [ ] **Step 2: Run all automated verification**
+- [x] **Step 2: Run all automated verification**
 
 Run:
 
@@ -637,7 +637,7 @@ npm run package
 
 Expected: TypeScript compilation, all unit tests, and VSIX packaging PASS.
 
-- [ ] **Step 3: Inspect the final diff**
+- [x] **Step 3: Inspect the final diff**
 
 Run:
 
