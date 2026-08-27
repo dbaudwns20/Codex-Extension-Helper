@@ -870,6 +870,77 @@ describe('ReviewController created-file rejection', () => {
     expect(host.deleteCalls).toHaveLength(1);
     expect(coordinator.state(key)).toBeUndefined();
   });
+
+  describe('empty created-file lifecycle review', () => {
+    function setupEmptyCreated(reviewResources: () => readonly vscode.Uri[] = () => []) {
+      return setup('', '', { lifecycle: 'created' }, undefined, reviewResources);
+    }
+
+    it('approves an empty created file from its SCM file action', async () => {
+      const { changed, controller, coordinator, host } = setupEmptyCreated();
+
+      await controller.approveFile(fakeUri(key));
+
+      expect(host.files.get(key)).toBe('');
+      expect(coordinator.state(key)).toMatchObject({
+        baselineText: '',
+        currentText: '',
+        comparisonActive: false,
+        pending: false,
+        lifecycle: 'existing',
+      });
+      expect(changed).toEqual([key]);
+      expectNoHostMutation(host);
+    });
+
+    it('rejects an empty created file from its SCM file action', async () => {
+      const { changed, controller, coordinator, host } = setupEmptyCreated();
+
+      await controller.rejectFile(fakeUri(key));
+
+      expect(host.files.has(key)).toBe(false);
+      expect(host.deleteCalls.map((uri) => uri.toString())).toEqual([key]);
+      expect(coordinator.state(key)).toBeUndefined();
+      expect(changed).toEqual([key]);
+    });
+
+    it('approves and rejects empty created files from active-editor all-file commands', async () => {
+      const approved = setupEmptyCreated();
+      await approved.controller.approveAll();
+      expect(approved.host.files.get(key)).toBe('');
+      expect(approved.coordinator.state(key)?.comparisonActive).toBe(false);
+
+      const rejected = setupEmptyCreated();
+      await rejected.controller.rejectAll();
+      expect(rejected.host.files.has(key)).toBe(false);
+      expect(rejected.coordinator.state(key)).toBeUndefined();
+    });
+
+    it('routes bulk approval and rejection through empty created-file actions', async () => {
+      const uri = fakeUri(key);
+      const approved = setupEmptyCreated(() => [uri]);
+      await approved.controller.approveAllFiles();
+      expect(approved.host.files.get(key)).toBe('');
+      expect(approved.coordinator.state(key)?.comparisonActive).toBe(false);
+
+      const rejected = setupEmptyCreated(() => [uri]);
+      await rejected.controller.rejectAllFiles();
+      expect(rejected.host.files.has(key)).toBe(false);
+      expect(rejected.coordinator.state(key)).toBeUndefined();
+    });
+
+    for (const action of ['approveHunk', 'rejectHunk'] as const) {
+      it(`keeps ${action} unavailable for an empty created file`, async () => {
+        const { controller, coordinator, host, state } = setupEmptyCreated();
+
+        await controller[action](reference(key, state));
+
+        expect(host.files.get(key)).toBe('');
+        expect(coordinator.state(key)).toEqual(state);
+        expectNoHostMutation(host);
+      });
+    }
+  });
 });
 
 describe('ReviewController deleted-file decisions', () => {
@@ -896,6 +967,28 @@ describe('ReviewController deleted-file decisions', () => {
     expect(reviewDocument).not.toHaveBeenCalled();
     expectNoHostMutation(host);
   });
+
+  for (const action of ['approveHunk', 'rejectHunk', 'approveAll', 'rejectAll'] as const) {
+    it(`does not let a directly invoked ${action} editor command decide a deleted file`, async () => {
+      const { controller, coordinator, host, state } = setupDeleted();
+      host.document = liveDocument(key, '');
+      host.documents.set(key, host.document);
+
+      if (action === 'approveHunk') {
+        await controller.approveHunk(reference(key, state));
+      } else if (action === 'rejectHunk') {
+        await controller.rejectHunk(reference(key, state));
+      } else if (action === 'approveAll') {
+        await controller.approveAll();
+      } else {
+        await controller.rejectAll();
+      }
+
+      expect(host.files.has(key)).toBe(false);
+      expect(coordinator.state(key)).toEqual(state);
+      expectNoHostMutation(host);
+    });
+  }
 
   it('keeps deletion review active when approval finds a recreated path', async () => {
     const { changed, controller, coordinator, host, state } = setupDeleted();

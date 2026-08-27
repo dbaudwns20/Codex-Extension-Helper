@@ -341,6 +341,7 @@ export class ReviewController implements vscode.Disposable {
     const resolved = this.coordinator.resolveHunk(reference);
     if (
       resolved.status !== 'ok'
+      || resolved.state.lifecycle === 'deleted'
       || resolved.state.currentText !== document.text
     ) {
       this.synchronize(reference.key);
@@ -376,7 +377,8 @@ export class ReviewController implements vscode.Disposable {
     if (
       state === undefined
       || !state.pending
-      || state.hunks.length === 0
+      || state.lifecycle === 'deleted'
+      || (state.hunks.length === 0 && state.lifecycle !== 'created')
       || state.currentText !== this.canonicalTextForDisplay(document.key, document.text)
       || (expectedRevision !== undefined && state.sourceRevision !== expectedRevision)
     ) {
@@ -411,7 +413,7 @@ export class ReviewController implements vscode.Disposable {
     if (
       state === undefined
       || !state.pending
-      || state.hunks.length === 0
+      || (state.hunks.length === 0 && state.lifecycle !== 'created')
       || state.currentText !== this.canonicalTextForDisplay(key, document.text)
       || (expectedRevision !== undefined && state.sourceRevision !== expectedRevision)
     ) {

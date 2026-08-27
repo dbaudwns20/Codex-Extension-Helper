@@ -691,6 +691,88 @@ describe('packaged runtime', () => {
     }
   });
 
+  it('keeps an empty created file actionable through SCM approve and bulk reject', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+
+      await runtime.simulateExternalChange(fake.uri as never, '', '', 'created');
+      await settleRuntime();
+      expect(runtime.comparisonCount).toBe(1);
+      expect(fake.sourceControl.count).toBe(1);
+
+      await fake.commands.get('codexExtensionHelper.approveFile')!([{ resourceUri: fake.uri }]);
+      await settleRuntime();
+      expect(fake.fileText()).toBe('');
+      expect(runtime.comparisonCount).toBe(0);
+
+      await runtime.simulateExternalChange(fake.uri as never, '', '', 'created');
+      await settleRuntime();
+      await fake.commands.get('codexExtensionHelper.rejectAllFiles')!();
+      await settleRuntime();
+      expect(fake.fileText()).toBeUndefined();
+      expect(runtime.comparisonCount).toBe(0);
+
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('uses new virtual document identities when a deleted path is cleared and reviewed again', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('first\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+      fake.deleteFile();
+
+      await runtime.simulateExternalChange(fake.uri as never, 'first\n', '', 'deleted');
+      await settleRuntime();
+      await runtime.openActiveDiff(fake.uri as never);
+      const firstDiff = fake.executeCommand.mock.calls.find(([command]) => command === 'vscode.diff')!;
+      const [, firstBaseline, firstCurrent] = firstDiff;
+
+      await fake.commands.get('codexExtensionHelper.approveAllFiles')!();
+      await settleRuntime();
+      expect(fake.virtualContent(firstBaseline)).toBeUndefined();
+      expect(fake.virtualContent(firstCurrent)).toBeUndefined();
+
+      await runtime.simulateExternalChange(fake.uri as never, 'second\n', '', 'deleted');
+      await settleRuntime();
+      await runtime.openActiveDiff(fake.uri as never);
+      const diffCalls = fake.executeCommand.mock.calls.filter(([command]) => command === 'vscode.diff');
+      const [, secondBaseline, secondCurrent] = diffCalls[1];
+
+      expect(secondBaseline.toString()).not.toBe(firstBaseline.toString());
+      expect(secondCurrent.toString()).not.toBe(firstCurrent.toString());
+      expect(fake.virtualContent(secondBaseline)).toBe('second\n');
+      expect(fake.virtualContent(secondCurrent)).toBe('');
+
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('bulk-approves a deleted file while keeping its filesystem path absent', async () => {
     vi.useFakeTimers();
     try {
@@ -1174,6 +1256,97 @@ describe('stable review runtime boundaries', () => {
     await expect(host.restoreDeletedFile(target as never, 'before\n')).resolves.toBe(false);
     expect(decoder.decode(files.get(targetKey))).toBe('new owner\n');
     expect([...files.keys()]).toEqual([targetKey]);
+  });
+
+  it('removes a partially written restore temporary when the write rejects', async () => {
+    const { createReviewHost } = await import('../../src/extension');
+    const failure = new Error('partial write failed');
+    const targetKey = 'file:///workspace/deleted.ts';
+    const target = {
+      path: '/workspace/deleted.ts',
+      toString: () => targetKey,
+      with(changes: { path?: string }) {
+        const changedPath = changes.path ?? this.path;
+        return {
+          ...this,
+          path: changedPath,
+          toString: () => `file://${changedPath}`,
+        };
+      },
+    };
+    const files = new Map<string, Uint8Array>();
+    const fs = {
+      async stat(resource: typeof target) {
+        if (!files.has(resource.toString())) {
+          throw Object.assign(new Error('File not found'), { code: 'FileNotFound' });
+        }
+        return { type: 1, ctime: 0, mtime: 0, size: files.get(resource.toString())!.byteLength };
+      },
+      async writeFile(resource: typeof target, contents: Uint8Array) {
+        files.set(resource.toString(), contents);
+        throw failure;
+      },
+      rename: vi.fn(),
+      async delete(resource: typeof target) {
+        files.delete(resource.toString());
+      },
+    };
+    const api = {
+      window: { activeTextEditor: undefined, showErrorMessage: vi.fn() },
+      workspace: { applyEdit: vi.fn(), openTextDocument: vi.fn(), textDocuments: [], fs },
+      WorkspaceEdit: FakeWorkspaceEdit,
+      Range: FakeRange,
+      Selection: FakeSelection,
+      TextEditorRevealType: { InCenter: 9 },
+    };
+    const host = createReviewHost(api as never, { appendLine: vi.fn() });
+
+    await expect(host.restoreDeletedFile(target as never, 'before\n')).rejects.toBe(failure);
+    expect([...files.keys()].filter((key) => key.includes('.codex-restore-'))).toEqual([]);
+    expect(fs.rename).not.toHaveBeenCalled();
+  });
+
+  it('logs temporary cleanup failure without replacing the primary restore error', async () => {
+    const { createReviewHost } = await import('../../src/extension');
+    const failure = new Error('partial write failed');
+    const cleanupFailure = new Error('cleanup failed');
+    const target = {
+      path: '/workspace/deleted.ts',
+      toString: () => 'file:///workspace/deleted.ts',
+      with(changes: { path?: string }) {
+        const changedPath = changes.path ?? this.path;
+        return {
+          ...this,
+          path: changedPath,
+          toString: () => `file://${changedPath}`,
+        };
+      },
+    };
+    const fs = {
+      async stat() {
+        throw Object.assign(new Error('File not found'), { code: 'FileNotFound' });
+      },
+      async writeFile() {
+        throw failure;
+      },
+      rename: vi.fn(),
+      async delete() {
+        throw cleanupFailure;
+      },
+    };
+    const output = { appendLine: vi.fn() };
+    const api = {
+      window: { activeTextEditor: undefined, showErrorMessage: vi.fn() },
+      workspace: { applyEdit: vi.fn(), openTextDocument: vi.fn(), textDocuments: [], fs },
+      WorkspaceEdit: FakeWorkspaceEdit,
+      Range: FakeRange,
+      Selection: FakeSelection,
+      TextEditorRevealType: { InCenter: 9 },
+    };
+    const host = createReviewHost(api as never, output);
+
+    await expect(host.restoreDeletedFile(target as never, 'before\n')).rejects.toBe(failure);
+    expect(output.appendLine).toHaveBeenCalledWith(expect.stringContaining('cleanup failed'));
   });
 
   it('consumes two separated edit spans in either event array order', async () => {

@@ -337,17 +337,18 @@ export function createReviewHost(
       finishReviewEdit();
     }
   };
+  const isFileNotFound = (error: unknown): boolean => (
+    typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && error.code === 'FileNotFound'
+  );
   const isFileAbsent = async (uri: vscode.Uri): Promise<boolean> => {
     try {
       await api.workspace.fs.stat(uri);
       return false;
     } catch (error) {
-      if (
-        typeof error === 'object'
-        && error !== null
-        && 'code' in error
-        && error.code === 'FileNotFound'
-      ) {
+      if (isFileNotFound(error)) {
         return true;
       }
       throw error;
@@ -392,21 +393,25 @@ export function createReviewHost(
         query: '',
         fragment: '',
       });
-      await api.workspace.fs.writeFile(temporary, new TextEncoder().encode(text));
+      let writeCompleted = false;
       try {
+        await api.workspace.fs.writeFile(temporary, new TextEncoder().encode(text));
+        writeCompleted = true;
         await api.workspace.fs.rename(temporary, uri, { overwrite: false });
         return true;
       } catch (error) {
         try {
           await api.workspace.fs.delete(temporary);
         } catch (cleanupError) {
-          try {
-            output.appendLine(`[Restore deleted file cleanup] ${errorDetail(cleanupError)}`);
-          } catch {
-            // Cleanup reporting must not hide the original restore result.
+          if (!isFileNotFound(cleanupError)) {
+            try {
+              output.appendLine(`[Restore deleted file cleanup] ${errorDetail(cleanupError)}`);
+            } catch {
+              // Cleanup reporting must not hide the original restore result.
+            }
           }
         }
-        if (!await isFileAbsent(uri)) {
+        if (writeCompleted && !await isFileAbsent(uri)) {
           return false;
         }
         throw error;

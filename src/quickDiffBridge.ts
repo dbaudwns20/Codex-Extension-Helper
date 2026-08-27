@@ -9,12 +9,14 @@ interface ReviewEntry {
   readonly resource: vscode.Uri;
   readonly baseline: vscode.Uri;
   readonly current: vscode.Uri;
+  readonly generation: number;
   text: string;
 }
 
 export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vscode.Disposable {
   private readonly entries = new Map<string, ReviewEntry>();
   private readonly contents = new Map<string, string>();
+  private nextGeneration = 0;
   private sourceControl: vscode.SourceControl | undefined;
   private changesGroup: vscode.SourceControlResourceGroup | undefined;
   private registrations: vscode.Disposable[] = [];
@@ -32,17 +34,18 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
     lifecycle: 'existing' | 'created' | 'deleted' = 'existing',
   ): void {
     const existing = this.entries.get(key);
-    const baseline = existing?.baseline ?? this.createBaselineUri(resource, key);
+    const generation = existing?.generation ?? ++this.nextGeneration;
+    const baseline = existing?.baseline ?? this.createBaselineUri(resource, key, generation);
     const current = lifecycle === 'deleted'
       ? existing?.current.scheme === CURRENT_SCHEME
         ? existing.current
-        : this.createCurrentUri(resource, key)
+        : this.createCurrentUri(resource, key, generation)
       : resource;
     const changed = existing?.text !== baselineText;
     if (existing !== undefined && existing.current.toString() !== current.toString()) {
       this.contents.delete(existing.current.toString());
     }
-    const entry = { resource, baseline, current, text: baselineText };
+    const entry = { resource, baseline, current, generation, text: baselineText };
     this.entries.set(key, entry);
     this.contents.set(baseline.toString(), baselineText);
     if (lifecycle === 'deleted') {
@@ -99,20 +102,20 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
     this.contents.clear();
   }
 
-  private createBaselineUri(resource: vscode.Uri, key: string): vscode.Uri {
+  private createBaselineUri(resource: vscode.Uri, key: string, generation: number): vscode.Uri {
     return resource.with({
       scheme: BASELINE_SCHEME,
       authority: '',
-      query: `source=${encodeURIComponent(key)}`,
+      query: `source=${encodeURIComponent(key)}&generation=${generation}`,
       fragment: '',
     });
   }
 
-  private createCurrentUri(resource: vscode.Uri, key: string): vscode.Uri {
+  private createCurrentUri(resource: vscode.Uri, key: string, generation: number): vscode.Uri {
     return resource.with({
       scheme: CURRENT_SCHEME,
       authority: '',
-      query: `source=${encodeURIComponent(key)}`,
+      query: `source=${encodeURIComponent(key)}&generation=${generation}`,
       fragment: '',
     });
   }
