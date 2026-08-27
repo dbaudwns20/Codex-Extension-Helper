@@ -1,10 +1,10 @@
 # Codex Extension Helper
 
 Codex Extension Helper is a private, unofficial VS Code extension for reviewing
-external file writes directly in the normal editable editor. It compares a
-qualifying disk change with the last in-memory snapshot, highlights additions
-and deletions, and lets you approve or reject changes by hunk, file, or across
-the current workspace.
+exactly proven Codex file changes directly in the normal editable editor. It
+compares a qualifying disk change with the last in-memory snapshot, highlights
+additions and deletions, and lets you approve or reject changes by hunk, file,
+or across the current workspace.
 
 The extension also includes optional tools for inserting Explorer files and
 folders as Codex `@` mentions. It is not affiliated with, endorsed by, or
@@ -69,19 +69,25 @@ review begins.
 | **Reject All Files** | Restores all files currently listed in `Codex Changes`. |
 
 Rejecting all changes in a newly created file moves that file to the operating
-system trash. Navigation wraps between the first and last change.
+system trash. A proven whole-file deletion is also reviewable: approving it
+keeps the file absent, while rejecting it recreates the exact pre-delete bytes
+after confirming that nothing else has recreated the path. Navigation wraps
+between the first and last change.
 
-VS Code does not identify which process wrote a file. The extension therefore
-shows every qualifying external write, not only writes made by Codex. Git
-operations that leave a resource Git-clean are cleared or suppressed rather
-than shown as review changes.
+VS Code filesystem events do not identify the writer. Debounce timing says only
+when an event arrived, and Git status says only how the resulting bytes compare
+with the repository; neither can establish that Codex authored a write. The
+extension therefore requires both a completed Codex `fileChange` item and an
+exact replay whose resulting bytes match the observed file. An unproven write
+silently becomes the new baseline and clears any active review for that path.
 
 ## Requirements
 
 - VS Code 1.101.1 or newer.
 - Node.js and npm for building from source.
 - macOS for automatic Explorer-to-Codex `@` mention insertion.
-- The OpenAI Codex VS Code extension for Codex mention and patch features.
+- The OpenAI Codex VS Code extension for Codex mention and provenance bridge
+  features.
 
 ## Build, package, and install
 
@@ -140,19 +146,73 @@ node scripts/patch-codex-drop.mjs --extension-dir <extension-path>
 node scripts/unpatch-codex-drop.mjs --extension-dir <extension-path>
 ```
 
+## Exact Codex provenance bridge
+
+Exact attribution requires a small, separately managed bridge in the installed
+Codex extension host. The bridge forwards only Codex `fileChange` patch and
+completion notifications to Codex Extension Helper. It is never installed or
+repaired during activation. Use the Command Palette and explicitly confirm the
+installed-extension modification:
+
+- **Codex Helper: Install Exact Provenance Bridge**
+- **Codex Helper: Remove Exact Provenance Bridge**
+- **Codex Helper: Show Exact Provenance Bridge Status**
+
+After a successful install or removal, accept the separate **Reload VS Code**
+prompt before expecting the new bridge state to take effect. Repository scripts
+provide the same manual lifecycle for development:
+
+```bash
+npm run patch:codex-provenance
+# Reload VS Code after the bridge is installed.
+
+npm run unpatch:codex-provenance
+# Reload VS Code after the verified original is restored.
+```
+
+The installer changes only the selected Codex `out/extension.js`. Before the
+first modification it creates an adjacent original backup and metadata that
+records the target, bridge version, Codex version, and original/patched hashes.
+Inspection, reinstall, and removal verify those hashes. If the target, backup,
+or metadata was deleted or changed, the manager reports an invalid or tampered
+state and does not overwrite anything. Preserve the reported files, restore a
+known matching set (or reinstall that exact Codex version), then inspect status
+again; do not delete the backup or metadata as a shortcut.
+
+The bridge is intentionally version-sensitive. An unsupported Codex release or
+bundle layout fails before creating recovery artifacts and is left unchanged.
+Updating Codex can therefore require a newer bridge implementation.
+
+### Exact-only visibility and expected false negatives
+
+A file appears in `Codex Changes` only when all of the following agree:
+
+1. Codex completed a `fileChange` item for the workspace path.
+2. Its patch replays exactly from the accepted pre-change content.
+3. The observed file content or deletion exactly matches the replayed result.
+
+This fail-closed rule deliberately prefers false negatives over false
+attribution. A genuine Codex edit may remain hidden when the bridge is absent or
+incompatible, an event expires, a concurrent formatter or user edit changes the
+bytes, the starting snapshot is unavailable, or the patch cannot be replayed
+exactly. Git merge, rebase, cherry-pick, revert, checkout, reset, restore, pull,
+and other writes are hidden unless they independently have matching completed
+Codex proof. Codex shell commands that write files without producing a
+`fileChange` item are intentionally hidden as well.
+
 ## Configuration
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `codexExtensionHelper.enabled` | `true` | Enables external-change detection and review UI. Disabling it clears pending in-memory state. |
+| `codexExtensionHelper.enabled` | `true` | Enables exact Codex change detection and review UI. Disabling it clears pending in-memory state. |
 | `codexExtensionHelper.debounceMs` | `300` | Delay before comparing an external write, from 50 to 5000 ms. |
 | `codexExtensionHelper.maxFileSizeKb` | `1024` | Maximum eligible file size in KiB. |
 | `codexExtensionHelper.exclude` | `**/.git/**`, `**/node_modules/**`, `**/dist/**`, `**/build/**` | Glob patterns excluded from tracking. |
 
 Only `file` resources with decodable, non-binary text, an eligible size, and a
-non-excluded workspace path are compared. Existing files need an observed
-in-memory baseline before an external write can be reviewed; newly detected file
-creation is compared with an empty baseline.
+non-excluded workspace path are compared. Existing files need an accepted
+in-memory baseline before a Codex patch can be proven; a proven creation is
+compared with an empty baseline.
 
 ## Development
 
@@ -197,8 +257,11 @@ or regulated data.
 ## Limitations
 
 - Review state does not persist across VS Code restarts.
-- The writer cannot be attributed to Codex; other qualifying external writers
-  can appear in the same review UI.
+- Exact-only attribution can hide genuine Codex changes when event and content
+  proof is incomplete; it never falls back to debounce timing or Git status.
+- Codex shell-command writes without a completed `fileChange` item are hidden.
+- The provenance bridge is version-sensitive and must be explicitly installed
+  again when a compatible Codex update replaces the extension-host bundle.
 - Deleted decorations cannot reserve true editor rows and may be less distinct
   in dense or folded code.
 - `editor.codeLens` must remain enabled for per-change Approve/Reject actions.
@@ -221,6 +284,12 @@ If no review UI appears:
 4. Confirm `editor.codeLens` is enabled if only hunk actions are missing.
 5. Use a gutter marker or **Codex Changes: Open Full Diff** when inline deleted
    decorations are hard to distinguish.
+
+Also run **Codex Helper: Show Exact Provenance Bridge Status**. If the bridge is
+not installed, install it explicitly and reload VS Code. If status reports a
+hash mismatch, missing backup, inconsistent artifacts, or an unsupported Codex
+bundle, follow the recovery guidance above; the extension intentionally will
+not repair unknown bytes automatically.
 
 If Explorer `@` mention insertion fails, confirm the Codex patch status from the
 Command Palette and allow Visual Studio Code under macOS Accessibility settings.

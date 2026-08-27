@@ -20,6 +20,11 @@ import type { ExactCodexTransition } from './codexProvenanceLedger';
 import { createCodexDropPatchController, registerCodexDropPatchCommands } from './codexDropPatchCommands';
 import { createCodexDropPatchRuntimeDependencies } from './codexDropPatchRuntime';
 import {
+  createCodexProvenancePatchController,
+  registerCodexProvenancePatchCommands,
+} from './codexProvenancePatchCommands';
+import { createCodexProvenancePatchRuntimeDependencies } from './codexProvenancePatchRuntime';
+import {
   DeletedLinesCodeLensProvider,
   type ReviewCodeLensState,
 } from './deletedLinesCodeLensProvider';
@@ -1703,6 +1708,14 @@ export function activate(context: vscode.ExtensionContext): TestExtensionApi | u
     context.subscriptions,
     (command, handler) => vscode.commands.registerCommand(command, handler),
     codexDropPatchController,
+  );
+  const codexProvenancePatchController = createCodexProvenancePatchController(
+    createCodexProvenancePatchRuntimeDependencies(vscode, output),
+  );
+  registerCodexProvenancePatchCommands(
+    context.subscriptions,
+    (command, handler) => vscode.commands.registerCommand(command, handler),
+    codexProvenancePatchController,
   );
   if (process.env.CODEX_EXTENSION_HELPER_TEST !== '1') {
     void codexDropPatchController.offerInstallIfNeeded();

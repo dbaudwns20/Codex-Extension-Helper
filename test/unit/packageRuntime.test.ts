@@ -656,7 +656,7 @@ async function sendCodexNotification(
 }
 
 describe('packaged runtime', () => {
-  it('registers Codex drop patch management commands during activation', async () => {
+  it('registers patch commands without inspecting or installing the provenance bridge', async () => {
     const fake = installRuntimeVscode();
     const previousTestMode = process.env.CODEX_EXTENSION_HELPER_TEST;
     process.env.CODEX_EXTENSION_HELPER_TEST = '1';
@@ -670,7 +670,14 @@ describe('packaged runtime', () => {
         'codexExtensionHelper.installCodexDropPatch',
         'codexExtensionHelper.removeCodexDropPatch',
         'codexExtensionHelper.showCodexDropPatchStatus',
+        'codexExtensionHelper.installProvenanceBridge',
+        'codexExtensionHelper.removeProvenanceBridge',
+        'codexExtensionHelper.showProvenanceBridgeStatus',
       ]));
+      const getExtension = (vscodeMock.extensions as {
+        getExtension: ReturnType<typeof vi.fn>;
+      }).getExtension;
+      expect(getExtension).not.toHaveBeenCalled();
       await fake.commands.get('codexExtensionHelper.showCodexDropPatchStatus')!();
       expect(fake.window.showInformationMessage).toHaveBeenCalledWith(
         'The OpenAI Codex extension is not installed.',

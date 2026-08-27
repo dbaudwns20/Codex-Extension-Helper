@@ -45,6 +45,9 @@ describe('extension manifest', () => {
       'codexExtensionHelper.installCodexDropPatch',
       'codexExtensionHelper.removeCodexDropPatch',
       'codexExtensionHelper.showCodexDropPatchStatus',
+      'codexExtensionHelper.installProvenanceBridge',
+      'codexExtensionHelper.removeProvenanceBridge',
+      'codexExtensionHelper.showProvenanceBridgeStatus',
     ]);
   });
 
@@ -63,6 +66,29 @@ describe('extension manifest', () => {
         title: 'Codex Helper: Show Drop Patch Status',
       },
     ]));
+  });
+
+  it('exposes manual exact provenance bridge management and matching CLI scripts', () => {
+    expect(manifest.contributes.commands).toEqual(expect.arrayContaining([
+      {
+        command: 'codexExtensionHelper.installProvenanceBridge',
+        title: 'Codex Helper: Install Exact Provenance Bridge',
+      },
+      {
+        command: 'codexExtensionHelper.removeProvenanceBridge',
+        title: 'Codex Helper: Remove Exact Provenance Bridge',
+      },
+      {
+        command: 'codexExtensionHelper.showProvenanceBridgeStatus',
+        title: 'Codex Helper: Show Exact Provenance Bridge Status',
+      },
+    ]));
+    expect(manifest.scripts['patch:codex-provenance']).toBe(
+      'node ./scripts/patch-codex-provenance.mjs',
+    );
+    expect(manifest.scripts['unpatch:codex-provenance']).toBe(
+      'node ./scripts/unpatch-codex-provenance.mjs',
+    );
   });
 
   it('offers Codex @ mention insertion from the Explorer context menu on macOS', () => {
