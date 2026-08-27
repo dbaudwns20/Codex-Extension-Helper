@@ -179,6 +179,13 @@ state and does not overwrite anything. Preserve the reported files, restore a
 known matching set (or reinstall that exact Codex version), then inspect status
 again; do not delete the backup or metadata as a shortcut.
 
+If status reports that the target is restored but cleanup is pending, the
+original target bytes are already in place and verified, but recovery artifacts
+remain after an interrupted cleanup. Run **Codex Helper: Remove Exact Provenance
+Bridge** and explicitly confirm **Finish Cleanup**. A successful retry reports
+the bridge as already restored and does not offer reload because it removes only
+verified recovery artifacts; it does not change the active target bytes.
+
 The bridge is intentionally version-sensitive. An unsupported Codex release or
 bundle layout fails before creating recovery artifacts and is left unchanged.
 Updating Codex can therefore require a newer bridge implementation.

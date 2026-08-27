@@ -105,7 +105,7 @@ describe('VS Code Codex provenance bridge runtime adapter', () => {
     });
   });
 
-  it('treats unknown installer status as invalid rather than guessing', async () => {
+  it('preserves restored-pending-cleanup as a valid recoverable state', async () => {
     const { createCodexProvenancePatchRuntimeDependencies } = await import(
       '../../src/codexProvenancePatchRuntime'
     );
@@ -124,9 +124,33 @@ describe('VS Code Codex provenance bridge runtime adapter', () => {
     );
 
     await expect(runtime.inspect()).resolves.toEqual({
+      kind: 'cleanup-pending',
+      extensionVersion: '26.826.11250',
+    });
+  });
+
+  it('treats genuinely unknown installer status as invalid rather than guessing', async () => {
+    const { createCodexProvenancePatchRuntimeDependencies } = await import(
+      '../../src/codexProvenancePatchRuntime'
+    );
+    const api = vscodeApi();
+    const runtime = createCodexProvenancePatchRuntimeDependencies(
+      api,
+      { appendLine: vi.fn() },
+      async () => ({
+        inspectCodexProvenancePatch: async () => ({
+          status: 'future-state',
+          extensionVersion: '26.826.11250',
+        }),
+        applyCodexProvenancePatch: vi.fn(),
+        restoreCodexProvenancePatch: vi.fn(),
+      }),
+    );
+
+    await expect(runtime.inspect()).resolves.toEqual({
       kind: 'invalid',
       extensionVersion: '26.826.11250',
-      message: 'Unknown provenance bridge state: restored-pending-cleanup',
+      message: 'Unknown provenance bridge state: future-state',
     });
   });
 

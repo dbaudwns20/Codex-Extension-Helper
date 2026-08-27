@@ -84,6 +84,9 @@ export function createCodexProvenancePatchRuntimeDependencies(
         if (result.status === 'not-patched') {
           return { kind: 'not-patched', extensionVersion: result.extensionVersion };
         }
+        if (result.status === 'restored-pending-cleanup') {
+          return { kind: 'cleanup-pending', extensionVersion: result.extensionVersion };
+        }
         return {
           kind: 'invalid',
           extensionVersion: result.extensionVersion,

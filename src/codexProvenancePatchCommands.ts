@@ -8,6 +8,7 @@ export type CodexProvenancePatchState =
   | { readonly kind: 'missing' }
   | { readonly kind: 'not-patched'; readonly extensionVersion: string }
   | { readonly kind: 'patched'; readonly extensionVersion: string }
+  | { readonly kind: 'cleanup-pending'; readonly extensionVersion: string }
   | { readonly kind: 'invalid'; readonly extensionVersion?: string; readonly message: string };
 
 export interface CodexProvenancePatchRuntimeDependencies {
@@ -83,6 +84,13 @@ export function createCodexProvenancePatchController(
           );
           return;
         }
+        if (state.kind === 'cleanup-pending') {
+          await dependencies.showInformation(
+            `Codex ${state.extensionVersion} is restored, but provenance bridge cleanup is pending. `
+              + 'Run the remove command to finish cleanup before installing again.',
+          );
+          return;
+        }
         if (state.kind === 'invalid') {
           await showInvalidState(state);
           return;
@@ -135,12 +143,15 @@ export function createCodexProvenancePatchController(
           return;
         }
 
-        const action = await dependencies.confirm(
-          `Remove the exact provenance bridge from Codex ${state.extensionVersion} `
-            + 'and restore its verified backup?',
-          'Remove Bridge',
-        );
-        if (action !== 'Remove Bridge') return;
+        const cleanupPending = state.kind === 'cleanup-pending';
+        const confirmationAction = cleanupPending ? 'Finish Cleanup' : 'Remove Bridge';
+        const confirmationMessage = cleanupPending
+          ? `Codex ${state.extensionVersion} is already restored. Finish removal and clean up its `
+            + 'verified provenance recovery artifacts?'
+          : `Remove the exact provenance bridge from Codex ${state.extensionVersion} `
+            + 'and restore its verified backup?';
+        const action = await dependencies.confirm(confirmationMessage, confirmationAction);
+        if (action !== confirmationAction) return;
 
         const result = await dependencies.restore();
         dependencies.log(
@@ -151,9 +162,10 @@ export function createCodexProvenancePatchController(
             `The exact provenance bridge was removed from Codex ${result.extensionVersion}.`,
           );
         } else if (result.status === 'already-restored') {
-          await dependencies.showInformation(
-            `Codex ${result.extensionVersion} exact provenance bridge is not installed.`,
-          );
+          await dependencies.showInformation(cleanupPending
+            ? `Codex ${result.extensionVersion} provenance bridge cleanup completed; `
+              + 'the bridge is not installed.'
+            : `Codex ${result.extensionVersion} exact provenance bridge is not installed.`);
         } else {
           throw new Error(`Unexpected removal status: ${result.status}`);
         }
@@ -176,6 +188,11 @@ export function createCodexProvenancePatchController(
         } else if (state.kind === 'patched') {
           await dependencies.showInformation(
             `Codex ${state.extensionVersion} exact provenance bridge is installed.`,
+          );
+        } else if (state.kind === 'cleanup-pending') {
+          await dependencies.showInformation(
+            `Codex ${state.extensionVersion} target is restored, but provenance bridge cleanup `
+              + 'is pending. Run the remove command to finish cleanup.',
           );
         } else {
           await showInvalidState(state);

@@ -146,6 +146,66 @@ describe('Codex provenance bridge commands', () => {
     expect(runtime.reload).toHaveBeenCalledOnce();
   });
 
+  it('requires confirmation to finish pending cleanup without offering a misleading reload', async () => {
+    const { createCodexProvenancePatchController } = await import(
+      '../../src/codexProvenancePatchCommands'
+    );
+    let confirmed = false;
+    const runtime = dependencies({
+      inspect: vi.fn(async () => ({
+        kind: 'cleanup-pending' as const,
+        extensionVersion: '26.826.11250',
+      })),
+      restore: vi.fn(async () => ({
+        status: 'already-restored',
+        extensionVersion: '26.826.11250',
+      })),
+      confirm: vi.fn(async (_message: string, action: string) => (
+        confirmed ? action : undefined
+      )),
+    });
+    const controller = createCodexProvenancePatchController(runtime);
+
+    await controller.remove();
+    expect(runtime.restore).not.toHaveBeenCalled();
+
+    confirmed = true;
+    await controller.remove();
+
+    expect(runtime.confirm).toHaveBeenLastCalledWith(
+      expect.stringContaining('clean up its verified provenance recovery artifacts'),
+      'Finish Cleanup',
+    );
+    expect(runtime.restore).toHaveBeenCalledOnce();
+    expect(runtime.showInformation).toHaveBeenCalledWith(
+      'Codex 26.826.11250 provenance bridge cleanup completed; the bridge is not installed.',
+    );
+    expect(runtime.offerReload).not.toHaveBeenCalled();
+    expect(runtime.reload).not.toHaveBeenCalled();
+  });
+
+  it('directs pending cleanup to the remove command instead of attempting install', async () => {
+    const { createCodexProvenancePatchController } = await import(
+      '../../src/codexProvenancePatchCommands'
+    );
+    const runtime = dependencies({
+      inspect: vi.fn(async () => ({
+        kind: 'cleanup-pending' as const,
+        extensionVersion: '26.826.11250',
+      })),
+    });
+    const controller = createCodexProvenancePatchController(runtime);
+
+    await controller.install();
+
+    expect(runtime.showInformation).toHaveBeenCalledWith(
+      'Codex 26.826.11250 is restored, but provenance bridge cleanup is pending. '
+        + 'Run the remove command to finish cleanup before installing again.',
+    );
+    expect(runtime.confirm).not.toHaveBeenCalled();
+    expect(runtime.apply).not.toHaveBeenCalled();
+  });
+
   it('reports missing, clean, installed, and tampered status without mutation', async () => {
     const { createCodexProvenancePatchController } = await import(
       '../../src/codexProvenancePatchCommands'
@@ -165,6 +225,8 @@ describe('Codex provenance bridge commands', () => {
     await controller.showStatus();
     state = { kind: 'patched', extensionVersion: '26.826.11250' };
     await controller.showStatus();
+    state = { kind: 'cleanup-pending', extensionVersion: '26.826.11250' };
+    await controller.showStatus();
     state = {
       kind: 'invalid',
       extensionVersion: '26.826.11250',
@@ -176,6 +238,8 @@ describe('Codex provenance bridge commands', () => {
       'The OpenAI Codex extension is not installed.',
       'Codex 26.826.11250 exact provenance bridge is not installed.',
       'Codex 26.826.11250 exact provenance bridge is installed.',
+      'Codex 26.826.11250 target is restored, but provenance bridge cleanup is pending. '
+        + 'Run the remove command to finish cleanup.',
     ]);
     expect(errors).toEqual([
       'Codex 26.826.11250 provenance bridge state is invalid: '
