@@ -304,6 +304,43 @@ export class CodexProvenanceLedger {
     this.ready.delete(key);
   }
 
+  retireKey(key: string, additionalItemKeys: Iterable<string> = []): void {
+    const itemKeys = new Set([
+      ...(this.itemKeysByNormalizedKey.get(key) ?? []),
+      ...(this.invalidatedGenerations.get(key)?.itemKeys ?? []),
+      ...additionalItemKeys,
+    ]);
+    const evidence = new Set([
+      ...(this.evidenceByNormalizedKey.get(key) ?? []),
+      ...(this.invalidatedGenerations.get(key)?.evidence ?? []),
+    ]);
+    const affectedKeys = new Set([key]);
+    for (const [normalizedKey, mappedItemKeys] of this.itemKeysByNormalizedKey) {
+      if ([...mappedItemKeys].some((itemKey) => itemKeys.has(itemKey))) {
+        affectedKeys.add(normalizedKey);
+      }
+    }
+    for (const normalizedKey of affectedKeys) {
+      for (const value of this.evidenceByNormalizedKey.get(normalizedKey) ?? []) {
+        evidence.add(value);
+      }
+    }
+    if (itemKeys.size > 0 || evidence.size > 0) {
+      this.invalidateGeneration(key, itemKeys, evidence);
+    }
+    for (const itemKey of itemKeys) this.items.delete(itemKey);
+    const generation = this.invalidatedGenerations.get(key);
+    if (generation !== undefined) {
+      generation.cleanupWatermark = Math.max(generation.cleanupWatermark, this.latestRecordOrder);
+      generation.cleanupComplete = true;
+    }
+    for (const normalizedKey of affectedKeys) {
+      this.ready.delete(normalizedKey);
+      this.evidenceByNormalizedKey.delete(normalizedKey);
+      this.itemKeysByNormalizedKey.delete(normalizedKey);
+    }
+  }
+
   prune(now: number): void {
     let changed = false;
     for (const [key, item] of this.items) {

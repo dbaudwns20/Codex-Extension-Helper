@@ -170,6 +170,19 @@ function completedUpdate(before: string, after: string, itemId = 'item-1') {
   };
 }
 
+function updatedUpdate(before: string, after: string, itemId = 'item-1') {
+  const completed = completedUpdate(before, after, itemId);
+  return {
+    method: 'item/fileChange/patchUpdated',
+    params: {
+      threadId: completed.params.threadId,
+      turnId: completed.params.turnId,
+      itemId,
+      changes: completed.params.item.changes,
+    },
+  };
+}
+
 function completedDelete(text: string, itemId = 'item-delete') {
   return {
     method: 'item/completed',
@@ -511,6 +524,12 @@ function installRuntimeVscode(initialText = 'before\n') {
         contentChanges: disjointFakeChanges(originalText, value),
       });
     },
+    emitDocumentChange(originalText: string) {
+      callbacks.get('documentChange')?.({
+        document,
+        contentChanges: disjointFakeChanges(originalText, text),
+      });
+    },
     editor,
     executeCommand,
     output,
@@ -533,6 +552,11 @@ function installRuntimeVscode(initialText = 'before\n') {
     setText(value: string, isDirty = false) {
       text = value;
       files.set(uri.toString(), encoder.encode(value));
+      version += 1;
+      dirty = isDirty;
+    },
+    setDocumentText(value: string, isDirty = true) {
+      text = value;
       version += 1;
       dirty = isDirty;
     },
@@ -769,6 +793,102 @@ describe('packaged runtime', () => {
     }
   });
 
+  it('never substitutes dirty document bytes for an exact watcher disk candidate', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: true, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'dirty document'));
+      fake.writeFile('disk write\n');
+      fake.setDocumentText('dirty document\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      const state = (runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString());
+      expect(runtime.comparisonCount).toBe(0);
+      expect(state).toMatchObject({ baselineText: 'disk write\n', provenance: undefined });
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('proves exact disk bytes before a differing dirty document candidate clears them', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: true, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'disk write'));
+      fake.writeFile('disk write\n');
+      fake.setDocumentText('dirty document\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(1);
+      expect(fake.quickDiffBaseline()).toBe('before\n');
+
+      fake.emitDocumentChange('before\n');
+      await settleRuntime();
+
+      const state = (runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString());
+      expect(runtime.comparisonCount).toBe(0);
+      expect(state).toMatchObject({ baselineText: 'dirty document\n', provenance: undefined });
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps notification-first evidence through 5000ms debounce and delayed disk read', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      let resolveRead!: (bytes: Uint8Array) => void;
+      const delayedRead = new Promise<Uint8Array>((resolve) => { resolveRead = resolve; });
+      fake.workspace.fs.readFile.mockImplementationOnce(() => delayedRead);
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 5_000,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: true, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'after'));
+      fake.writeFile('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+      resolveRead(new TextEncoder().encode('after\n'));
+      await vi.advanceTimersByTimeAsync(0);
+      for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+
+      expect(runtime.comparisonCount).toBe(1);
+      expect(fake.quickDiffBaseline()).toBe('before\n');
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('clears an active exact review when a newer unproven watcher write arrives', async () => {
     vi.useFakeTimers();
     try {
@@ -957,7 +1077,7 @@ describe('packaged runtime', () => {
     }
   });
 
-  it('does not let a quarantined watcher candidate revive state after workspace removal', async () => {
+  it('does not let old evidence revive after workspace removal and immediate re-add', async () => {
     vi.useFakeTimers();
     try {
       const fake = installRuntimeVscode('before\n');
@@ -973,13 +1093,81 @@ describe('packaged runtime', () => {
       fake.callbacks.get('watcherChange')!(fake.uri);
       await vi.advanceTimersByTimeAsync(0);
       await Promise.resolve();
+      await sendCodexNotification(fake, updatedUpdate('before', 'stale candidate', 'old-item'));
       const removed = fake.workspace.workspaceFolders.splice(0);
-      fake.callbacks.get('workspaceFolders')!({ added: [], removed });
+      await fake.callbacks.get('workspaceFolders')!({ added: [], removed });
+
+      fake.setText('re-added baseline\n');
+      fake.workspace.workspaceFolders.push(...removed);
+      await fake.callbacks.get('workspaceFolders')!({ added: removed, removed: [] });
+      await sendCodexNotification(
+        fake,
+        completedUpdate('before', 'stale candidate', 'old-item'),
+      );
       await settleRuntime();
 
-      expect((runtime as unknown as {
+      const state = (runtime as unknown as {
         coordinator: { state(key: string): FileComparisonState | undefined };
-      }).coordinator.state(fake.uri.toString())).toBeUndefined();
+      }).coordinator.state(fake.uri.toString());
+      expect(state).toMatchObject({
+        baselineText: 're-added baseline\n',
+        provenance: undefined,
+      });
+      expect(runtime.comparisonCount).toBe(0);
+
+      await sendCodexNotification(
+        fake,
+        completedUpdate('re-added baseline', 'fresh', 'new-item'),
+      );
+      fake.setText('fresh\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(1);
+      expect(fake.quickDiffBaseline()).toBe('re-added baseline\n');
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('invalidates an in-flight watcher read before workspace removal awaits the gate', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      let resolveRead!: (bytes: Uint8Array) => void;
+      const delayedRead = new Promise<Uint8Array>((resolve) => { resolveRead = resolve; });
+      fake.workspace.fs.readFile.mockImplementationOnce(() => delayedRead);
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: true, warningShown: false });
+
+      fake.writeFile('stale read\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await vi.advanceTimersByTimeAsync(0);
+      const removed = fake.workspace.workspaceFolders.splice(0);
+      const removal = Promise.resolve(
+        fake.callbacks.get('workspaceFolders')!({ added: [], removed }),
+      );
+      resolveRead(new TextEncoder().encode('stale read\n'));
+      await removal;
+
+      fake.setText('re-added baseline\n');
+      fake.workspace.workspaceFolders.push(...removed);
+      await fake.callbacks.get('workspaceFolders')!({ added: removed, removed: [] });
+      await settleRuntime();
+
+      const state = (runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString());
+      expect(state).toMatchObject({
+        baselineText: 're-added baseline\n',
+        provenance: undefined,
+      });
       expect(runtime.comparisonCount).toBe(0);
       runtime.dispose();
     } finally {
@@ -2678,6 +2866,72 @@ describe('stable review runtime boundaries', () => {
       expect(runtime.renderedComparisonCount).toBe(0);
 
       render.mockRestore();
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a review save fenced across spacer install and removal versions', async () => {
+    vi.useFakeTimers();
+    try {
+      const baseline = 'one\nkeep\ntwo\n';
+      const modified = 'ONE\nkeep\nTWO\n';
+      const fake = installRuntimeVscode(baseline);
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, {
+        renderingDisabled: false,
+        warningShown: false,
+      });
+      const internals = runtime as unknown as {
+        gate: { handleCandidate(candidate: unknown): Promise<void> };
+        spacers: { remove(key: string): Promise<{ status: string }> };
+        reviewEditSaves: Map<string, { version: number; text: string }>;
+      };
+      const gateCandidate = vi.spyOn(internals.gate, 'handleCandidate');
+
+      fake.setText(modified);
+      await runtime.simulateExternalChange(fake.uri as never, baseline, modified);
+      await settleRuntime();
+      const rejectLenses = fake.codeLenses().filter(
+        (lens) => lens.command?.command === 'codexExtensionHelper.rejectHunk',
+      );
+      await fake.commands.get('codexExtensionHelper.rejectHunk')!(
+        ...rejectLenses[0].command!.arguments!,
+      );
+      await settleRuntime();
+      expect(internals.reviewEditSaves.get(fake.uri.toString())).toEqual({
+        version: fake.document.version,
+        text: fake.document.getText(),
+      });
+      await internals.spacers.remove(fake.uri.toString());
+      await settleRuntime();
+
+      expect(internals.reviewEditSaves.get(fake.uri.toString())).toEqual({
+        version: fake.document.version,
+        text: fake.document.getText(),
+      });
+
+      gateCandidate.mockClear();
+      fake.callbacks.get('documentSave')!(fake.document);
+      await settleRuntime();
+      expect(gateCandidate).not.toHaveBeenCalled();
+
+      gateCandidate.mockClear();
+      fake.editText('real user edit\n');
+      fake.callbacks.get('documentSave')!(fake.document);
+      await settleRuntime();
+      expect(gateCandidate).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'present',
+        text: 'real user edit\n',
+      }));
+
+      gateCandidate.mockRestore();
       runtime.dispose();
     } finally {
       vi.useRealTimers();

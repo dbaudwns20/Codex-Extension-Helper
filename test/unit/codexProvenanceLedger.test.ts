@@ -453,6 +453,27 @@ describe('CodexProvenanceLedger', () => {
     expect(ledger.completedTransitions(resolveAcceptedPath)).toEqual([]);
   });
 
+  it('retires one normalized key without clearing unrelated ready evidence', () => {
+    const ledger = new CodexProvenanceLedger();
+    ledger.record(completed([update('a.txt', 'old-a', 'new')], 'item-a'));
+    ledger.record(completed([update('b.txt', 'old-b', 'new')], 'item-b'));
+    const resolveAcceptedPath = accepted({
+      'a.txt': state('a.txt', true, 'old-a\n'),
+      'b.txt': state('b.txt', true, 'old-b\n'),
+    });
+    ledger.completedTransitions(resolveAcceptedPath);
+
+    ledger.retireKey(
+      'file:///workspace/a.txt',
+      ['thread-1\0turn-1\0item-a'],
+    );
+
+    expect(ledger.consume('file:///workspace/a.txt', NEW_HASH)).toBeUndefined();
+    expect(ledger.consume('file:///workspace/b.txt', NEW_HASH)).toEqual(
+      expect.objectContaining({ key: 'file:///workspace/b.txt' }),
+    );
+  });
+
   it('prunes expired entries without turning elapsed time into proof', () => {
     let now = 1_000;
     const ledger = new CodexProvenanceLedger(100, () => now);

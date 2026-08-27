@@ -48,10 +48,10 @@ function remove(path: string, text: string): CodexFileUpdateChange {
   };
 }
 
-function patchUpdated(changes: readonly CodexFileUpdateChange[]) {
+function patchUpdated(changes: readonly CodexFileUpdateChange[], itemId = 'item-1') {
   return {
     method: 'item/fileChange/patchUpdated',
-    params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', changes },
+    params: { threadId: 'thread-1', turnId: 'turn-1', itemId, changes },
   };
 }
 
@@ -489,12 +489,16 @@ describe('CodexChangeGate', () => {
     await gate.handleCandidate(document);
     clock.advance(100);
     await flush();
+    await gate.handleNotification(completed(
+      [update('file.txt', 'old', 'new')],
+      'item-after-shadow-expiry',
+    ));
 
     expect(proven).toHaveLength(1);
     expect(unproven).toEqual([]);
   });
 
-  it('allows a newer Codex item to prove the same observed bytes again', async () => {
+  it('allows a notification-first newer Codex item to prove the same observed bytes again', async () => {
     const accepted = state('file.txt', true, 'old\n');
     const { gate, proven, unproven } = setup({ 'file.txt': accepted });
 
@@ -507,6 +511,127 @@ describe('CodexChangeGate', () => {
 
     expect(proven).toHaveLength(2);
     expect(unproven).toEqual([]);
+  });
+
+  it('promotes a candidate-first same-byte shadow when a newer Codex item arrives', async () => {
+    const accepted = state('file.txt', true, 'old\n');
+    const { gate, proven, unproven } = setup({ 'file.txt': accepted });
+
+    await gate.handleNotification(completed([update('file.txt', 'old', 'new')], 'item-1'));
+    await gate.handleCandidate(present('file.txt', 'new\n'));
+    await gate.handleCandidate(present('file.txt', 'new\n'));
+    expect(proven).toHaveLength(1);
+
+    await gate.handleNotification(completed([update('file.txt', 'old', 'new')], 'item-2'));
+
+    expect(proven).toHaveLength(2);
+    expect(unproven).toEqual([]);
+  });
+
+  it('bounds same-byte proof shadows and keeps only the newest file eligible', async () => {
+    const { gate, proven, unproven } = setup({
+      'a.txt': state('a.txt', true, 'old-a\n'),
+      'b.txt': state('b.txt', true, 'old-b\n'),
+    }, { maxPendingCandidates: 1 });
+
+    await gate.handleNotification(completed([update('a.txt', 'old-a', 'new-a')], 'item-a1'));
+    await gate.handleCandidate(present('a.txt', 'new-a\n'));
+    await gate.handleNotification(completed([update('b.txt', 'old-b', 'new-b')], 'item-b1'));
+    await gate.handleCandidate(present('b.txt', 'new-b\n'));
+    await gate.handleCandidate(present('a.txt', 'new-a\n'));
+    await gate.handleCandidate(present('b.txt', 'new-b\n'));
+
+    await gate.handleNotification(completed([update('a.txt', 'old-a', 'new-a')], 'item-a2'));
+    await gate.handleNotification(completed([update('b.txt', 'old-b', 'new-b')], 'item-b2'));
+
+    expect(proven).toHaveLength(3);
+    expect(proven).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: present('b.txt', '').key }),
+    ]));
+    expect(unproven).toEqual([]);
+  });
+
+  it('invalidates in-progress evidence and pending candidates without callback revival', async () => {
+    const candidate = present('file.txt', 'stale\n');
+    const change = update('file.txt', 'old', 'stale');
+    const { gate, proven, unproven } = setup({
+      'file.txt': state('file.txt', true, 'old\n'),
+    });
+
+    await gate.handleCandidate(candidate);
+    await gate.handleNotification(patchUpdated([change], 'old-item'));
+    const invalidate = (gate as CodexChangeGate & {
+      invalidate(key: string): Promise<void>;
+    }).invalidate;
+    expect(invalidate).toBeTypeOf('function');
+    if (invalidate === undefined) return;
+    await invalidate.call(gate, candidate.key);
+    await gate.handleNotification(completed([change], 'old-item'));
+
+    expect(proven).toEqual([]);
+    expect(unproven).toEqual([]);
+
+    await gate.handleNotification(completed(
+      [update('file.txt', 'old', 'fresh')],
+      'new-item',
+    ));
+    await gate.handleCandidate(present('file.txt', 'fresh\n'));
+
+    expect(proven).toHaveLength(1);
+    expect(unproven).toEqual([]);
+  });
+
+  it('invalidates exact-transition and proof-shadow caches for one key', async () => {
+    const candidate = present('file.txt', 'new\n');
+    const change = update('file.txt', 'old', 'new');
+    const { gate, proven, unproven } = setup({
+      'file.txt': state('file.txt', true, 'old\n'),
+    });
+
+    await gate.handleNotification(completed([change], 'item-1'));
+    await gate.handleCandidate(candidate);
+    await gate.handleCandidate(candidate);
+    const invalidate = (gate as CodexChangeGate & {
+      invalidate(key: string): Promise<void>;
+    }).invalidate;
+    expect(invalidate).toBeTypeOf('function');
+    if (invalidate === undefined) return;
+    await invalidate.call(gate, candidate.key);
+    await gate.handleNotification(completed([change], 'item-2'));
+
+    expect(proven).toHaveLength(1);
+    await gate.handleCandidate(candidate);
+    expect(proven).toHaveLength(2);
+    expect(unproven).toEqual([]);
+  });
+
+  it('retires a stale terminal item even when it never became eligible', async () => {
+    const acceptedStates: Record<string, ProvenanceFileState> = {
+      'file.txt': state('file.txt', true, 'other\n'),
+    };
+    const candidate = present('file.txt', 'new\n');
+    const notification = completed([update('file.txt', 'old', 'new')], 'stale-item');
+    const { gate, proven } = setup(acceptedStates);
+
+    await gate.handleNotification(notification);
+    await gate.invalidate(candidate.key);
+    acceptedStates['file.txt'] = state('file.txt', true, 'old\n');
+    await gate.handleNotification(notification);
+    await gate.handleCandidate(candidate);
+
+    expect(proven).toEqual([]);
+  });
+
+  it('keeps default completed evidence beyond the maximum configured watcher debounce', async () => {
+    const { clock, gate, proven } = setup({
+      'file.txt': state('file.txt', true, 'old\n'),
+    }, { transitionLifetimeMs: undefined });
+
+    await gate.handleNotification(completed([update('file.txt', 'old', 'new')]));
+    clock.advance(6_000);
+    await gate.handleCandidate(present('file.txt', 'new\n'));
+
+    expect(proven).toHaveLength(1);
   });
 
   it('unproves an older candidate exactly once when a newer post-image supersedes it', async () => {

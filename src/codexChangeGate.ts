@@ -55,7 +55,9 @@ interface NotificationKeyResolution {
 }
 
 const DEFAULT_QUARANTINE_MS = 1_000;
-const DEFAULT_TRANSITION_LIFETIME_MS = 5_000;
+// Completed evidence must outlive the extension's maximum 5-second watcher
+// debounce, plus bounded disk-read and gate-correlation time.
+export const DEFAULT_CODEX_TRANSITION_LIFETIME_MS = 15_000;
 const DEFAULT_MAX_PENDING_CANDIDATES = 256;
 const DEFAULT_MAX_ELIGIBLE_TRANSITIONS = 256;
 
@@ -113,8 +115,10 @@ function transitionIdentity(transition: ExactCodexTransition): string {
 
 export class CodexChangeGate implements vscode.Disposable {
   private readonly pendingCandidates = new Map<string, PendingCandidate>();
+  private readonly shadowCandidates = new Map<string, PendingCandidate>();
   private readonly provenCandidateIdentities = new Map<string, ProvenCandidateIdentity>();
   private readonly eligibleTransitions = new Map<string, EligibleTransition>();
+  private readonly inProgressItemKeys = new Map<string, Set<string>>();
   private readonly rejectedItems = new Set<string>();
   private readonly quarantineMs: number;
   private readonly transitionLifetimeMs: number;
@@ -134,7 +138,7 @@ export class CodexChangeGate implements vscode.Disposable {
       'quarantineMs',
     );
     this.transitionLifetimeMs = nonNegativeFinite(
-      options.transitionLifetimeMs ?? DEFAULT_TRANSITION_LIFETIME_MS,
+      options.transitionLifetimeMs ?? DEFAULT_CODEX_TRANSITION_LIFETIME_MS,
       'transitionLifetimeMs',
     );
     this.maxPendingCandidates = nonNegativeInteger(
@@ -172,7 +176,17 @@ export class CodexChangeGate implements vscode.Disposable {
         const proven = this.provenCandidateIdentities.get(key);
         if (proven !== undefined && !proven.itemKeys.has(itemKey)) {
           this.provenCandidateIdentities.delete(key);
+          const shadow = this.shadowCandidates.get(key);
+          if (shadow !== undefined) {
+            this.shadowCandidates.delete(key);
+            this.pendingCandidates.set(key, shadow);
+          }
         }
+      }
+      try {
+        await this.enforceCandidateBound();
+      } catch (error) {
+        firstError ??= error;
       }
       if (resolution.resolverAgreementFailed || this.rejectedItems.has(itemKey)) {
         this.rejectedItems.add(itemKey);
@@ -190,6 +204,18 @@ export class CodexChangeGate implements vscode.Disposable {
         this.armTimer();
         if (firstError !== undefined) throw firstError;
         return;
+      }
+
+      for (const key of resolution.relevantKeys) {
+        if (notification.method === 'item/fileChange/patchUpdated') {
+          const itemKeys = this.inProgressItemKeys.get(key) ?? new Set<string>();
+          itemKeys.add(itemKey);
+          this.inProgressItemKeys.set(key, itemKeys);
+        } else {
+          const itemKeys = this.inProgressItemKeys.get(key);
+          itemKeys?.delete(itemKey);
+          if (itemKeys?.size === 0) this.inProgressItemKeys.delete(key);
+        }
       }
 
       const previouslyEligible = new Set(this.eligibleTransitions.keys());
@@ -218,18 +244,31 @@ export class CodexChangeGate implements vscode.Disposable {
         return;
       }
 
-      const identity = candidateIdentity(candidate);
-      if (this.provenCandidateIdentities.get(candidate.key)?.identity === identity) {
-        return;
-      }
-      this.provenCandidateIdentities.delete(candidate.key);
-
       let firstError: unknown;
       try {
         await this.sweep(this.now());
       } catch (error) {
         firstError = error;
       }
+      const identity = candidateIdentity(candidate);
+      if (this.provenCandidateIdentities.get(candidate.key)?.identity === identity) {
+        const existingShadow = this.shadowCandidates.get(candidate.key);
+        if (existingShadow === undefined
+          || candidateIdentity(existingShadow.candidate) !== identity) {
+          this.shadowCandidates.delete(candidate.key);
+          this.shadowCandidates.set(candidate.key, {
+            candidate,
+            expiresAt: this.now() + this.quarantineMs,
+          });
+          this.enforceShadowBound();
+        }
+        this.armTimer();
+        if (firstError !== undefined) throw firstError;
+        return;
+      }
+      this.provenCandidateIdentities.delete(candidate.key);
+      this.shadowCandidates.delete(candidate.key);
+
       const existing = this.pendingCandidates.get(candidate.key);
       if (existing !== undefined) {
         if (candidateIdentity(existing.candidate) === identity) {
@@ -264,6 +303,37 @@ export class CodexChangeGate implements vscode.Disposable {
     });
   }
 
+  invalidate(key: string): Promise<void> {
+    return this.enqueue(async () => {
+      if (this.disposeRequested) return;
+
+      const retiredItemKeys = new Set(this.inProgressItemKeys.get(key) ?? []);
+      for (const itemKey of retiredItemKeys) {
+        this.rejectedItems.add(itemKey);
+      }
+      const eligible = this.eligibleTransitions.get(key);
+      if (eligible !== undefined) {
+        for (const itemId of eligible.transition.provenance.itemIds) {
+          const itemKey = `${eligible.transition.provenance.threadId}\0${eligible.transition.provenance.turnId}\0${itemId}`;
+          retiredItemKeys.add(itemKey);
+          this.rejectedItems.add(itemKey);
+        }
+      }
+      for (const itemKey of this.provenCandidateIdentities.get(key)?.itemKeys ?? []) {
+        retiredItemKeys.add(itemKey);
+        this.rejectedItems.add(itemKey);
+      }
+
+      this.pendingCandidates.delete(key);
+      this.shadowCandidates.delete(key);
+      this.provenCandidateIdentities.delete(key);
+      this.eligibleTransitions.delete(key);
+      this.inProgressItemKeys.delete(key);
+      this.ledger.retireKey(key, retiredItemKeys);
+      this.armTimer();
+    });
+  }
+
   dispose(): void {
     if (this.disposeRequested) return;
     this.disposeRequested = true;
@@ -271,8 +341,10 @@ export class CodexChangeGate implements vscode.Disposable {
     void this.enqueue(async () => {
       const pending = [...this.pendingCandidates.values()];
       this.pendingCandidates.clear();
+      this.shadowCandidates.clear();
       this.provenCandidateIdentities.clear();
       this.eligibleTransitions.clear();
+      this.inProgressItemKeys.clear();
       this.rejectedItems.clear();
       let firstError: unknown;
       for (const { candidate } of pending) {
@@ -391,6 +463,14 @@ export class CodexChangeGate implements vscode.Disposable {
     }
   }
 
+  private enforceShadowBound(): void {
+    while (this.shadowCandidates.size > this.maxPendingCandidates) {
+      const oldestKey = this.shadowCandidates.keys().next().value as string | undefined;
+      if (oldestKey === undefined) return;
+      this.shadowCandidates.delete(oldestKey);
+    }
+  }
+
   private async sweep(now: number): Promise<void> {
     const expiredCandidates = [...this.pendingCandidates.entries()]
       .filter(([, pending]) => pending.expiresAt <= now);
@@ -410,6 +490,9 @@ export class CodexChangeGate implements vscode.Disposable {
         this.ledger.invalidate(key);
       }
     }
+    for (const [key, shadow] of this.shadowCandidates) {
+      if (shadow.expiresAt <= now) this.shadowCandidates.delete(key);
+    }
     this.ledger.prune(now);
     if (firstError !== undefined) throw firstError;
   }
@@ -419,6 +502,7 @@ export class CodexChangeGate implements vscode.Disposable {
     if (this.disposeRequested) return;
     const expiries = [
       ...[...this.pendingCandidates.values()].map(({ expiresAt }) => expiresAt),
+      ...[...this.shadowCandidates.values()].map(({ expiresAt }) => expiresAt),
       ...[...this.eligibleTransitions.values()].map(({ expiresAt }) => expiresAt),
     ];
     if (expiries.length === 0) return;

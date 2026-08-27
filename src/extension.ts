@@ -7,6 +7,7 @@ import { PerKeyDebouncer } from './changePolicy';
 import { ComparisonCoordinator, type ComparisonView } from './coordinator';
 import {
   CodexChangeGate,
+  DEFAULT_CODEX_TRANSITION_LIFETIME_MS,
   type FileSystemCandidate,
 } from './codexChangeGate';
 import {
@@ -766,6 +767,7 @@ export class ExtensionRuntime implements vscode.Disposable {
           onProven: (transition) => this.applyProvenTransition(transition),
           onUnproven: (candidate) => this.acceptUnprovenCandidate(candidate),
         },
+        transitionLifetimeMs: DEFAULT_CODEX_TRANSITION_LIFETIME_MS,
       }));
       ownership.use(vscode.commands.registerCommand(
         CODEX_PROVENANCE_NOTIFICATION_COMMAND,
@@ -793,7 +795,10 @@ export class ExtensionRuntime implements vscode.Disposable {
       ownership.use(vscode.workspace.onDidCloseTextDocument((document) => this.guard('DocumentClose', () => this.handleDocumentClose(document))));
       ownership.use(vscode.window.onDidChangeVisibleTextEditors((editors) => this.guard('VisibleEditors', () => this.handleVisibleEditors(editors))));
       ownership.use(vscode.window.onDidChangeActiveTextEditor((editor) => this.guard('ActiveEditor', () => this.handleActiveEditor(editor))));
-      ownership.use(vscode.workspace.onDidChangeWorkspaceFolders((event) => this.guard('WorkspaceFolders', () => this.handleWorkspaceFolders(event))));
+      ownership.use(vscode.workspace.onDidChangeWorkspaceFolders((event) => this.run(
+        'WorkspaceFolders',
+        () => this.handleWorkspaceFolders(event),
+      )));
 
       return {
         snapshots,
@@ -970,6 +975,12 @@ export class ExtensionRuntime implements vscode.Disposable {
       resultingText: event.document.getText(),
       changes: contentChanges,
     })) {
+      if (this.reviewEditSaves.has(key)) {
+        this.reviewEditSaves.set(key, {
+          version: event.document.version,
+          text: event.document.getText(),
+        });
+      }
       return;
     }
 
@@ -1192,13 +1203,14 @@ export class ExtensionRuntime implements vscode.Disposable {
     this.syncComparison(normalizeUriKey(editor.document.uri));
   }
 
-  private handleWorkspaceFolders(event: vscode.WorkspaceFoldersChangeEvent): void {
+  private async handleWorkspaceFolders(event: vscode.WorkspaceFoldersChangeEvent): Promise<void> {
     if (this.disposed) {
       return;
     }
 
     for (const [key, uri] of [...this.trackedUris]) {
       if (event.removed.some((folder) => this.isWithin(uri, folder.uri))) {
+        await this.gate.invalidate(key);
         this.deleteKey(key);
       }
     }
@@ -1296,11 +1308,7 @@ export class ExtensionRuntime implements vscode.Disposable {
       return this.gate.handleCandidate({ kind: 'absent', key, uri });
     }
 
-    const document = this.liveDocument(key);
-    const text = document?.isDirty === true && document.getText() !== candidate.text
-      ? document.getText()
-      : candidate.text;
-    return this.gate.handleCandidate({ kind: 'present', key, uri, text });
+    return this.gate.handleCandidate({ kind: 'present', key, uri, text: candidate.text });
   }
 
   private async applyProvenTransition(transition: ExactCodexTransition): Promise<void> {
