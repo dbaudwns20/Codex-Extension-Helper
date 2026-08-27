@@ -175,6 +175,7 @@ function matchingBraceIndex(source, openingBrace) {
   let braceDepth = 1;
   let bracketDepth = 0;
   let index = openingBrace + 1;
+  let memberAccess = null;
   let pendingControlParen = false;
   const controlParens = [];
   let regexState = 'allowed';
@@ -200,12 +201,14 @@ function matchingBraceIndex(source, openingBrace) {
       continue;
     }
     if (character === '`') {
+      if (memberAccess !== null) throw new Error('unsupported token after property access');
       pendingControlParen = false;
       index = skipTemplateLiteral(source, index);
       regexState = 'disallowed';
       continue;
     }
     if (character === '/') {
+      if (memberAccess !== null) throw new Error('unsupported token after property access');
       pendingControlParen = false;
       if (regexState === 'ambiguous') {
         throw new Error('ambiguous slash after a closing brace');
@@ -223,14 +226,21 @@ function matchingBraceIndex(source, openingBrace) {
       let end = index + 1;
       while (/[\w$]/u.test(source[end] ?? '')) end += 1;
       const word = source.slice(index, end);
-      pendingControlParen = CONTROL_PAREN_KEYWORDS.has(word);
-      regexState = pendingControlParen || EXPRESSION_PREFIX_KEYWORDS.has(word)
-        ? 'allowed'
-        : 'disallowed';
+      if (memberAccess !== null) {
+        memberAccess = null;
+        pendingControlParen = false;
+        regexState = 'disallowed';
+      } else {
+        pendingControlParen = CONTROL_PAREN_KEYWORDS.has(word);
+        regexState = pendingControlParen || EXPRESSION_PREFIX_KEYWORDS.has(word)
+          ? 'allowed'
+          : 'disallowed';
+      }
       index = end;
       continue;
     }
     if (/[0-9]/u.test(character)) {
+      if (memberAccess !== null) throw new Error('unsupported token after property access');
       pendingControlParen = false;
       let end = index + 1;
       while (/[\w.]/u.test(source[end] ?? '')) end += 1;
@@ -239,6 +249,13 @@ function matchingBraceIndex(source, openingBrace) {
       continue;
     }
 
+    if (
+      memberAccess !== null
+      && !(memberAccess === 'optional' && (character === '(' || character === '['))
+    ) {
+      throw new Error('unsupported token after property access');
+    }
+    if (memberAccess === 'optional') memberAccess = null;
     if (character !== '(') pendingControlParen = false;
     if (character === '(') {
       controlParens.push(pendingControlParen);
@@ -266,10 +283,15 @@ function matchingBraceIndex(source, openingBrace) {
         return index;
       }
       regexState = 'ambiguous';
+    } else if (character === '?' && source[index + 1] === '.') {
+      index += 1;
+      memberAccess = 'optional';
+      regexState = 'disallowed';
     } else if (character === '.' && source.slice(index, index + 3) === '...') {
       index += 2;
       regexState = 'allowed';
     } else if (character === '.') {
+      memberAccess = 'direct';
       regexState = 'disallowed';
     } else if ((character === '+' || character === '-') && source[index + 1] === character) {
       index += 1;

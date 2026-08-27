@@ -169,6 +169,44 @@ describe('Codex provenance host source transform', () => {
   });
 
   it.each([
+    ['direct property access', 'obj.return/2;'],
+    ['optional property access', 'obj?.return/2;'],
+  ])('does not let %s hide the real activation close', async (_name, propertyDivision) => {
+    const { patchCodexHostSource } = await sourceTransform();
+    const source = [
+      'function enclosing(){',
+      VSCODE_IMPORT,
+      ACTIVATION_HEADER,
+      propertyDivision,
+      VSCODE_USAGE,
+      '};',
+      NOTIFICATION_ANCHOR,
+      'const regexTrap=/[}]/u,stringTrap="}";',
+      '}',
+    ].join('');
+
+    expect(() => new Function(source)).not.toThrow();
+    expect(() => patchCodexHostSource(source))
+      .toThrow(/inside the Codex activation function body/u);
+  });
+
+  it('distinguishes property keywords from real return and control keywords', async () => {
+    const { patchCodexHostSource } = await sourceTransform();
+    const tokenCases = 'const obj={return:4,throw:4,if:4};const quotient=obj.return/2+obj?.throw/2+obj?.if/2;function realReturn(){return /[}]/u}if(!1)/[}]/u.test("}");';
+    const source = minifiedHostFixture().replace(
+      NOTIFICATION_ANCHOR,
+      `${tokenCases}${NOTIFICATION_ANCHOR}`,
+    );
+
+    const runtime = await executePatchedFixture(patchCodexHostSource(source).source);
+    const event = { method: 'item/fileChange/patchUpdated', params: { itemId: 'patch' } };
+    runtime.handlers[0](event);
+    await Promise.resolve();
+
+    expect(runtime.provenanceCalls).toEqual([event]);
+  });
+
+  it.each([
     ['if control flow', 'if(i)'],
     ['a label', 'bridgeLabel:'],
     ['a comma expression', 'void 0,'],
