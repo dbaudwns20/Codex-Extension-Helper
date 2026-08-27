@@ -1,4 +1,5 @@
 import {
+  lstat as fsLstat,
   mkdtemp,
   mkdir,
   readFile,
@@ -28,6 +29,7 @@ const METADATA_KEYS = [
 const temporaryDirectories: string[] = [];
 
 type FileOperations = {
+  lstat?: (filePath: string) => ReturnType<typeof fsLstat>;
   rename?: (sourcePath: string, targetPath: string) => Promise<void>;
   rm?: (filePath: string, options?: { force?: boolean }) => Promise<void>;
   syncDirectory?: (directoryPath: string) => Promise<void>;
@@ -439,6 +441,72 @@ describe('Codex provenance installation apply lifecycle', () => {
     expect(await readOptional(metadataPath)).toBeUndefined();
   });
 
+  it('preserves a concurrent backup created before a non-EEXIST write failure', async () => {
+    const { applyCodexProvenancePatch, inspectCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
+    const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
+    const original = await readFile(targetPath);
+    const concurrentBackup = Buffer.from('backup created by a concurrent transaction');
+
+    await expect(applyCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        writeFile: async (filePath) => {
+          if (filePath === backupPath) {
+            await fsWriteFile(filePath, concurrentBackup, { flag: 'wx' });
+            throw Object.assign(new Error('backup write failed before transaction effect'), {
+              code: 'EIO',
+            });
+          }
+          throw new Error(`unexpected write to ${filePath}`);
+        },
+      },
+    })).rejects.toThrow(/backup.*ownership.*unconfirmed.*preserved.*manual cleanup/iu);
+
+    expect(await readFile(targetPath)).toEqual(original);
+    expect(await readFile(backupPath)).toEqual(concurrentBackup);
+    expect(await readOptional(metadataPath)).toBeUndefined();
+    expect(await tempArtifacts(extensionDir)).toEqual([]);
+    await expect(inspectCodexProvenancePatch({ extensionDir })).rejects.toThrow(
+      /inconsistent.*artifacts/u,
+    );
+  });
+
+  it('preserves an exact backup when its exclusive write reports an after-effect failure', async () => {
+    const { applyCodexProvenancePatch, inspectCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
+    const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
+    const original = await readFile(targetPath);
+
+    await expect(applyCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        writeFile: async (filePath, data, options) => {
+          await fsWriteFile(filePath, data, options);
+          if (filePath === backupPath) {
+            throw Object.assign(new Error('backup write reported after-effect failure'), {
+              code: 'EIO',
+            });
+          }
+        },
+      },
+    })).rejects.toThrow(/backup.*ownership.*unconfirmed.*preserved.*manual cleanup/iu);
+
+    expect(await readFile(targetPath)).toEqual(original);
+    expect(await readFile(backupPath)).toEqual(original);
+    expect(await readOptional(metadataPath)).toBeUndefined();
+    expect(await tempArtifacts(extensionDir)).toEqual([]);
+    await expect(inspectCodexProvenancePatch({ extensionDir })).rejects.toThrow(
+      /inconsistent.*artifacts/u,
+    );
+  });
+
   it('verifies newly created backup bytes before replacing the target', async () => {
     const { applyCodexProvenancePatch } = await installationModule();
     const root = await makeTemporaryDirectory();
@@ -499,7 +567,7 @@ describe('Codex provenance installation apply lifecycle', () => {
     expect(await tempArtifacts(extensionDir)).toEqual([]);
   });
 
-  it('verifies final metadata bytes and schema after the metadata rename', async () => {
+  it('preserves unknown final metadata written by another transaction before rename failure', async () => {
     const { applyCodexProvenancePatch } = await installationModule();
     const root = await makeTemporaryDirectory();
     const extensionDir = await makeInstallation(root, '26.826.11250');
@@ -507,26 +575,28 @@ describe('Codex provenance installation apply lifecycle', () => {
     const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
     const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
     const original = await readFile(targetPath);
+    const concurrentMetadata = Buffer.from('{"owner":"other-transaction"}\n');
 
     await expect(applyCodexProvenancePatch({
       extensionDir,
       __testFileOperations: {
         rename: async (sourcePath, destinationPath) => {
-          await fsRename(sourcePath, destinationPath);
           if (destinationPath === metadataPath) {
-            await fsWriteFile(metadataPath, '{"malformed":true}\n');
+            await fsWriteFile(metadataPath, concurrentMetadata, { flag: 'wx' });
+            throw new Error('metadata rename failed before transaction effect');
           }
+          await fsRename(sourcePath, destinationPath);
         },
       },
-    })).rejects.toThrow('Codex provenance final metadata is invalid');
+    })).rejects.toThrow(/unknown metadata.*preserved.*manual cleanup/iu);
 
     expect(await readFile(targetPath)).toEqual(original);
-    expect(await readOptional(backupPath)).toBeUndefined();
-    expect(await readOptional(metadataPath)).toBeUndefined();
+    expect(await readFile(backupPath)).toEqual(original);
+    expect(await readFile(metadataPath)).toEqual(concurrentMetadata);
     expect(await tempArtifacts(extensionDir)).toEqual([]);
   });
 
-  it('reports backup-only recovery when malformed metadata removal sync fails', async () => {
+  it('cleans exact metadata after its rename takes effect and reports cleanup sync failure', async () => {
     const { applyCodexProvenancePatch, inspectCodexProvenancePatch } = await installationModule();
     const root = await makeTemporaryDirectory();
     const extensionDir = await makeInstallation(root, '26.826.11250');
@@ -534,7 +604,7 @@ describe('Codex provenance installation apply lifecycle', () => {
     const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
     const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
     const original = await readFile(targetPath);
-    let metadataWasCorrupted = false;
+    let metadataRenameTookEffect = false;
 
     await expect(applyCodexProvenancePatch({
       extensionDir,
@@ -542,19 +612,18 @@ describe('Codex provenance installation apply lifecycle', () => {
         rename: async (sourcePath, destinationPath) => {
           await fsRename(sourcePath, destinationPath);
           if (destinationPath === metadataPath) {
-            await fsWriteFile(metadataPath, '{"malformed":true}\n');
-            metadataWasCorrupted = true;
+            metadataRenameTookEffect = true;
+            await fsWriteFile(targetPath, original);
+            throw new Error('metadata rename reported after-effect failure');
           }
         },
         syncDirectory: async () => {
           if (
-            metadataWasCorrupted
+            metadataRenameTookEffect
             && await readOptional(metadataPath) === undefined
-            && (await readFile(targetPath, 'utf8')).includes(
-              'codex-extension-helper:provenance:start',
-            )
+            && (await readFile(targetPath)).equals(original)
           ) {
-            throw new Error('malformed metadata removal directory sync failed');
+            throw new Error('exact metadata removal directory sync failed');
           }
         },
       },
@@ -569,7 +638,6 @@ describe('Codex provenance installation apply lifecycle', () => {
   });
 
   it.each([
-    ['backup write after creation', 'write-backup-after-create'],
     ['patched temporary write', 'write-target'],
     ['metadata temporary write', 'write-metadata'],
     ['target rename', 'rename-target'],
@@ -584,10 +652,6 @@ describe('Codex provenance installation apply lifecycle', () => {
     const original = await readFile(targetPath);
     const operations: FileOperations = {
       writeFile: async (filePath, data, options) => {
-        if (failure === 'write-backup-after-create' && filePath === backupPath) {
-          await fsWriteFile(filePath, data, options);
-          throw new Error('injected backup write failure after creation');
-        }
         if (failure === 'write-target' && filePath.startsWith(`${targetPath}.tmp-`)) {
           throw new Error('injected patched temporary write failure');
         }
@@ -670,6 +734,32 @@ describe('Codex provenance installation apply lifecycle', () => {
           if (filePath.startsWith(`${metadataPath}.tmp-`)) {
             await fsWriteFile(targetPath, concurrentBytes);
           }
+        },
+      },
+    })).rejects.toThrow(/target changed.*backup retained/iu);
+
+    expect(await readFile(targetPath)).toEqual(concurrentBytes);
+    expect(await readFile(backupPath)).toBeDefined();
+    expect(await readOptional(metadataPath)).toBeUndefined();
+    expect(await tempArtifacts(extensionDir)).toEqual([]);
+  });
+
+  it('performs the final symlink check before the exact target read boundary', async () => {
+    const { applyCodexProvenancePatch } = await installationModule();
+    const root = await makeTemporaryDirectory();
+    const extensionDir = await makeInstallation(root, '26.826.11250');
+    const targetPath = path.join(extensionDir, 'out/extension.js');
+    const backupPath = `${targetPath}.codex-extension-helper-provenance.original`;
+    const metadataPath = `${targetPath}.codex-extension-helper-provenance.json`;
+    const concurrentBytes = Buffer.from('concurrent former-lstat-window target bytes');
+
+    await expect(applyCodexProvenancePatch({
+      extensionDir,
+      __testFileOperations: {
+        lstat: async (filePath) => {
+          const fileStats = await fsLstat(filePath);
+          if (filePath === targetPath) await fsWriteFile(targetPath, concurrentBytes);
+          return fileStats;
         },
       },
     })).rejects.toThrow(/target changed.*backup retained/iu);

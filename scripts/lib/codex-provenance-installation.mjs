@@ -63,10 +63,10 @@ async function fileExists(filePath) {
   }
 }
 
-async function assertNotSymbolicLink(filePath, label) {
+async function assertNotSymbolicLink(filePath, label, lstatFile = lstat) {
   let fileStats;
   try {
-    fileStats = await lstat(filePath);
+    fileStats = await lstatFile(filePath);
   } catch (error) {
     if (error?.code === 'ENOENT') return;
     throw error;
@@ -381,6 +381,7 @@ async function durableSyncDirectory(directoryPath) {
 
 function fileOperationsFor(options) {
   return {
+    lstat: options?.__testFileOperations?.lstat ?? lstat,
     rename: options?.__testFileOperations?.rename ?? rename,
     rm: options?.__testFileOperations?.rm ?? rm,
     syncDirectory: options?.__testFileOperations?.syncDirectory ?? durableSyncDirectory,
@@ -453,7 +454,7 @@ async function atomicReplace(
   temporaryPaths.push(tempPath);
   await operations.writeFile(tempPath, bytes, { flag: 'wx', mode });
   if (expectedCurrentBytes !== undefined) {
-    await assertNotSymbolicLink(filePath, 'target');
+    await assertNotSymbolicLink(filePath, 'target', operations.lstat);
     const currentBytes = await readFile(filePath).catch(() => undefined);
     if (!matchesExactBytes(currentBytes, expectedCurrentBytes, expectedCurrentSha256)) {
       throw new Error(changedMessage);
@@ -498,15 +499,14 @@ export async function applyCodexProvenancePatch(options = {}) {
   );
   const metadataBytes = Buffer.from(`${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
   const temporaryPaths = [];
-  let backupCreated = false;
-  let metadataRenameAttempted = false;
+  let backupOwned = false;
 
   try {
     await operations.writeFile(analysis.paths.backupPath, analysis.targetBytes, {
       flag: 'wx',
       mode: targetMode,
     });
-    backupCreated = true;
+    backupOwned = true;
     if (!Buffer.from(await readFile(analysis.paths.backupPath)).equals(analysis.targetBytes)) {
       throw new Error('Codex provenance backup verification failed');
     }
@@ -533,6 +533,7 @@ export async function applyCodexProvenancePatch(options = {}) {
       'Codex provenance metadata temporary file is invalid',
     );
 
+    await assertNotSymbolicLink(analysis.target.targetPath, 'target', operations.lstat);
     const currentImmediatelyBeforeInstall = await readFile(analysis.target.targetPath)
       .catch(() => undefined);
     if (!matchesExactBytes(
@@ -542,14 +543,12 @@ export async function applyCodexProvenancePatch(options = {}) {
     )) {
       throw new Error('Codex provenance target changed during installation');
     }
-    await assertNotSymbolicLink(analysis.target.targetPath, 'target');
     await operations.rename(targetTempPath, analysis.target.targetPath);
     await syncParentDirectory(analysis.target.targetPath, operations);
     if (!Buffer.from(await readFile(analysis.target.targetPath)).equals(analysis.patchedBytes)) {
       throw new Error('Codex provenance target verification failed after installation');
     }
 
-    metadataRenameAttempted = true;
     await operations.rename(metadataTempPath, analysis.paths.metadataPath);
     await verifyMetadataFile(
       analysis.paths.metadataPath,
@@ -561,21 +560,28 @@ export async function applyCodexProvenancePatch(options = {}) {
     await syncParentDirectory(analysis.paths.metadataPath, operations);
     return resultFor('patched', analysis.target, analysis.paths);
   } catch (error) {
-    if (
-      !backupCreated
-      && error?.code !== 'EEXIST'
-      && await fileExists(analysis.paths.backupPath)
-    ) {
-      backupCreated = true;
-    }
     const metadataOnDisk = await readFile(analysis.paths.metadataPath).catch((readError) => {
       if (readError?.code === 'ENOENT') return undefined;
       throw readError;
     });
+    let metadataMatchesTransaction = false;
+    if (metadataOnDisk !== undefined) {
+      try {
+        assertExactMetadataBytes(
+          metadataOnDisk,
+          metadataBytes,
+          analysis.target,
+          analysis.paths,
+          'Codex provenance final metadata is invalid',
+        );
+        metadataMatchesTransaction = true;
+      } catch {
+        // Unknown final metadata is never owned or removed by this transaction.
+      }
+    }
     const targetOnDisk = await readFile(analysis.target.targetPath).catch(() => undefined);
     if (
-      metadataOnDisk !== undefined
-      && metadataOnDisk.equals(metadataBytes)
+      metadataMatchesTransaction
       && matchesExactBytes(targetOnDisk, analysis.patchedBytes, patchedSha256)
     ) {
       try {
@@ -591,8 +597,15 @@ export async function applyCodexProvenancePatch(options = {}) {
     }
 
     let metadataCleanupFailure;
-    if (metadataRenameAttempted && metadataOnDisk !== undefined) {
+    if (metadataMatchesTransaction) {
       try {
+        await verifyMetadataFile(
+          analysis.paths.metadataPath,
+          metadataBytes,
+          analysis.target,
+          analysis.paths,
+          'Codex provenance final metadata changed before cleanup',
+        );
         await removeDurably(analysis.paths.metadataPath, operations);
       } catch (cleanupError) {
         metadataCleanupFailure = errorMessage(cleanupError);
@@ -622,13 +635,35 @@ export async function applyCodexProvenancePatch(options = {}) {
 
     const tempCleanupFailures = await cleanupTemporaryPaths(temporaryPaths, operations);
     if (rollbackFailure !== undefined) {
+      const unknownMetadataSuffix = metadataOnDisk !== undefined && !metadataMatchesTransaction
+        ? `; unknown metadata preserved at ${analysis.paths.metadataPath}; manual cleanup required`
+        : '';
       throw new Error(
         `Could not install Codex provenance patch: ${errorMessage(error)}; `
         + `rollback failed: ${rollbackFailure}; original backup retained at ${analysis.paths.backupPath}`
+        + unknownMetadataSuffix
         + (tempCleanupFailures.length === 0
           ? ''
           : `; temporary cleanup failures: ${tempCleanupFailures.join('; ')}`),
       );
+    }
+
+    if (metadataOnDisk !== undefined && !metadataMatchesTransaction) {
+      const finalMetadata = await readFile(analysis.paths.metadataPath).catch((readError) => {
+        if (readError?.code === 'ENOENT') return undefined;
+        throw readError;
+      });
+      if (finalMetadata !== undefined) {
+        const backupStillExists = await fileExists(analysis.paths.backupPath);
+        throw new Error(
+          `Could not install Codex provenance patch: ${errorMessage(error)}; target remains original; `
+          + `unknown metadata preserved at ${analysis.paths.metadataPath}; `
+          + (backupStillExists
+            ? `original backup retained at ${analysis.paths.backupPath}; `
+            : 'backup is absent; ')
+          + 'manual cleanup required',
+        );
+      }
     }
 
     if (metadataCleanupFailure !== undefined) {
@@ -664,7 +699,7 @@ export async function applyCodexProvenancePatch(options = {}) {
       );
     }
 
-    const backupCleanupFailure = backupCreated
+    const backupCleanupFailure = backupOwned
       ? await removeNewBackup(analysis.paths, operations)
       : undefined;
     if (backupCleanupFailure !== undefined) {
@@ -678,6 +713,12 @@ export async function applyCodexProvenancePatch(options = {}) {
       throw new Error(
         `Could not install Codex provenance patch: ${errorMessage(error)}; target restored; `
         + `backup retained at ${analysis.paths.backupPath}: ${backupCleanupFailure.message}`,
+      );
+    }
+    if (!backupOwned && await fileExists(analysis.paths.backupPath)) {
+      throw new Error(
+        `Could not install Codex provenance patch: ${errorMessage(error)}; backup ownership is `
+        + `unconfirmed, so it was preserved at ${analysis.paths.backupPath}; manual cleanup required`,
       );
     }
     throw new Error(
