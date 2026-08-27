@@ -6,10 +6,16 @@ import { ActiveReviewContext } from './activeReviewContext';
 import { PerKeyDebouncer } from './changePolicy';
 import { ComparisonCoordinator, type ComparisonView } from './coordinator';
 import {
+  CodexChangeGate,
+  type FileSystemCandidate,
+} from './codexChangeGate';
+import {
   formatExplorerResourcesAsMentions,
   insertMentionsIntoCodex,
   type ExplorerMentionResource,
 } from './codexChatInsert';
+import { CODEX_PROVENANCE_NOTIFICATION_COMMAND } from './codexProvenanceProtocol';
+import type { ExactCodexTransition } from './codexProvenanceLedger';
 import { createCodexDropPatchController, registerCodexDropPatchCommands } from './codexDropPatchCommands';
 import { createCodexDropPatchRuntimeDependencies } from './codexDropPatchRuntime';
 import {
@@ -28,9 +34,8 @@ import { isEligibleFile, normalizeSettings, type ExtensionSettings } from './eli
 import {
   ExternalChangeDetector,
   normalizeUriKey,
-  type ExternalChangeKind,
+  type ExternalChangeCandidate,
 } from './externalChangeDetector';
-import { GitChangeGuard } from './gitChangeGuard';
 import { DisplayEditFence } from './displayEditFence';
 import {
   createInlineRendererSessionState,
@@ -79,11 +84,6 @@ interface TestExtensionApi {
     currentText: string,
     lifecycle?: FileLifecycle,
   ): Promise<void>;
-}
-
-interface ExternalComparisonCandidate {
-  readonly text: string;
-  readonly kind: ExternalChangeKind;
 }
 
 interface StableReviewHostApi {
@@ -643,14 +643,14 @@ export class ExtensionRuntime implements vscode.Disposable {
   private readonly activeReviewContext: ActiveReviewContext;
   private readonly spacers: TemporaryLineSpacerManager;
   private readonly detector: ExternalChangeDetector;
-  private readonly gitChangeGuard = new GitChangeGuard();
+  private readonly gate: CodexChangeGate;
   private readonly documentDebouncer: PerKeyDebouncer<string>;
   private readonly ownership: DisposableStore;
   private readonly trackedUris = new Map<string, vscode.Uri>();
   private readonly comparisonKeys = new Set<string>();
   private readonly documentFence = new DocumentChangeFence();
   private readonly displayEditFence = new DisplayEditFence();
-  private readonly externalCandidates = new Map<string, ExternalComparisonCandidate>();
+  private readonly reviewEditSaves = new Map<string, { version: number; text: string }>();
   private readonly pendingReviewEdits = new PendingReviewEdits();
   private visibleKeys = new Set<string>();
   private disposed = false;
@@ -750,14 +750,35 @@ export class ExtensionRuntime implements vscode.Disposable {
         reviewController,
         (scope, error) => this.log(scope, error),
       );
+      const gate = ownership.use(new CodexChangeGate({
+        resolveAcceptedPath: (relativePath) => {
+          const uri = this.resolveWorkspacePath(relativePath);
+          if (uri === undefined) return undefined;
+          const text = snapshots.acceptedText(normalizeUriKey(uri));
+          return {
+            uri,
+            exists: text !== undefined,
+            text: text ?? '',
+          };
+        },
+        resolveWorkspacePath: (relativePath) => this.resolveWorkspacePath(relativePath),
+        callbacks: {
+          onProven: (transition) => this.applyProvenTransition(transition),
+          onUnproven: (candidate) => this.acceptUnprovenCandidate(candidate),
+        },
+      }));
+      ownership.use(vscode.commands.registerCommand(
+        CODEX_PROVENANCE_NOTIFICATION_COMMAND,
+        (payload: unknown) => this.run(
+          'CodexProvenanceNotification',
+          () => gate.handleNotification(payload),
+        ),
+      ));
       const detector = ownership.use(new ExternalChangeDetector({
         readFile: (uri) => vscode.workspace.fs.readFile(uri as vscode.Uri),
         settings: () => this.settingsValue,
         relativePath: (uri) => this.relativePath(uri as vscode.Uri),
-        onComparison: async (key, text, kind) => {
-          await this.applyExternalComparison(key, text, kind);
-        },
-        onDelete: (key) => this.deleteKey(key, false),
+        onCandidate: (candidate) => this.handleFileSystemCandidate(candidate),
         onError: (error) => this.log('ExternalChangeDetector', error),
       }));
       const documentDebouncer = ownership.use(new PerKeyDebouncer<string>());
@@ -778,6 +799,7 @@ export class ExtensionRuntime implements vscode.Disposable {
         snapshots,
         view,
         coordinator,
+        gate,
         detector,
         documentDebouncer,
         quickDiff,
@@ -791,6 +813,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     this.snapshots = construction.value.snapshots;
     this.view = construction.value.view;
     this.coordinator = construction.value.coordinator;
+    this.gate = construction.value.gate;
     this.quickDiff = construction.value.quickDiff;
     this.deletedLines = construction.value.deletedLines;
     this.activeReviewContext = construction.value.activeReviewContext;
@@ -833,7 +856,6 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
 
     const key = normalizeUriKey(uri);
-    this.externalCandidates.delete(key);
     this.documentFence.invalidate(key);
     this.documentDebouncer.cancel(key);
     this.detector.markRecentSave(uri);
@@ -889,7 +911,7 @@ export class ExtensionRuntime implements vscode.Disposable {
       this.trackedUris.clear();
       this.comparisonKeys.clear();
       this.visibleKeys.clear();
-      this.externalCandidates.clear();
+      this.reviewEditSaves.clear();
       this.pendingReviewEdits.clear();
       this.documentFence.clear();
       this.displayEditFence.clear();
@@ -903,7 +925,6 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
 
     const key = normalizeUriKey(uri);
-    this.externalCandidates.delete(key);
     this.trackedUris.set(key, uri);
     if (kind === 'create') {
       this.detector.handleCreate(uri);
@@ -913,9 +934,9 @@ export class ExtensionRuntime implements vscode.Disposable {
   }
 
   private handleWatcherDelete(uri: vscode.Uri): void {
-    if (!this.disposed) {
-      this.detector.handleDelete(uri);
-    }
+    if (this.disposed || !this.preflightEligible(uri)) return;
+    this.trackedUris.set(normalizeUriKey(uri), uri);
+    this.detector.handleDelete(uri);
   }
 
   private seedDocument(document: vscode.TextDocument): void {
@@ -967,11 +988,10 @@ export class ExtensionRuntime implements vscode.Disposable {
           changes: contentChanges,
         });
         if (reconciled?.status === 'canonicalized') {
-          this.processCanonicalDocumentEdit(key, event.document.uri, reconciled.text);
+          this.processUnknownDocumentEdit(key, event.document.uri, reconciled.text);
           return;
         }
-        this.coordinator.save(key, event.document.getText());
-        this.syncComparison(key);
+        this.processUnknownDocumentEdit(key, event.document.uri, event.document.getText());
         void vscode.window.showWarningMessage(
           'Codex review display was cleared because a temporary deleted-line row changed unexpectedly.',
         );
@@ -986,6 +1006,10 @@ export class ExtensionRuntime implements vscode.Disposable {
       contentChanges,
     });
     if (isReviewEdit) {
+      this.reviewEditSaves.set(key, {
+        version: event.document.version,
+        text: event.document.getText(),
+      });
       this.spacers.authorizeDirtyInstall({
         key,
         text: event.document.getText(),
@@ -993,26 +1017,18 @@ export class ExtensionRuntime implements vscode.Disposable {
         isDirty: event.document.isDirty,
         eol: event.document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n',
       });
+      this.processReviewDocumentEdit(key, event.document.uri, event.document.getText());
+      return;
     }
-    if (
-      !isReviewEdit
-      && !shouldInvalidateDocumentChange(event.contentChanges.length, event.document.isDirty)
-    ) {
-      const candidate = this.externalCandidates.get(key);
-      if (candidate !== undefined && candidate.text === event.document.getText()) {
-        void this.run(
-          'ExternalDocumentRefresh',
-          () => this.tryApplyExternalComparison(key, candidate),
-        );
-      }
+    this.reviewEditSaves.delete(key);
+    if (!shouldInvalidateDocumentChange(event.contentChanges.length, event.document.isDirty)) {
       return;
     }
 
-    this.processCanonicalDocumentEdit(key, event.document.uri, event.document.getText());
+    this.processUnknownDocumentEdit(key, event.document.uri, event.document.getText());
   }
 
-  private processCanonicalDocumentEdit(key: string, uri: vscode.Uri, text: string): void {
-    this.externalCandidates.delete(key);
+  private processReviewDocumentEdit(key: string, uri: vscode.Uri, text: string): void {
     this.documentFence.invalidate(key);
     this.detector.invalidate(key);
     this.coordinator.invalidate(key);
@@ -1038,6 +1054,27 @@ export class ExtensionRuntime implements vscode.Disposable {
     });
   }
 
+  private processUnknownDocumentEdit(key: string, uri: vscode.Uri, text: string): void {
+    this.documentFence.invalidate(key);
+    this.detector.invalidate(key);
+    this.coordinator.invalidate(key);
+    this.documentDebouncer.cancel(key);
+    if (!this.isEligible(uri, text)) {
+      this.deleteKey(key);
+      return;
+    }
+
+    this.trackedUris.set(key, uri);
+    this.documentDebouncer.schedule(key, this.settingsValue.debounceMs, () => {
+      void this.run('DocumentEditCandidate', () => this.gate.handleCandidate({
+        kind: 'present',
+        key,
+        uri,
+        text,
+      }));
+    });
+  }
+
   private handleWillSave(event: vscode.TextDocumentWillSaveEvent): void {
     const key = normalizeUriKey(event.document.uri);
     const spacerEdits = this.spacers.willSaveEdits({
@@ -1056,7 +1093,6 @@ export class ExtensionRuntime implements vscode.Disposable {
     ))));
 
     if (!this.disposed && this.isEligible(event.document.uri, event.document.getText())) {
-      this.externalCandidates.delete(key);
       this.documentFence.invalidate(key);
       this.documentDebouncer.cancel(key);
       this.coordinator.invalidate(key);
@@ -1070,7 +1106,6 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
 
     const key = normalizeUriKey(document.uri);
-    this.externalCandidates.delete(key);
     this.documentFence.invalidate(key);
     this.detector.invalidate(key);
     this.documentDebouncer.cancel(key);
@@ -1081,8 +1116,23 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
 
     this.trackedUris.set(key, document.uri);
-    this.coordinator.save(key, text);
-    this.syncComparison(key);
+    const reviewSave = this.reviewEditSaves.get(key);
+    this.reviewEditSaves.delete(key);
+    if (
+      reviewSave !== undefined
+      && reviewSave.version === document.version
+      && reviewSave.text === text
+    ) {
+      this.coordinator.save(key, text);
+      this.syncComparison(key);
+      return;
+    }
+    void this.run('DocumentSaveCandidate', () => this.gate.handleCandidate({
+      kind: 'present',
+      key,
+      uri: document.uri,
+      text,
+    }));
   }
 
   private handleDocumentClose(document: vscode.TextDocument): void {
@@ -1091,6 +1141,7 @@ export class ExtensionRuntime implements vscode.Disposable {
     }
 
     const key = normalizeUriKey(document.uri);
+    this.reviewEditSaves.delete(key);
     this.documentDebouncer.cancel(key);
     if (!vscode.window.visibleTextEditors.some(
       (editor) => normalizeUriKey(editor.document.uri) === key,
@@ -1157,7 +1208,7 @@ export class ExtensionRuntime implements vscode.Disposable {
   }
 
   private deleteKey(key: string, invalidateDetector = true): void {
-    this.externalCandidates.delete(key);
+    this.reviewEditSaves.delete(key);
     this.documentFence.invalidate(key);
     if (invalidateDetector) {
       this.detector.invalidate(key);
@@ -1232,64 +1283,87 @@ export class ExtensionRuntime implements vscode.Disposable {
     return valid;
   }
 
-  private async applyExternalComparison(
-    key: string,
-    text: string,
-    kind: ExternalChangeKind,
-  ): Promise<void> {
-    const candidate = { text, kind };
-    this.externalCandidates.set(key, candidate);
-    await this.tryApplyExternalComparison(key, candidate);
-  }
+  private handleFileSystemCandidate(candidate: ExternalChangeCandidate): Promise<void> {
+    if (this.disposed) return Promise.resolve();
+    const uri = candidate.uri as vscode.Uri;
+    const key = normalizeUriKey(uri);
+    if (candidate.key !== key || !this.preflightEligible(uri)) {
+      return Promise.resolve();
+    }
 
-  private async tryApplyExternalComparison(
-    key: string,
-    candidate: ExternalComparisonCandidate,
-  ): Promise<void> {
-    if (this.disposed || this.externalCandidates.get(key) !== candidate) {
-      return;
+    this.trackedUris.set(key, uri);
+    if (candidate.kind === 'absent') {
+      return this.gate.handleCandidate({ kind: 'absent', key, uri });
     }
 
     const document = this.liveDocument(key);
-    if (document !== undefined && document.getText() !== candidate.text) {
-      if (document.isDirty && this.externalCandidates.get(key) === candidate) {
-        this.externalCandidates.delete(key);
-      }
-      return;
-    }
+    const text = document?.isDirty === true && document.getText() !== candidate.text
+      ? document.getText()
+      : candidate.text;
+    return this.gate.handleCandidate({ kind: 'present', key, uri, text });
+  }
 
-    const resource = document?.uri ?? this.trackedUris.get(key);
+  private async applyProvenTransition(transition: ExactCodexTransition): Promise<void> {
+    if (this.disposed) return;
     if (
-      resource !== undefined
-      && await this.gitChangeGuard.resourceState(resource) === 'clean'
+      !this.preflightEligible(transition.uri)
+      || (transition.after.exists && !this.isEligible(transition.uri, transition.after.text))
     ) {
-      if (
-        !this.disposed
-        && this.externalCandidates.get(key) === candidate
-        && this.liveDocumentMatches(key, candidate.text)
-      ) {
-        this.externalCandidates.delete(key);
-        this.documentFence.invalidate(key);
-        this.coordinator.save(key, candidate.text);
-        this.syncComparison(key);
-      }
+      await this.coordinator.acceptExternalState(transition.key, undefined);
+      this.syncComparison(transition.key);
+      this.trackedUris.delete(transition.key);
+      return;
+    }
+    this.trackedUris.set(transition.key, transition.uri);
+
+    if (
+      transition.before.exists === transition.after.exists
+      && transition.before.text === transition.after.text
+    ) {
+      await this.coordinator.acceptExternalState(
+        transition.key,
+        transition.after.exists ? transition.after.text : undefined,
+      );
+      this.syncComparison(transition.key);
       return;
     }
 
-    const isCurrent = this.createDocumentGuard(key, candidate.text);
-    if (isCurrent === undefined) {
+    const lifecycle: FileLifecycle = !transition.before.exists
+      ? 'created'
+      : !transition.after.exists
+        ? 'deleted'
+        : 'existing';
+    await this.coordinator.provenChange(
+      transition.key,
+      transition.before.text,
+      transition.after.text,
+      lifecycle,
+      transition.provenance,
+    );
+    this.syncComparison(transition.key);
+  }
+
+  private async acceptUnprovenCandidate(candidate: FileSystemCandidate): Promise<void> {
+    if (this.disposed) return;
+    if (
+      !this.preflightEligible(candidate.uri)
+      || (candidate.kind === 'present' && !this.isEligible(candidate.uri, candidate.text))
+    ) {
+      await this.coordinator.acceptExternalState(candidate.key, undefined);
+      this.syncComparison(candidate.key);
+      this.trackedUris.delete(candidate.key);
+      return;
+    }
+    if (candidate.kind === 'present') {
+      this.trackedUris.set(candidate.key, candidate.uri);
+      await this.coordinator.acceptExternalState(candidate.key, candidate.text);
+      this.syncComparison(candidate.key);
       return;
     }
 
-    if (candidate.kind === 'create') {
-      await this.coordinator.externalCreate(key, candidate.text, isCurrent);
-    } else {
-      await this.coordinator.externalChange(key, candidate.text, isCurrent);
-    }
-    if (this.externalCandidates.get(key) === candidate) {
-      this.externalCandidates.delete(key);
-    }
-    this.syncComparison(key);
+    await this.coordinator.acceptExternalState(candidate.key, undefined);
+    this.syncComparison(candidate.key);
+    this.trackedUris.delete(candidate.key);
   }
 
   private createDocumentGuard(
@@ -1318,11 +1392,6 @@ export class ExtensionRuntime implements vscode.Disposable {
     );
   }
 
-  private liveDocumentMatches(key: string, expectedText: string): boolean {
-    const document = this.liveDocument(key);
-    return document === undefined || document.getText() === expectedText;
-  }
-
   private documentSnapshot(document: vscode.TextDocument): LiveDocumentSnapshot {
     return {
       version: document.version,
@@ -1332,25 +1401,60 @@ export class ExtensionRuntime implements vscode.Disposable {
   }
 
   private preflightEligible(uri: vscode.Uri): boolean {
-    return vscode.workspace.getWorkspaceFolder(uri) !== undefined && isEligibleFile({
+    const relativePath = this.workspaceRelativePath(uri);
+    return relativePath !== undefined && isEligibleFile({
       scheme: uri.scheme,
-      relativePath: this.relativePath(uri),
+      relativePath,
       text: '',
       sizeBytes: 0,
     }, this.settingsValue);
   }
 
   private isEligible(uri: vscode.Uri, text: string): boolean {
-    return vscode.workspace.getWorkspaceFolder(uri) !== undefined && isEligibleFile({
+    const relativePath = this.workspaceRelativePath(uri);
+    return relativePath !== undefined && isEligibleFile({
       scheme: uri.scheme,
-      relativePath: this.relativePath(uri),
+      relativePath,
       text,
       sizeBytes: Buffer.byteLength(text, 'utf8'),
     }, this.settingsValue);
   }
 
   private relativePath(uri: vscode.Uri): string {
-    return vscode.workspace.asRelativePath(uri, false).replace(/\\/g, '/');
+    const relativePath = this.workspaceRelativePath(uri);
+    if (relativePath === undefined) {
+      throw new Error(`Resource is not inside exactly one file workspace: ${uri.toString()}`);
+    }
+    return relativePath;
+  }
+
+  private workspaceRelativePath(uri: vscode.Uri): string | undefined {
+    if (uri.scheme !== 'file') return undefined;
+    const folders = (vscode.workspace.workspaceFolders ?? []).filter(
+      (folder) => folder.uri.scheme === 'file' && this.isWithin(uri, folder.uri),
+    );
+    if (folders.length !== 1) return undefined;
+    const relativePath = path.posix.relative(folders[0].uri.path, uri.path);
+    if (!this.validRelativePath(relativePath)) return undefined;
+    return relativePath;
+  }
+
+  private resolveWorkspacePath(relativePath: string): vscode.Uri | undefined {
+    if (!this.validRelativePath(relativePath)) return undefined;
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (folders.length !== 1 || folders[0].uri.scheme !== 'file') return undefined;
+    const uri = vscode.Uri.joinPath(folders[0].uri, ...relativePath.split('/'));
+    return this.workspaceRelativePath(uri) === relativePath ? uri : undefined;
+  }
+
+  private validRelativePath(relativePath: string): boolean {
+    return relativePath.length > 0
+      && !relativePath.includes('\\')
+      && !relativePath.includes('\0')
+      && !relativePath.startsWith('/')
+      && relativePath.split('/').every((segment) => (
+        segment.length > 0 && segment !== '.' && segment !== '..'
+      ));
   }
 
   private isWithin(uri: vscode.Uri, folder: vscode.Uri): boolean {

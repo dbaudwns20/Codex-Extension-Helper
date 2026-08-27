@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { diffChars } from 'diff';
 import { describe, expect, it, vi } from 'vitest';
 import { ComparisonCoordinator } from '../../src/coordinator';
+import { CODEX_PROVENANCE_NOTIFICATION_COMMAND } from '../../src/codexProvenanceProtocol';
 import { DisposableStore } from '../../src/disposableStore';
 import { SnapshotStore } from '../../src/snapshotStore';
 import type { ChangeHunk, FileComparisonState, HunkReference } from '../../src/types';
@@ -142,6 +143,59 @@ async function settleRuntime(): Promise<void> {
   }
 }
 
+function completedUpdate(before: string, after: string, itemId = 'item-1') {
+  return {
+    method: 'item/completed',
+    params: {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      item: {
+        id: itemId,
+        type: 'fileChange',
+        status: 'completed',
+        changes: [{
+          path: 'file.ts',
+          kind: { type: 'update', move_path: null },
+          diff: [
+            '--- a/file.ts',
+            '+++ b/file.ts',
+            '@@ -1 +1 @@',
+            `-${before}`,
+            `+${after}`,
+            '',
+          ].join('\n'),
+        }],
+      },
+    },
+  };
+}
+
+function completedDelete(text: string, itemId = 'item-delete') {
+  return {
+    method: 'item/completed',
+    params: {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      item: {
+        id: itemId,
+        type: 'fileChange',
+        status: 'completed',
+        changes: [{
+          path: 'file.ts',
+          kind: { type: 'delete' },
+          diff: [
+            '--- a/file.ts',
+            '+++ /dev/null',
+            '@@ -1 +0,0 @@',
+            `-${text}`,
+            '',
+          ].join('\n'),
+        }],
+      },
+    },
+  };
+}
+
 function installRuntimeVscode(initialText = 'before\n') {
   const callbacks = new Map<string, (...args: any[]) => unknown>();
   const commands = new Map<string, (...args: any[]) => unknown>();
@@ -198,6 +252,13 @@ function installRuntimeVscode(initialText = 'before\n') {
     fsPath: '/workspace/second.ts',
     toString: () => 'file:///workspace/second.ts',
   };
+  const workspaceUri = {
+    ...uri,
+    path: '/workspace',
+    fsPath: '/workspace',
+    toString: () => 'file:///workspace',
+  };
+  const workspaceFolders = [{ uri: workspaceUri }];
   const secondDocument = {
     ...document,
     uri: secondUri,
@@ -268,6 +329,7 @@ function installRuntimeVscode(initialText = 'before\n') {
     onDidChangeActiveTextEditor: event('activeEditor'),
   };
   const workspace = {
+    workspaceFolders,
     textDocuments: [document] as Array<typeof document | typeof secondDocument>,
     openTextDocument: vi.fn(async (resource: typeof uri) => {
       if (!files.has(resource.toString())) {
@@ -364,7 +426,13 @@ function installRuntimeVscode(initialText = 'before\n') {
     onDidSaveTextDocument: event('documentSave'),
     onDidCloseTextDocument: event('documentClose'),
     onDidChangeWorkspaceFolders: event('workspaceFolders'),
-    getWorkspaceFolder: vi.fn(() => ({ uri: { path: '/workspace' } })),
+    getWorkspaceFolder: vi.fn((resource: { scheme: string; authority: string; path: string }) => (
+      workspace.workspaceFolders.find(({ uri: folder }) => (
+        resource.scheme === folder.scheme
+        && resource.authority === folder.authority
+        && (resource.path === folder.path || resource.path.startsWith(`${folder.path}/`))
+      ))
+    )),
     asRelativePath: vi.fn((resource: { path: string }) => resource.path.slice('/workspace/'.length)),
   };
   const executeCommand = vi.fn().mockResolvedValue(undefined);
@@ -396,6 +464,17 @@ function installRuntimeVscode(initialText = 'before\n') {
     ThemeColor: FakeThemeColor,
     TabInputText: FakeTabInputText,
     EndOfLine: { LF: 1, CRLF: 2 },
+    Uri: {
+      joinPath(root: typeof uri, ...segments: string[]) {
+        const joinedPath = path.posix.join(root.path, ...segments);
+        return {
+          ...root,
+          path: joinedPath,
+          fsPath: joinedPath,
+          toString: () => `${root.scheme}://${joinedPath}`,
+        };
+      },
+    },
     DecorationRangeBehavior: { ClosedClosed: 1 },
     OverviewRulerLane: { Full: 7 },
     TextEditorRevealType: { InCenter: 9 },
@@ -422,6 +501,16 @@ function installRuntimeVscode(initialText = 'before\n') {
       );
     },
     document,
+    editText(value: string) {
+      const originalText = text;
+      text = value;
+      version += 1;
+      dirty = true;
+      callbacks.get('documentChange')?.({
+        document,
+        contentChanges: disjointFakeChanges(originalText, value),
+      });
+    },
     editor,
     executeCommand,
     output,
@@ -453,6 +542,16 @@ function installRuntimeVscode(initialText = 'before\n') {
     setEnabled(value: boolean) {
       enabled = value;
     },
+    addWorkspaceFolder(folderPath: string) {
+      workspace.workspaceFolders.push({
+        uri: {
+          ...workspaceUri,
+          path: folderPath,
+          fsPath: folderPath,
+          toString: () => `file://${folderPath}`,
+        },
+      });
+    },
     sourceControl,
     uri,
     window,
@@ -461,6 +560,17 @@ function installRuntimeVscode(initialText = 'before\n') {
       return contentProviders.get(resource.scheme)?.provideTextDocumentContent(resource);
     },
   };
+}
+
+async function sendCodexNotification(
+  fake: ReturnType<typeof installRuntimeVscode>,
+  payload: unknown,
+): Promise<void> {
+  const handler = fake.commands.get(CODEX_PROVENANCE_NOTIFICATION_COMMAND);
+  expect(handler).toBeDefined();
+  if (handler !== undefined) {
+    await handler(payload);
+  }
 }
 
 describe('packaged runtime', () => {
@@ -488,6 +598,392 @@ describe('packaged runtime', () => {
     } finally {
       if (previousTestMode === undefined) delete process.env.CODEX_EXTENSION_HELPER_TEST;
       else process.env.CODEX_EXTENSION_HELPER_TEST = previousTestMode;
+    }
+  });
+
+  it('shows an exact Codex update when completion arrives before the watcher candidate', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'after'));
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(1);
+      expect(fake.quickDiffBaseline()).toBe('before\n');
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows an exact Codex update when the watcher candidate arrives before completion', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await vi.advanceTimersByTimeAsync(0);
+      await Promise.resolve();
+      await sendCodexNotification(fake, completedUpdate('before', 'after'));
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(1);
+      expect(fake.quickDiffBaseline()).toBe('before\n');
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    'merge result',
+    'revert result',
+    'checkout result',
+    'reset result',
+    'restore result',
+    'shell-command write',
+    'formatter write',
+  ])(
+    'hides and rebaselines an unproven %s',
+    async (text) => {
+      vi.useFakeTimers();
+      try {
+        const fake = installRuntimeVscode('before\n');
+        const { ExtensionRuntime } = await import('../../src/extension');
+        const runtime = new ExtensionRuntime({
+          enabled: true,
+          debounceMs: 0,
+          maxFileSizeBytes: 1024,
+          exclude: [],
+        }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+        fake.setText(`${text}\n`);
+        fake.callbacks.get('watcherChange')!(fake.uri);
+        await settleRuntime();
+
+        const state = (runtime as unknown as {
+          coordinator: { state(key: string): FileComparisonState | undefined };
+        }).coordinator.state(fake.uri.toString());
+        expect(runtime.comparisonCount).toBe(0);
+        expect(state).toMatchObject({
+          baselineText: `${text}\n`,
+          currentText: `${text}\n`,
+          comparisonActive: false,
+          provenance: undefined,
+        });
+        runtime.dispose();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('does not let hanging Git status delay an unproven watcher rebaseline', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      (vscodeMock.extensions as { getExtension: ReturnType<typeof vi.fn> }).getExtension
+        .mockReturnValue({
+          isActive: true,
+          exports: {
+            getAPI: () => ({
+              repositories: [{
+                rootUri: { fsPath: '/workspace' },
+                state: {
+                  workingTreeChanges: [{ uri: fake.uri }],
+                  indexChanges: [],
+                  mergeChanges: [],
+                  untrackedChanges: [],
+                },
+                status: () => new Promise<void>(() => {}),
+              }],
+            }),
+          },
+        });
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+      fake.setText('external\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      const state = (runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString());
+      expect(state?.baselineText).toBe('external\n');
+      expect(runtime.comparisonCount).toBe(0);
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects completed evidence whose output bytes differ from the watcher candidate', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'codex'));
+      fake.setText('different\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      const state = (runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString());
+      expect(runtime.comparisonCount).toBe(0);
+      expect(state).toMatchObject({ baselineText: 'different\n', provenance: undefined });
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears an active exact review when a newer unproven watcher write arrives', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'after'));
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+      expect(runtime.comparisonCount).toBe(1);
+
+      fake.setText('unknown\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      const state = (runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString());
+      expect(runtime.comparisonCount).toBe(0);
+      expect(state).toMatchObject({ baselineText: 'unknown\n', provenance: undefined });
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('routes an unfenced live document edit through the gate and clears exact review state', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'after'));
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+      expect(runtime.comparisonCount).toBe(1);
+
+      fake.editText('user edit\n');
+      await settleRuntime();
+
+      const state = (runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString());
+      expect(runtime.comparisonCount).toBe(0);
+      expect(state).toMatchObject({ baselineText: 'user edit\n', provenance: undefined });
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('coalesces identical save and watcher candidates after exact proof', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'after'));
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      fake.callbacks.get('documentSave')!(fake.document);
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(1);
+      expect(fake.quickDiffBaseline()).toBe('before\n');
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows exact deletion but removes state for an unknown deletion', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+      await sendCodexNotification(fake, completedDelete('before'));
+      fake.deleteFile();
+      fake.callbacks.get('watcherDelete')!(fake.uri);
+      await settleRuntime();
+      expect(runtime.comparisonCount).toBe(1);
+      expect((runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString())).toMatchObject({ lifecycle: 'deleted' });
+      runtime.dispose();
+
+      const unknownFake = installRuntimeVscode('before\n');
+      const unknownRuntime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, unknownFake.output as never, { renderingDisabled: false, warningShown: false });
+      unknownFake.deleteFile();
+      unknownFake.callbacks.get('watcherDelete')!(unknownFake.uri);
+      await settleRuntime();
+
+      expect((unknownRuntime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(unknownFake.uri.toString())).toBeUndefined();
+      expect(unknownRuntime.comparisonCount).toBe(0);
+      unknownRuntime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores an invalid notification without mutating active exact review state', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'after'));
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+      expect(runtime.comparisonCount).toBe(1);
+
+      await sendCodexNotification(fake, { method: 'unknown', params: {} });
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(1);
+      expect(fake.quickDiffBaseline()).toBe('before\n');
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fails closed when a relative Codex path is ambiguous across workspace roots', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      fake.addWorkspaceFolder('/other-workspace');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+      await sendCodexNotification(fake, completedUpdate('before', 'after'));
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(0);
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not let a quarantined watcher candidate revive state after workspace removal', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+      fake.setText('stale candidate\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await vi.advanceTimersByTimeAsync(0);
+      await Promise.resolve();
+      const removed = fake.workspace.workspaceFolders.splice(0);
+      fake.callbacks.get('workspaceFolders')!({ added: [], removed });
+      await settleRuntime();
+
+      expect((runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString())).toBeUndefined();
+      expect(runtime.comparisonCount).toBe(0);
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
     }
   });
 
@@ -2073,6 +2569,7 @@ describe('stable review runtime boundaries', () => {
         'codexExtensionHelper.rejectFile',
         'codexExtensionHelper.approveAllFiles',
         'codexExtensionHelper.rejectAllFiles',
+        CODEX_PROVENANCE_NOTIFICATION_COMMAND,
       ]);
 
       fake.setText('after\n');

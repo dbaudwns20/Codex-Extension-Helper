@@ -7,18 +7,26 @@ export interface ExternalChangeUri {
   toString(): string;
 }
 
-export type ExternalChangeKind = 'create' | 'change';
+export type ExternalChangeCandidate =
+  | {
+    readonly kind: 'present';
+    readonly key: string;
+    readonly uri: ExternalChangeUri;
+    readonly text: string;
+  }
+  | {
+    readonly kind: 'absent';
+    readonly key: string;
+    readonly uri: ExternalChangeUri;
+  };
 
 export interface ExternalChangeDetectorOptions {
   readonly readFile: (uri: ExternalChangeUri) => PromiseLike<Uint8Array>;
   readonly settings: () => ExtensionSettings;
   readonly relativePath: (uri: ExternalChangeUri) => string;
-  readonly onComparison: (
-    key: string,
-    text: string,
-    kind: ExternalChangeKind,
+  readonly onCandidate: (
+    candidate: ExternalChangeCandidate,
   ) => void | PromiseLike<void>;
-  readonly onDelete: (key: string) => void;
   readonly onError: (error: unknown) => void;
   readonly recentSaves?: RecentSaveRegistry;
   readonly debouncer?: PerKeyDebouncer<string>;
@@ -33,7 +41,6 @@ export class ExternalChangeDetector {
   private readonly recentSaves: RecentSaveRegistry;
   private readonly debouncer: PerKeyDebouncer<string>;
   private readonly revisions = new Map<string, number>();
-  private readonly pendingCreates = new Set<string>();
   private readonly now: () => number;
   private disposed = false;
 
@@ -52,26 +59,15 @@ export class ExternalChangeDetector {
   }
 
   handleCreate(uri: ExternalChangeUri): void {
-    this.schedule(uri, 'create');
+    this.schedule(uri, 'present');
   }
 
   handleChange(uri: ExternalChangeUri): void {
-    this.schedule(uri, 'change');
+    this.schedule(uri, 'present');
   }
 
   handleDelete(uri: ExternalChangeUri): void {
-    if (this.disposed) {
-      return;
-    }
-
-    const key = normalizeUriKey(uri);
-    this.invalidate(key);
-
-    try {
-      this.options.onDelete(key);
-    } catch (error) {
-      this.report(error);
-    }
+    this.schedule(uri, 'absent');
   }
 
   invalidate(key: string): void {
@@ -81,7 +77,6 @@ export class ExternalChangeDetector {
 
     this.nextRevision(key);
     this.debouncer.cancel(key);
-    this.pendingCreates.delete(key);
   }
 
   dispose(): void {
@@ -92,40 +87,36 @@ export class ExternalChangeDetector {
     this.disposed = true;
     this.debouncer.dispose();
     this.revisions.clear();
-    this.pendingCreates.clear();
   }
 
-  private schedule(uri: ExternalChangeUri, kind: ExternalChangeKind): void {
+  private schedule(uri: ExternalChangeUri, kind: ExternalChangeCandidate['kind']): void {
     if (this.disposed) {
       return;
     }
 
     const key = normalizeUriKey(uri);
-    if (this.recentSaves.consume(key, this.now())) {
-      this.pendingCreates.delete(key);
+    if (kind === 'present' && this.recentSaves.consume(key, this.now())) {
+      this.invalidate(key);
       return;
     }
 
     try {
-      if (kind === 'create') {
-        this.pendingCreates.add(key);
-      }
-      const effectiveKind: ExternalChangeKind = this.pendingCreates.has(key) ? 'create' : 'change';
       const revision = this.nextRevision(key);
       const delayMs = this.options.settings().debounceMs;
       this.debouncer.schedule(key, delayMs, () => {
-        void this.process(uri, key, revision, effectiveKind);
+        void (kind === 'present'
+          ? this.processPresent(uri, key, revision)
+          : this.processAbsent(uri, key, revision));
       });
     } catch (error) {
       this.report(error);
     }
   }
 
-  private async process(
+  private async processPresent(
     uri: ExternalChangeUri,
     key: string,
     revision: number,
-    kind: ExternalChangeKind,
   ): Promise<void> {
     try {
       const initialSettings = this.options.settings();
@@ -171,10 +162,32 @@ export class ExternalChangeDetector {
         return;
       }
 
-      await this.options.onComparison(key, text, kind);
+      await this.options.onCandidate({ kind: 'present', key, uri, text });
+    } catch (error) {
       if (this.isCurrent(key, revision)) {
-        this.pendingCreates.delete(key);
+        this.report(error);
       }
+    }
+  }
+
+  private async processAbsent(
+    uri: ExternalChangeUri,
+    key: string,
+    revision: number,
+  ): Promise<void> {
+    try {
+      const settings = this.options.settings();
+      const relativePath = this.options.relativePath(uri);
+      if (!isEligibleFile({
+        scheme: uri.scheme,
+        relativePath,
+        text: '',
+        sizeBytes: 0,
+      }, settings) || !this.isCurrent(key, revision)) {
+        return;
+      }
+
+      await this.options.onCandidate({ kind: 'absent', key, uri });
     } catch (error) {
       if (this.isCurrent(key, revision)) {
         this.report(error);
