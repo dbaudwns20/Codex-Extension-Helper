@@ -1474,12 +1474,16 @@ export class ExtensionRuntime implements vscode.Disposable {
     return relativePath;
   }
 
-  private resolveWorkspacePath(relativePath: string): vscode.Uri | undefined {
-    if (!this.validRelativePath(relativePath)) return undefined;
+  private resolveWorkspacePath(filePath: string): vscode.Uri | undefined {
+    if (filePath.startsWith('/')) {
+      const uri = vscode.Uri.file(filePath);
+      return this.workspaceRelativePath(uri) === undefined ? undefined : uri;
+    }
+    if (!this.validRelativePath(filePath)) return undefined;
     const folders = vscode.workspace.workspaceFolders ?? [];
     if (folders.length !== 1 || folders[0].uri.scheme !== 'file') return undefined;
-    const uri = vscode.Uri.joinPath(folders[0].uri, ...relativePath.split('/'));
-    return this.workspaceRelativePath(uri) === relativePath ? uri : undefined;
+    const uri = vscode.Uri.joinPath(folders[0].uri, ...filePath.split('/'));
+    return this.workspaceRelativePath(uri) === filePath ? uri : undefined;
   }
 
   private validRelativePath(relativePath: string): boolean {

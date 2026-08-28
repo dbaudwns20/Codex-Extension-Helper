@@ -536,6 +536,14 @@ function installRuntimeVscode(initialText = 'before\n') {
     TabInputText: FakeTabInputText,
     EndOfLine: { LF: 1, CRLF: 2 },
     Uri: {
+      file(filePath: string) {
+        return {
+          ...uri,
+          path: filePath,
+          fsPath: filePath,
+          toString: () => `file://${filePath}`,
+        };
+      },
       joinPath(root: typeof uri, ...segments: string[]) {
         const joinedPath = path.posix.join(root.path, ...segments);
         return {
@@ -712,6 +720,59 @@ describe('packaged runtime', () => {
 
       expect(runtime.comparisonCount).toBe(1);
       expect(fake.quickDiffBaseline()).toBe('before\n');
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows an exact Codex update emitted with an absolute workspace path', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+      const notification = completedUpdate('before', 'after');
+      notification.params.item.changes[0].path = '/workspace/file.ts';
+
+      await sendCodexNotification(fake, notification);
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(1);
+      expect(fake.quickDiffBaseline()).toBe('before\n');
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores a Codex notification emitted with an absolute path outside the workspace', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+      const notification = completedUpdate('before', 'after');
+      notification.params.item.changes[0].path = '/outside/file.ts';
+
+      await sendCodexNotification(fake, notification);
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await settleRuntime();
+
+      expect(runtime.comparisonCount).toBe(0);
       runtime.dispose();
     } finally {
       vi.useRealTimers();

@@ -59,10 +59,19 @@ function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
 
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function validTimestamp(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
 function validPath(value: unknown): value is string {
   if (!nonEmptyString(value) || value.includes('\0') || value.includes('\\')) return false;
-  if (value.startsWith('/') || /^[A-Za-z]:\//u.test(value)) return false;
-  return value.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+  if (/^[A-Za-z]:\//u.test(value)) return false;
+  const segments = value.startsWith('/') ? value.slice(1).split('/') : value.split('/');
+  return segments.every((segment) => segment !== '' && segment !== '.' && segment !== '..');
 }
 
 function parseKind(value: unknown): CodexFileChangeKind | undefined {
@@ -103,7 +112,10 @@ export function parseCodexProvenanceNotification(
   value: unknown,
   limits: { maxChanges: number; maxDiffBytes: number } = DEFAULT_LIMITS,
 ): CodexProvenanceNotification | undefined {
-  if (!validLimits(limits) || !plainObject(value) || !exactKeys(value, ['method', 'params'])) return undefined;
+  if (!validLimits(limits) || !plainObject(value)) return undefined;
+  const hasEmittedAtMs = hasOwn(value, 'emittedAtMs');
+  if (!exactKeys(value, hasEmittedAtMs ? ['method', 'params', 'emittedAtMs'] : ['method', 'params'])
+    || (hasEmittedAtMs && !validTimestamp(value.emittedAtMs))) return undefined;
   if (value.method === 'item/fileChange/patchUpdated') {
     const params = value.params;
     if (!plainObject(params) || !exactKeys(params, ['threadId', 'turnId', 'itemId', 'changes'])
@@ -113,7 +125,12 @@ export function parseCodexProvenanceNotification(
   }
   if (value.method === 'item/completed') {
     const params = value.params;
-    if (!plainObject(params) || !exactKeys(params, ['threadId', 'turnId', 'item'])
+    if (!plainObject(params)) return undefined;
+    const hasCompletedAtMs = hasOwn(params, 'completedAtMs');
+    if (!exactKeys(params, hasCompletedAtMs
+      ? ['threadId', 'turnId', 'item', 'completedAtMs']
+      : ['threadId', 'turnId', 'item'])
+      || (hasCompletedAtMs && !validTimestamp(params.completedAtMs))
       || !nonEmptyString(params.threadId) || !nonEmptyString(params.turnId) || !plainObject(params.item)
       || !exactKeys(params.item, ['id', 'type', 'status', 'changes']) || !nonEmptyString(params.item.id)
       || params.item.type !== 'fileChange' || typeof params.item.status !== 'string'

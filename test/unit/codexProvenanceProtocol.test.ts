@@ -24,10 +24,55 @@ const completed = (status = 'completed', overrides: Record<string, unknown> = {}
   },
 });
 
+const timestampedCompleted = (emittedAtMs: unknown, completedAtMs: unknown) => ({
+  method: 'item/completed',
+  emittedAtMs,
+  params: {
+    threadId: 'thread-1',
+    turnId: 'turn-1',
+    completedAtMs,
+    item: {
+      id: 'item-1',
+      type: 'fileChange',
+      status: 'completed',
+      changes: [change],
+    },
+  },
+});
+
 describe('parseCodexProvenanceNotification', () => {
+  it('accepts the current timestamped completed notification envelope', () => {
+    expect(parseCodexProvenanceNotification(timestampedCompleted(
+      1_777_777_777_000,
+      1_777_777_776_000,
+    ))).toMatchObject({
+      method: 'item/completed',
+      params: { item: { status: 'completed' } },
+    });
+  });
+
+  it.each([
+    ['emission', -1, 1_777_777_776_000],
+    ['completion', 1_777_777_777_000, 1.5],
+  ])('rejects an invalid %s timestamp', (_label, emittedAtMs, completedAtMs) => {
+    expect(parseCodexProvenanceNotification(
+      timestampedCompleted(emittedAtMs, completedAtMs),
+    )).toBeUndefined();
+  });
+
   it('accepts a valid patch update', () => {
     expect(parseCodexProvenanceNotification(patchUpdated())).toMatchObject({
       method: 'item/fileChange/patchUpdated',
+    });
+  });
+
+  it('accepts the absolute POSIX path emitted by the current Codex extension', () => {
+    const path = '/workspace/src/file.ts';
+
+    expect(parseCodexProvenanceNotification(patchUpdated({
+      changes: [{ ...change, path }],
+    }))).toMatchObject({
+      params: { changes: [{ path }] },
     });
   });
 
@@ -57,7 +102,7 @@ describe('parseCodexProvenanceNotification', () => {
   });
 
   it('rejects invalid paths and extra or invalid kind fields', () => {
-    for (const path of ['', '/absolute.ts', '../escape.ts', 'src/../escape.ts', 'src\\file.ts', 'src/\u0000.ts']) {
+    for (const path of ['', '../escape.ts', 'src/../escape.ts', 'src\\file.ts', 'src/\u0000.ts']) {
       expect(parseCodexProvenanceNotification(patchUpdated({ changes: [{ ...change, path }] }))).toBeUndefined();
     }
     expect(parseCodexProvenanceNotification(patchUpdated({
