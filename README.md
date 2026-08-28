@@ -96,7 +96,7 @@ From the repository root:
 ```bash
 npm ci
 npm run package
-code --install-extension ./codex-extension-helper-0.0.3.vsix --force
+code --install-extension ./codex-extension-helper-0.0.4.vsix --force
 ```
 
 `npm run package` compiles the extension, runs the unit test suite, and creates
