@@ -4,11 +4,19 @@ import type { ChangeHunk } from './types';
 import type { InstalledSpacerPresentation } from './temporaryLineSpacers';
 export { DeletedLinesCodeLensProvider } from './deletedLinesCodeLensProvider';
 
+const INSET_WARNING = 'Codex Changes needs the editorInsets API to render deleted lines without modifying the document. Restart VS Code Stable with --enable-proposed-api=local.codex-extension-helper.';
 interface InlineRendererApi {
   readonly window: {
     readonly visibleTextEditors: readonly vscode.TextEditor[];
     readonly tabGroups: Pick<vscode.TabGroups, 'all'>;
     createTextEditorDecorationType(options: vscode.DecorationRenderOptions): vscode.TextEditorDecorationType;
+    createWebviewTextEditorInset?: (
+      editor: vscode.TextEditor,
+      line: number,
+      height: number,
+      options?: vscode.WebviewOptions,
+    ) => EditorInset;
+    showWarningMessage?(message: string): Thenable<string | undefined>;
   };
   readonly Range: typeof vscode.Range;
   readonly ThemeColor: typeof vscode.ThemeColor;
@@ -17,8 +25,14 @@ interface InlineRendererApi {
   readonly TabInputText: typeof vscode.TabInputText;
 }
 
+interface EditorInset {
+  readonly webview: Pick<vscode.Webview, 'html'>;
+  dispose(): void;
+}
+
 interface ViewResources {
   readonly editor: vscode.TextEditor;
+  readonly insets: EditorInset[];
 }
 
 /** Kept as a compatibility boundary for callers created by older builds. */
@@ -36,7 +50,7 @@ export interface InsetPlacement {
   height: number;
 }
 
-/** Legacy pure helper retained for consumers; Stable rendering does not use editor insets. */
+/** Calculates the editor-inset anchor and height for deleted source rows. */
 export function insetPlacementForHunk(hunk: ChangeHunk, modifiedLineCount: number): InsetPlacement {
   const insertionLine = Math.min(
     Math.max(0, hunk.modifiedStart),
@@ -45,7 +59,7 @@ export function insetPlacementForHunk(hunk: ChangeHunk, modifiedLineCount: numbe
   return { anchorLine: insertionLine - 1, height: hunk.originalLines.length };
 }
 
-/** Legacy pure helper retained for compatibility with existing consumers. */
+/** Escapes deleted source text before embedding it in inset HTML. */
 export function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (character) => {
     switch (character) {
@@ -58,13 +72,15 @@ export function escapeHtml(value: string): string {
   });
 }
 
-/** Legacy pure helper retained for compatibility; no webview is created on Stable. */
-export function buildDeletedLinesHtml(lines: readonly string[], originalStart: number): string {
-  const rows = lines.map((line, index) => {
-    const lineNumber = Math.max(0, originalStart) + index + 1;
-    return `<div class="line"><span class="gutter">${lineNumber}</span><span class="code">${escapeHtml(line)}</span></div>`;
-  }).join('');
-  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';"><style>html, body { margin: 0; padding: 0; color: var(--vscode-editor-foreground); background: var(--vscode-diffEditor-removedTextBackground, rgba(255, 0, 0, 0.2)); font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); }.line { display: flex; min-height: var(--vscode-editor-line-height); white-space: pre; tab-size: var(--vscode-editor-tabSize, 4); }.gutter { min-width: 4ch; padding-right: 1ch; color: var(--vscode-editorLineNumber-foreground); text-align: right; }.code { flex: 1; }</style></head><body>${rows}</body></html>`;
+/** Builds the deleted-row inset content. */
+export function buildDeletedLinesHtml(
+  lines: readonly string[],
+  _originalStart: number,
+): string {
+  const rows = lines.map((line) => (
+    `<div class="line"><span class="code">${escapeHtml(line)}</span></div>`
+  )).join('');
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';"><style>html, body { margin: 0; padding: 0; color: var(--vscode-editor-foreground); background: var(--vscode-diffEditor-removedTextBackground, rgba(255, 0, 0, 0.2)); font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); }.line { display: flex; min-height: var(--vscode-editor-line-height); white-space: pre; tab-size: var(--vscode-editor-tabSize, 4); }.code { flex: 1; }</style></head><body>${rows}</body></html>`;
 }
 
 export class InlineRenderer implements ComparisonView, vscode.Disposable {
@@ -78,7 +94,7 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
     private readonly api: InlineRendererApi,
     private readonly output: Pick<vscode.OutputChannel, 'appendLine'>,
     private readonly uriKey: (uri: vscode.Uri) => string = (uri) => uri.toString(),
-    _sessionState: InlineRendererSessionState = createInlineRendererSessionState(),
+    private readonly sessionState: InlineRendererSessionState = createInlineRendererSessionState(),
   ) {
     this.addedDecorationType = api.window.createTextEditorDecorationType({
       isWholeLine: true,
@@ -106,8 +122,22 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
     hunks: readonly ChangeHunk[],
     presentation?: InstalledSpacerPresentation,
   ): Promise<void> {
-    if (this.disposed) {
+    if (this.disposed || this.sessionState.renderingDisabled) {
       return;
+    }
+
+    let createInset: InlineRendererApi['window']['createWebviewTextEditorInset'];
+    if (presentation === undefined && hunks.some((hunk) => hunk.originalLines.length > 0)) {
+      try {
+        createInset = this.api.window.createWebviewTextEditorInset;
+      } catch (error) {
+        this.disableRendering(error);
+        return;
+      }
+      if (typeof createInset !== 'function') {
+        this.disableRendering(new Error('window.createWebviewTextEditorInset is unavailable'));
+        return;
+      }
     }
 
     this.clear(key);
@@ -118,7 +148,8 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
 
     try {
       for (const editor of editors) {
-        views.push({ editor });
+        const insets: EditorInset[] = [];
+        views.push({ editor, insets });
         editor.setDecorations(this.addedDecorationType, this.greenRanges(hunks, presentation));
         editor.setDecorations(
           this.removedRowDecorationType,
@@ -128,6 +159,28 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
           this.removedOverlayDecorationType,
           [],
         );
+        if (
+          presentation === undefined
+          && typeof createInset === 'function'
+        ) {
+          for (const hunk of hunks) {
+            if (hunk.originalLines.length === 0) {
+              continue;
+            }
+            const placement = insetPlacementForHunk(hunk, editor.document.lineCount);
+            const inset = createInset.call(
+              this.api.window,
+              editor,
+              placement.anchorLine,
+              placement.height,
+            );
+            insets.push(inset);
+            inset.webview.html = buildDeletedLinesHtml(
+              hunk.originalLines,
+              hunk.originalStart,
+            );
+          }
+        }
       }
       if (views.length > 0) {
         this.resources.set(key, views);
@@ -136,6 +189,9 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
       this.log('InlineRenderer', error);
       for (const view of views) {
         this.clearEditor(view.editor);
+        for (const inset of view.insets) {
+          this.cleanup('dispose editor inset', () => inset.dispose());
+        }
       }
     }
   }
@@ -152,6 +208,9 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
     this.resources.delete(key);
     for (const view of views) {
       this.clearEditor(view.editor);
+      for (const inset of view.insets) {
+        this.cleanup('dispose editor inset', () => inset.dispose());
+      }
     }
   }
 
@@ -227,6 +286,23 @@ export class InlineRenderer implements ComparisonView, vscode.Disposable {
       this.log('InlineRendererCleanup', new Error(
         `${operation}: ${error instanceof Error ? error.message : String(error)}`,
       ));
+    }
+  }
+
+  private disableRendering(error: unknown): void {
+    if (this.sessionState.renderingDisabled) {
+      return;
+    }
+    this.sessionState.renderingDisabled = true;
+    this.log('InlineRenderer', error);
+    this.clearAll();
+    if (!this.sessionState.warningShown) {
+      this.sessionState.warningShown = true;
+      try {
+        void this.api.window.showWarningMessage?.(INSET_WARNING);
+      } catch (warningError) {
+        this.log('InlineRendererWarning', warningError);
+      }
     }
   }
 

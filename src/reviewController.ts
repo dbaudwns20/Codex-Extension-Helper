@@ -50,8 +50,8 @@ interface ResolvedHunkAction {
 const REJECT_ERROR = 'Could not reject Codex changes.';
 const REJECT_SCOPE = 'Reject Codex changes';
 const SYNCHRONIZE_SCOPE = 'Synchronize Codex review state';
-const APPROVE_DELETED_ERROR = 'Could not approve the deleted Codex file.';
-const APPROVE_DELETED_SCOPE = 'Approve deleted Codex file';
+const APPROVE_DELETED_ERROR = 'Could not accept the deleted Codex file.';
+const APPROVE_DELETED_SCOPE = 'Accept deleted Codex file';
 
 export class ReviewController implements vscode.Disposable {
   private readonly mutationTails = new Map<string, Promise<void>>();
@@ -72,7 +72,7 @@ export class ReviewController implements vscode.Disposable {
       try {
         await this.approveFile(uri);
       } catch (error) {
-        this.host.log('Approve all Codex files', error);
+        this.host.log('Accept all Codex files', error);
       }
     }
   }

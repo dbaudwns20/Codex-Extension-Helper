@@ -3,7 +3,7 @@
 Codex Extension Helper is a private, unofficial VS Code extension for reviewing
 exactly proven Codex file changes directly in the normal editable editor. It
 compares a qualifying disk change with the last in-memory snapshot, highlights
-additions and deletions, and lets you approve or reject changes by hunk, file,
+additions and deletions, and lets you accept or reject changes by hunk, file,
 or across the current workspace.
 
 The extension also includes optional tools for inserting Explorer files and
@@ -18,17 +18,18 @@ sponsored by OpenAI.
 - Deleted lines appear in translucent red at their former location without
   becoming part of the document text.
 - Empty deleted lines remain visually empty; no placeholder text is inserted.
-- Each change exposes **Approve** and **Reject** CodeLens actions.
-- The editor title provides previous/next navigation plus **Approve All** and
+- Each change exposes clickable **Accept** and **Reject** actions at the end of
+  the affected source line.
+- The editor title provides previous/next navigation plus **Accept All** and
   **Reject All** while the active file has pending changes.
 - Quick Diff gutter markers open VS Code's native comparison view, and
   **Codex Changes: Open Full Diff** opens the complete file diff.
-- Saving accepts the current document as the new baseline and clears its review
-  state.
+- Saving writes the document without clearing its active review state.
 
-VS Code Stable does not expose an editor-inset API. Deleted content is rendered
-with decorations, so the review UI does not add persistent text to the file or
-make the document dirty. Review actions operate on the canonical file content.
+Deleted content is rendered through VS Code's proposed `editorInsets` API. The
+review UI never inserts presentation-only rows into the text buffer, so an open
+file modified by Codex stays clean instead of showing an unsaved `●`. Review
+actions operate on the canonical file content.
 
 ### Source Control review
 
@@ -36,10 +37,10 @@ The `Codex Changes` Source Control provider appears only while pending changes
 exist and lists every affected file.
 
 - Clicking a file opens its full diff.
-- File-row **Approve File** and **Reject File** actions process that file.
-- Provider-title **Approve All Files** and **Reject All Files** actions process
+- File-row **Accept File** and **Reject File** actions process that file.
+- Provider-title **Accept All Files** and **Reject All Files** actions process
   every file currently listed.
-- A background file can be approved or rejected without first making it the
+- A background file can be accepted or rejected without first making it the
   active editor.
 
 ### Codex Explorer `@` mentions
@@ -61,11 +62,11 @@ review begins.
 
 | Action | Result |
 | --- | --- |
-| **Approve** | Keeps the selected change and advances that part of the in-memory baseline without saving. |
+| **Accept** | Keeps the selected change and advances that part of the in-memory baseline without saving. |
 | **Reject** | Restores the selected baseline content as an ordinary unsaved editor edit. |
-| **Approve All** | Keeps every change in the selected file without saving. |
+| **Accept All** | Keeps every change in the selected file without saving. |
 | **Reject All** | Restores the complete file baseline as an unsaved edit. |
-| **Approve All Files** | Accepts all files currently listed in `Codex Changes`. |
+| **Accept All Files** | Accepts all files currently listed in `Codex Changes`. |
 | **Reject All Files** | Restores all files currently listed in `Codex Changes`. |
 
 Rejecting all changes in a newly created file moves that file to the operating
@@ -83,11 +84,39 @@ silently becomes the new baseline and clears any active review for that path.
 
 ## Requirements
 
-- VS Code 1.101.1 or newer.
+- VS Code Stable 1.135.0 or newer, launched with proposed API access for this extension.
 - Node.js and npm for building from source.
 - macOS for automatic Explorer-to-Codex `@` mention insertion.
 - The OpenAI Codex VS Code extension for Codex mention and provenance bridge
   features.
+
+### Enable editor insets on VS Code Stable
+
+This personal extension uses the proposed `editorInsets` API so deleted rows can
+occupy real visual space without editing the document. After installation, the
+extension detects when the API is unavailable and offers a **명령 실행** action.
+Accepting it opens an integrated terminal in the workspace and runs:
+
+```bash
+code . --enable-proposed-api=local.codex-extension-helper
+```
+
+The command can open a new VS Code window; it does not close the existing
+window. Dismissing the prompt runs nothing, and the extension offers it again
+after the next VS Code start while the API remains unavailable.
+
+For persistent access, run **Preferences: Configure Runtime Arguments** and add
+the extension identifier to the `enable-proposed-api` array, then restart VS
+Code:
+
+```json
+{
+  "enable-proposed-api": ["local.codex-extension-helper"]
+}
+```
+
+If access is missing or a future VS Code build removes the proposal, the helper
+shows one warning and does not fall back to modifying the document.
 
 ## Build, package, and install
 
@@ -96,7 +125,7 @@ From the repository root:
 ```bash
 npm ci
 npm run package
-code --install-extension ./codex-extension-helper-0.0.4.vsix --force
+code --install-extension ./codex-extension-helper-0.0.5.vsix --force
 ```
 
 `npm run package` compiles the extension, runs the unit test suite, and creates
@@ -239,7 +268,8 @@ npm run watch
 
 Then run the **Run Extension (Stable)** launch configuration. The watcher runs
 TypeScript checking in no-emit mode while esbuild rebuilds the bundled
-`out/src/extension.js` runtime.
+`out/src/extension.js` runtime. The launch configuration enables the
+`editorInsets` proposal for this extension.
 
 Useful commands:
 
@@ -276,9 +306,10 @@ or regulated data.
 - Codex shell-command writes without a completed `fileChange` item are hidden.
 - The provenance bridge is version-sensitive and must be explicitly installed
   again when a compatible Codex update replaces the extension-host bundle.
-- Deleted decorations cannot reserve true editor rows and may be less distinct
-  in dense or folded code.
-- `editor.codeLens` must remain enabled for per-change Approve/Reject actions.
+- The proposed `editorInsets` API is version-sensitive. A VS Code update can
+  require a compatible extension update before deleted rows render again.
+- Editor inlay hints must remain enabled for per-change **Accept**/**Reject**
+  actions.
 - Diff editors, custom editors, binary or undecodable content, oversized files,
   excluded paths, and non-file resources do not render inline comparisons.
 - Codex patch compatibility depends on the installed Codex bundle layout. An
@@ -295,9 +326,12 @@ If no review UI appears:
 2. Confirm the path is not excluded and the file is below the size limit.
 3. For an existing file, open it before the external write so an in-memory
    baseline exists.
-4. Confirm `editor.codeLens` is enabled if only hunk actions are missing.
-5. Use a gutter marker or **Codex Changes: Open Full Diff** when inline deleted
-   decorations are hard to distinguish.
+4. Confirm editor inlay hints are enabled if only hunk actions are missing.
+5. Confirm VS Code was launched with
+   `--enable-proposed-api=local.codex-extension-helper` if deleted rows are
+   missing.
+6. Use a gutter marker or **Codex Changes: Open Full Diff** when inline deleted
+   rows are hard to distinguish.
 
 Also run **Codex Helper: Show Exact Provenance Bridge Status**. If the bridge is
 not installed, install it explicitly and reload VS Code. If status reports a

@@ -59,13 +59,18 @@ function state(overrides: Partial<ReviewCodeLensState>): ReviewCodeLensState {
 function createProvider() {
   const registration = { dispose: vi.fn() };
   const emitter = new FakeEventEmitter();
+  const registerCodeLensProvider = vi.fn(() => registration);
+  const registerInlayHintsProvider = vi.fn(() => registration);
   const provider = new DeletedLinesCodeLensProvider({
-    languages: { registerCodeLensProvider: vi.fn(() => registration) },
+    languages: {
+      registerCodeLensProvider,
+      registerInlayHintsProvider,
+    },
     EventEmitter: vi.fn(() => emitter) as unknown as typeof FakeEventEmitter,
     Range: FakeRange,
     CodeLens: FakeCodeLens,
   } as never, (uri: { toString(): string }) => uri.toString());
-  return { provider, emitter, registration };
+  return { provider, emitter, registration, registerCodeLensProvider, registerInlayHintsProvider };
 }
 
 function provide(provider: DeletedLinesCodeLensProvider, lineCount = 5): Lens[] {
@@ -77,6 +82,13 @@ function provide(provider: DeletedLinesCodeLensProvider, lineCount = 5): Lens[] 
 }
 
 describe('DeletedLinesCodeLensProvider', () => {
+  it('registers review actions as CodeLens controls above the changed line', () => {
+    const { provider, registerCodeLensProvider, registerInlayHintsProvider } = createProvider();
+
+    expect(registerCodeLensProvider).toHaveBeenCalledWith({ scheme: 'file' }, provider);
+    expect(registerInlayHintsProvider).not.toHaveBeenCalled();
+  });
+
   it('emits approve and reject lenses for an addition-only hunk', () => {
     const { provider } = createProvider();
     provider.update(state({ hunks: [hunk({ modifiedLines: ['new'] })] }));
@@ -88,7 +100,7 @@ describe('DeletedLinesCodeLensProvider', () => {
       'codexExtensionHelper.rejectHunk',
     ]);
     expect(lenses.map((lens) => lens.command?.title)).toEqual([
-      '$(check) Approve',
+      '$(check) Accept',
       '$(close) Reject',
     ]);
     expect(lenses[0].command?.arguments).toEqual([{
@@ -101,7 +113,7 @@ describe('DeletedLinesCodeLensProvider', () => {
     expect(lenses[0].command?.arguments?.[0]).toBe(lenses[1].command?.arguments?.[0]);
   });
 
-  it('shows only review actions when deleted content has a spacer row', () => {
+  it('uses the same native review actions for a hunk containing deleted content', () => {
     const { provider } = createProvider();
     provider.update(state({ hunks: [hunk({
       kind: 'modification',
@@ -112,32 +124,49 @@ describe('DeletedLinesCodeLensProvider', () => {
 
     const lenses = provide(provider);
 
-    expect(lenses.map((lens) => lens.command?.command)).toEqual([
-      'codexExtensionHelper.approveHunk',
-      'codexExtensionHelper.rejectHunk',
-    ]);
     expect(lenses.map((lens) => lens.command?.title)).toEqual([
-      '$(check) Approve',
+      '$(check) Accept',
       '$(close) Reject',
     ]);
     expect(lenses.map((lens) => lens.range)).toEqual([
       new FakeRange(3, 6, 3, 6),
       new FakeRange(3, 6, 3, 6),
     ]);
-    expect(lenses[0].command?.arguments).toEqual([{
-      key,
-      sourceRevision: 7,
-      hunkIndex: 0,
-      expectedText: 'new\n',
-    }]);
-    expect(lenses[1].command?.arguments).toEqual(lenses[0].command?.arguments);
+    expect(lenses.map((lens) => lens.command?.arguments?.[0])).toEqual([
+      expect.objectContaining({ hunkIndex: 0 }),
+      expect.objectContaining({ hunkIndex: 0 }),
+    ]);
   });
 
-  it('preserves hunk order without replacing deleted rows with a CodeLens summary', () => {
+  it('preserves hunk order when deletion and addition actions are mixed', () => {
+    const { provider } = createProvider();
+    provider.update(state({ hunks: [
+      hunk({
+        kind: 'deletion',
+        originalEnd: 1,
+        originalLines: ['old'],
+        modifiedEnd: 0,
+        modifiedLines: [],
+      }),
+      hunk({ modifiedStart: 3, modifiedEnd: 4, modifiedLines: ['added'] }),
+    ] }));
+
+    const lenses = provide(provider);
+
+    expect(lenses).toHaveLength(4);
+    expect(lenses.map((lens) => lens.command?.arguments?.[0])).toEqual([
+      expect.objectContaining({ hunkIndex: 0 }),
+      expect.objectContaining({ hunkIndex: 0 }),
+      expect.objectContaining({ hunkIndex: 1 }),
+      expect.objectContaining({ hunkIndex: 1 }),
+    ]);
+  });
+
+  it('preserves hunk order for addition-only CodeLens actions', () => {
     const { provider } = createProvider();
     provider.update(state({ currentText: 'new\nother\n', hunks: [
       hunk({ modifiedStart: 0, modifiedLines: ['new'] }),
-      hunk({ modifiedStart: 4, originalLines: ['old'], modifiedLines: ['other'] }),
+      hunk({ modifiedStart: 4, modifiedLines: ['other'] }),
     ] }));
 
     const lenses = provide(provider, 8);
@@ -161,7 +190,7 @@ describe('DeletedLinesCodeLensProvider', () => {
 
   it('clamps negative modified starts to the first document line', () => {
     const { provider } = createProvider();
-    provider.update(state({ hunks: [hunk({ modifiedStart: -4, originalLines: ['old'] })] }));
+    provider.update(state({ hunks: [hunk({ modifiedStart: -4 })] }));
 
     const [approve] = provide(provider, 5);
 
@@ -170,7 +199,7 @@ describe('DeletedLinesCodeLensProvider', () => {
 
   it('clamps past-end modified starts to the final document line', () => {
     const { provider } = createProvider();
-    provider.update(state({ hunks: [hunk({ modifiedStart: 99, originalLines: ['old'] })] }));
+    provider.update(state({ hunks: [hunk({ modifiedStart: 99 })] }));
 
     const [approve] = provide(provider, 5);
 

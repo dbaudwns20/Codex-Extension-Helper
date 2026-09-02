@@ -2,13 +2,16 @@
   "name": "codex-extension-helper",
   "displayName": "Codex Extension Helper",
   "description": "Show external file changes inline in VS Code editors.",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "private": true,
   "license": "SEE LICENSE IN LICENSE",
   "publisher": "local",
   "engines": {
-    "vscode": "^1.101.1"
+    "vscode": "^1.135.0"
   },
+  "enabledApiProposals": [
+    "editorInsets"
+  ],
   "categories": [
     "Other"
   ],
@@ -24,7 +27,7 @@
       },
       {
         "command": "codexExtensionHelper.approveHunk",
-        "title": "Codex Changes: Approve Change"
+        "title": "Codex Changes: Accept Change"
       },
       {
         "command": "codexExtensionHelper.rejectHunk",
@@ -42,7 +45,7 @@
       },
       {
         "command": "codexExtensionHelper.approveAll",
-        "title": "Codex Changes: Approve All",
+        "title": "Codex Changes: Accept All",
         "icon": "$(check-all)"
       },
       {
@@ -52,7 +55,7 @@
       },
       {
         "command": "codexExtensionHelper.approveFile",
-        "title": "Approve File",
+        "title": "Accept File",
         "icon": "$(check)"
       },
       {
@@ -62,7 +65,7 @@
       },
       {
         "command": "codexExtensionHelper.approveAllFiles",
-        "title": "Approve All Files",
+        "title": "Accept All Files",
         "icon": "$(check-all)"
       },
       {

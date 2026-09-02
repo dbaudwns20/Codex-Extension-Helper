@@ -44,6 +44,7 @@ async function main(): Promise<void> {
       ['eof-approve.ts', 'export const eofApprove = true;'],
       ['eof-reject.ts', 'export const first = 1;\r\nexport const eofReject = true;\r\n'],
     ].map(([name, text]) => writeFile(path.join(workspacePath, name), text, 'utf8')));
+
     await withElectronRunAsNodeDisabled(process.env, async () => runTests({
         vscodeExecutablePath: await stableExecutable(),
         extensionDevelopmentPath,
@@ -54,6 +55,7 @@ async function main(): Promise<void> {
           '--disable-extensions',
           `--user-data-dir=${userDataPath}`,
           `--extensions-dir=${extensionsPath}`,
+          '--enable-proposed-api=local.codex-extension-helper',
         ],
       }));
   } finally {

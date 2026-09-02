@@ -2,6 +2,27 @@
 
 All notable changes to this personal extension are documented in this file.
 
+## 0.0.5 - 2026-09-01
+
+### Changed
+
+- After installation, Stable now offers to run the required
+  `code . --enable-proposed-api=local.codex-extension-helper` command when
+  editor insets are unavailable.
+- Saving a reviewed document no longer clears its pending `Codex Changes`.
+- Visible approval actions are now named **Accept**.
+- Per-change **Accept** and **Reject** actions now appear as clickable inlay
+  hints at the end of the affected source line instead of left-aligned
+  CodeLens actions.
+- Deleted rows now use the proposed `editorInsets` API on VS Code Stable 1.135+
+  so the review display does not modify the document or create an unsaved
+  dirty indicator.
+
+### Fixed
+
+- An open editor no longer becomes dirty merely because Codex changed its file
+  on disk and the inline deleted-row display was installed.
+
 ## 0.0.3 - 2026-08-26
 
 ### Added

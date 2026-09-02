@@ -79,7 +79,7 @@ export class DeletedLinesCodeLensProvider implements vscode.CodeLensProvider, vs
         expectedText: state.currentText,
       };
       lenses.push(new this.api.CodeLens(range, {
-        title: '$(check) Approve',
+        title: '$(check) Accept',
         command: APPROVE_HUNK_COMMAND,
         arguments: [reference],
       }));

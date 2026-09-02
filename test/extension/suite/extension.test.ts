@@ -62,12 +62,17 @@ async function hunkCommand(
   let found: vscode.Command | undefined;
   let signature: string | undefined;
   let stableSince = 0;
-  await waitFor(`${commandId} CodeLens`, async () => {
-    const lenses = await vscode.commands.executeCommand<vscode.CodeLens[]>(
-      'vscode.executeCodeLensProvider',
+  await waitFor(`${commandId} Inlay Hint`, async () => {
+    const lastLine = Math.max(0, document.lineCount - 1);
+    const range = new vscode.Range(0, 0, lastLine, document.lineAt(lastLine).range.end.character);
+    const hints = await vscode.commands.executeCommand<vscode.InlayHint[]>(
+      'vscode.executeInlayHintProvider',
       document.uri,
+      range,
     );
-    found = lenses?.find((lens) => lens.command?.command === commandId)?.command;
+    found = hints?.flatMap((hint) => (
+      typeof hint.label === 'string' ? [] : hint.label
+    )).find((part) => part.command?.command === commandId)?.command;
     if (found === undefined) {
       signature = undefined;
       stableSince = 0;
@@ -130,6 +135,11 @@ export async function runExtensionSmokeTest(): Promise<void> {
     await waitFor(`${description} buffer refresh`, () => fixture.document.getText() === currentText);
     await api.simulateExternalChange(fixture.uri, baselineText, currentText);
     await waitForReview(diagnostics, description);
+    assert.equal(
+      fixture.document.isDirty,
+      false,
+      `${description}: rendering Codex Changes must not dirty the open document`,
+    );
   };
 
   const approve = await openFixture('approve.ts');
@@ -232,7 +242,10 @@ export async function runExtensionSmokeTest(): Promise<void> {
   });
   assert.equal(edited, true, 'The source edit must apply before save');
   assert.equal(await saved.document.save(), true, 'The source document must save');
-  await waitForCleared(diagnostics, 'save to clear comparison UI and title context');
+  await waitForReview(diagnostics, 'save to preserve comparison UI and title context');
+  assert.equal(saved.document.isDirty, false, 'Saving must leave the reviewed document clean');
+  await vscode.commands.executeCommand('codexExtensionHelper.approveAll', saved.uri);
+  await waitForCleared(diagnostics, 'explicit Accept All to clear the saved comparison');
 
   const deleted = await openFixture('delete.ts');
   await simulateReview(

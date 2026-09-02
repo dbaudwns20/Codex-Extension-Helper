@@ -38,6 +38,21 @@ class FakeSelection {
   constructor(readonly anchor: unknown, readonly active: unknown) {}
 }
 
+class FakePosition {
+  constructor(readonly line: number, readonly character: number) {}
+}
+
+class FakeInlayHintLabelPart {
+  command?: { readonly command: string; readonly arguments?: readonly unknown[] };
+  tooltip?: unknown;
+  constructor(readonly value: string) {}
+}
+
+class FakeInlayHint {
+  paddingLeft = false;
+  constructor(readonly position: FakePosition, readonly label: FakeInlayHintLabelPart[]) {}
+}
+
 class FakeCodeLens {
   constructor(readonly range: unknown, readonly command?: {
     readonly command: string;
@@ -383,6 +398,23 @@ function installRuntimeVscode(initialText = 'before\n') {
   const createSourceControl = vi.fn(() => sourceControl);
   const contentProviders = new Map<string, { provideTextDocumentContent(uri: unknown): string }>();
   let codeLensProvider: { provideCodeLenses(document: unknown): FakeCodeLens[] } | undefined;
+  let inlayHintsProvider: {
+    provideInlayHints(document: unknown, range: unknown): FakeInlayHint[];
+  } | undefined;
+  const editorInsets: Array<{
+    webview: {
+      html: string;
+      onDidReceiveMessage(listener: (message: unknown) => unknown): { dispose(): void };
+    };
+    dispose: ReturnType<typeof vi.fn>;
+    receiveMessage(message: unknown): Promise<void>;
+  }> = [];
+  const terminals: Array<{
+    readonly name: string;
+    readonly cwd: unknown;
+    readonly sentTexts: string[];
+    shown: boolean;
+  }> = [];
   const window = {
     activeTextEditor: editor as typeof editor | typeof secondEditor | undefined,
     visibleTextEditors: [editor] as Array<typeof editor | typeof secondEditor>,
@@ -393,8 +425,44 @@ function installRuntimeVscode(initialText = 'before\n') {
       }],
     },
     createTextEditorDecorationType: vi.fn(() => ({ dispose: vi.fn() })),
+    createWebviewTextEditorInset: vi.fn(() => {
+      let listener: ((message: unknown) => unknown) | undefined;
+      const inset = {
+        webview: {
+          html: '',
+          onDidReceiveMessage(nextListener: (message: unknown) => unknown) {
+            listener = nextListener;
+            return { dispose: () => { listener = undefined; } };
+          },
+        },
+        dispose: vi.fn(),
+        async receiveMessage(message: unknown) {
+          await listener?.(message);
+        },
+      };
+      editorInsets.push(inset);
+      return inset;
+    }),
+    showWarningMessage: vi.fn().mockResolvedValue(undefined),
     showInformationMessage: vi.fn().mockResolvedValue(undefined),
     showErrorMessage: vi.fn().mockResolvedValue(undefined),
+    createTerminal: vi.fn((options: { name: string; cwd?: unknown }) => {
+      const terminal = {
+        name: options.name,
+        cwd: options.cwd,
+        sentTexts: [] as string[],
+        shown: false,
+        sendText(value: string) {
+          this.sentTexts.push(value);
+        },
+        show() {
+          this.shown = true;
+        },
+        dispose: vi.fn(),
+      };
+      terminals.push(terminal);
+      return terminal;
+    }),
     createOutputChannel: vi.fn(),
     onDidChangeVisibleTextEditors: event('visibleEditors'),
     onDidChangeActiveTextEditor: event('activeEditor'),
@@ -506,7 +574,9 @@ function installRuntimeVscode(initialText = 'before\n') {
     )),
     asRelativePath: vi.fn((resource: { path: string }) => resource.path.slice('/workspace/'.length)),
   };
-  const executeCommand = vi.fn().mockResolvedValue(undefined);
+  const executeCommand = vi.fn(async (command: string, ...args: any[]) => (
+    commands.get(command)?.(...args)
+  ));
   const output = { appendLine: vi.fn(), dispose: vi.fn() };
   window.createOutputChannel.mockReturnValue(output);
   Object.assign(vscodeMock, {
@@ -516,6 +586,10 @@ function installRuntimeVscode(initialText = 'before\n') {
     languages: {
       registerCodeLensProvider: vi.fn((_selector: unknown, provider: typeof codeLensProvider) => {
         codeLensProvider = provider;
+        return disposable();
+      }),
+      registerInlayHintsProvider: vi.fn((_selector: unknown, provider: typeof inlayHintsProvider) => {
+        inlayHintsProvider = provider;
         return disposable();
       }),
     },
@@ -531,6 +605,9 @@ function installRuntimeVscode(initialText = 'before\n') {
     WorkspaceEdit: FakeWorkspaceEdit,
     Range: FakeRange,
     CodeLens: FakeCodeLens,
+    Position: FakePosition,
+    InlayHint: FakeInlayHint,
+    InlayHintLabelPart: FakeInlayHintLabelPart,
     Selection: FakeSelection,
     ThemeColor: FakeThemeColor,
     TabInputText: FakeTabInputText,
@@ -563,6 +640,14 @@ function installRuntimeVscode(initialText = 'before\n') {
     callbacks,
     changesGroup,
     codeLenses() {
+      if (inlayHintsProvider !== undefined) {
+        return inlayHintsProvider.provideInlayHints(
+          document,
+          new FakeRange(0, 0, 999, 0),
+        ).flatMap((hint) => hint.label
+          .filter((part) => part.command !== undefined)
+          .map((part) => new FakeCodeLens(hint.position, part.command)));
+      }
       return codeLensProvider?.provideCodeLenses(document) ?? [];
     },
     commands,
@@ -597,6 +682,10 @@ function installRuntimeVscode(initialText = 'before\n') {
       });
     },
     editor,
+    editorInsets,
+    activeEditorInsets() {
+      return editorInsets.filter((inset) => inset.dispose.mock.calls.length === 0);
+    },
     executeCommand,
     output,
     fileText(resource: typeof uri = uri): string | undefined {
@@ -646,6 +735,7 @@ function installRuntimeVscode(initialText = 'before\n') {
       });
     },
     sourceControl,
+    terminals,
     uri,
     window,
     workspace,
@@ -667,6 +757,79 @@ async function sendCodexNotification(
 }
 
 describe('packaged runtime', () => {
+  it('offers and runs the Stable proposed-API launch command when editor insets are unavailable', async () => {
+    const fake = installRuntimeVscode();
+    (fake.window as { createWebviewTextEditorInset?: unknown }).createWebviewTextEditorInset = undefined;
+    fake.window.showWarningMessage.mockResolvedValueOnce('명령 실행');
+    const previousTestMode = process.env.CODEX_EXTENSION_HELPER_TEST;
+    process.env.CODEX_EXTENSION_HELPER_TEST = '1';
+    const context = { subscriptions: [] as { dispose(): unknown }[] };
+
+    try {
+      const { activate, deactivate } = await import('../../src/extension');
+      const api = activate(context as never);
+
+      await vi.waitFor(() => expect(fake.terminals).toHaveLength(1));
+      expect(fake.terminals[0]).toMatchObject({
+        cwd: fake.workspace.workspaceFolders[0].uri,
+        sentTexts: ['code . --enable-proposed-api=local.codex-extension-helper'],
+        shown: true,
+      });
+      expect(api).toBeDefined();
+      fake.setText('after\n');
+      await api?.simulateExternalChange(fake.uri as never, 'before\n', 'after\n');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(fake.window.showWarningMessage).toHaveBeenCalledOnce();
+
+      await deactivate();
+    } finally {
+      if (previousTestMode === undefined) delete process.env.CODEX_EXTENSION_HELPER_TEST;
+      else process.env.CODEX_EXTENSION_HELPER_TEST = previousTestMode;
+    }
+  });
+
+  it('does not offer a relaunch when editor insets are already available', async () => {
+    const fake = installRuntimeVscode();
+    const previousTestMode = process.env.CODEX_EXTENSION_HELPER_TEST;
+    process.env.CODEX_EXTENSION_HELPER_TEST = '1';
+    const context = { subscriptions: [] as { dispose(): unknown }[] };
+
+    try {
+      const { activate, deactivate } = await import('../../src/extension');
+      activate(context as never);
+      await Promise.resolve();
+
+      expect(fake.window.showWarningMessage).not.toHaveBeenCalled();
+      expect(fake.terminals).toHaveLength(0);
+
+      await deactivate();
+    } finally {
+      if (previousTestMode === undefined) delete process.env.CODEX_EXTENSION_HELPER_TEST;
+      else process.env.CODEX_EXTENSION_HELPER_TEST = previousTestMode;
+    }
+  });
+
+  it('does not run the proposed-API launch command when the installation prompt is dismissed', async () => {
+    const fake = installRuntimeVscode();
+    (fake.window as { createWebviewTextEditorInset?: unknown }).createWebviewTextEditorInset = undefined;
+    const previousTestMode = process.env.CODEX_EXTENSION_HELPER_TEST;
+    process.env.CODEX_EXTENSION_HELPER_TEST = '1';
+    const context = { subscriptions: [] as { dispose(): unknown }[] };
+
+    try {
+      const { activate, deactivate } = await import('../../src/extension');
+      activate(context as never);
+      await vi.waitFor(() => expect(fake.window.showWarningMessage).toHaveBeenCalledOnce());
+
+      expect(fake.terminals).toHaveLength(0);
+
+      await deactivate();
+    } finally {
+      if (previousTestMode === undefined) delete process.env.CODEX_EXTENSION_HELPER_TEST;
+      else process.env.CODEX_EXTENSION_HELPER_TEST = previousTestMode;
+    }
+  });
+
   it('registers patch commands without inspecting or installing the provenance bridge', async () => {
     const fake = installRuntimeVscode();
     const previousTestMode = process.env.CODEX_EXTENSION_HELPER_TEST;
@@ -1209,7 +1372,7 @@ describe('packaged runtime', () => {
     }
   });
 
-  it('proves exact disk bytes before a differing dirty document candidate clears them', async () => {
+  it('keeps exact review attribution while recomputing a differing dirty document', async () => {
     vi.useFakeTimers();
     try {
       const fake = installRuntimeVscode('before\n');
@@ -1236,8 +1399,12 @@ describe('packaged runtime', () => {
       const state = (runtime as unknown as {
         coordinator: { state(key: string): FileComparisonState | undefined };
       }).coordinator.state(fake.uri.toString());
-      expect(runtime.comparisonCount).toBe(0);
-      expect(state).toMatchObject({ baselineText: 'dirty document\n', provenance: undefined });
+      expect(runtime.comparisonCount).toBe(1);
+      expect(state).toMatchObject({
+        baselineText: 'before\n',
+        currentText: 'dirty document\n',
+        comparisonActive: true,
+      });
       runtime.dispose();
     } finally {
       vi.useRealTimers();
@@ -1413,7 +1580,7 @@ describe('packaged runtime', () => {
     }
   });
 
-  it('routes an unfenced live document edit through the gate and clears exact review state', async () => {
+  it('recomputes an active review after a live document edit without accepting it', async () => {
     vi.useFakeTimers();
     try {
       const fake = installRuntimeVscode('before\n');
@@ -1437,8 +1604,12 @@ describe('packaged runtime', () => {
       const state = (runtime as unknown as {
         coordinator: { state(key: string): FileComparisonState | undefined };
       }).coordinator.state(fake.uri.toString());
-      expect(runtime.comparisonCount).toBe(0);
-      expect(state).toMatchObject({ baselineText: 'user edit\n', provenance: undefined });
+      expect(runtime.comparisonCount).toBe(1);
+      expect(state).toMatchObject({
+        baselineText: 'before\n',
+        currentText: 'user edit\n',
+        comparisonActive: true,
+      });
       runtime.dispose();
     } finally {
       vi.useRealTimers();
@@ -1727,7 +1898,7 @@ describe('packaged runtime', () => {
     }
   });
 
-  it('installs a temporary deleted row while rendering a replacement diff', async () => {
+  it('renders a replacement diff without making the document dirty', async () => {
     vi.useFakeTimers();
     try {
       const modified = 'new line\nkeep\n';
@@ -1748,8 +1919,9 @@ describe('packaged runtime', () => {
       await settleRuntime();
 
       expect(runtime.renderedComparisonCount).toBe(1);
-      expect(fake.currentText()).toBe(`\n${modified}`);
-      expect(fake.document.isDirty).toBe(true);
+      expect(fake.currentText()).toBe(modified);
+      expect(fake.document.isDirty).toBe(false);
+      expect(fake.editorInsets).toHaveLength(1);
 
       runtime.dispose();
     } finally {
@@ -3049,42 +3221,13 @@ describe('stable review runtime boundaries', () => {
     const resource = { toString: () => key };
     const state = reviewState();
     const activeState = reviewState({ sourceRevision: 11 });
-    const presentation = {
-      key,
-      canonicalText: state.currentText,
-      displayText: '\nlive document\n',
-      documentVersion: 5,
-      revision: 1,
-      plan: {
-        canonicalText: state.currentText,
-        displayText: '\nlive document\n',
-        eol: '\n',
-        insertions: [{ offset: 0, length: 0, text: '\n' }],
-        spans: [{
-          displayStart: 0,
-          displayEnd: 1,
-          text: '\n',
-          hunkIndex: 0,
-          originalLineIndex: 0,
-          displayLine: 0,
-        }],
-        hunks: [{
-          hunkIndex: 0,
-          actionLine: 0,
-          removedRows: [{ line: 0, text: 'before' }],
-          modifiedStart: 1,
-          modifiedEnd: 2,
-        }],
-        displayLineForCanonical: vi.fn((line: number) => line + 1),
-      },
-    };
     const views = {
       renderer: { render: vi.fn().mockResolvedValue(undefined), clear: vi.fn() },
       deletedLines: { update: vi.fn(), clear: vi.fn() },
       quickDiff: { update: vi.fn(), clear: vi.fn() },
       activeContext: { update: vi.fn().mockResolvedValue(undefined) },
       spacers: {
-        install: vi.fn().mockResolvedValue(presentation),
+        install: vi.fn(),
         presentation: vi.fn(),
         clear: vi.fn(),
       },
@@ -3099,18 +3242,14 @@ describe('stable review runtime boundaries', () => {
       views,
     });
 
-    expect(views.spacers.install).toHaveBeenCalledWith({
-      key,
-      canonicalText: state.currentText,
-      hunks: state.hunks,
-    });
-    expect(views.renderer.render).toHaveBeenCalledWith(key, state.hunks, presentation);
+    expect(views.spacers.install).not.toHaveBeenCalled();
+    expect(views.renderer.render).toHaveBeenCalledWith(key, state.hunks);
     expect(views.deletedLines.update).toHaveBeenCalledWith({
       key,
       sourceRevision: 9,
       currentText: 'live document\n',
       hunks: state.hunks,
-      actionLines: [0],
+      actionLines: undefined,
     });
     expect(views.quickDiff.update).toHaveBeenCalledWith(
       key,
@@ -3160,62 +3299,37 @@ describe('stable review runtime boundaries', () => {
     expect(views.activeContext.update).toHaveBeenCalledWith(key, undefined);
   });
 
-  it('does not repaint stale review views after external acceptance during spacer installation', async () => {
+  it('does not repaint review views when the state guard is already stale', async () => {
     const { synchronizeReviewViews } = await import('../../src/extension');
     const key = 'file:///workspace/file.ts';
     const state = reviewState();
-    const store = new SnapshotStore();
-    store.seed(key, state.baselineText);
-    store.setComparison(key, state);
-    const coordinator = new ComparisonCoordinator(
-      { compute: () => [] },
-      store,
-      { render: async () => {}, clear: () => {}, clearAll: () => {} },
-    );
-    const presentation = { key } as never;
-    let currentPresentation: unknown;
-    let resolveInstall!: (installed: typeof presentation) => void;
-    const install = new Promise<typeof presentation>((resolve) => {
-      resolveInstall = resolve;
-    });
     const views = {
       renderer: { render: vi.fn().mockResolvedValue(undefined), clear: vi.fn() },
       deletedLines: { update: vi.fn(), clear: vi.fn() },
       quickDiff: { update: vi.fn(), clear: vi.fn() },
       activeContext: { update: vi.fn().mockResolvedValue(undefined) },
       spacers: {
-        install: vi.fn(async () => {
-          currentPresentation = await install;
-          return currentPresentation as typeof presentation;
-        }),
-        presentation: vi.fn(() => currentPresentation as never),
-        clear: vi.fn(async () => {
-          currentPresentation = undefined;
-          return { status: 'absent' as const };
-        }),
+        install: vi.fn(),
+        presentation: vi.fn(),
+        clear: vi.fn(),
       },
     };
 
-    const run = synchronizeReviewViews({
+    await synchronizeReviewViews({
       key,
       state,
       resource: { toString: () => key } as never,
       activeKey: key,
       activeState: state,
       views,
-      isCurrent: () => coordinator.state(key) === state,
+      isCurrent: () => false,
     });
-    await Promise.resolve();
-    await coordinator.acceptExternalState(key, 'unknown');
-    resolveInstall(presentation);
-    await run;
 
     expect(views.renderer.render).not.toHaveBeenCalled();
     expect(views.deletedLines.update).not.toHaveBeenCalled();
     expect(views.quickDiff.update).not.toHaveBeenCalled();
     expect(views.activeContext.update).not.toHaveBeenCalled();
-    expect(views.spacers.clear).toHaveBeenCalledWith(key);
-    expect(currentPresentation).toBeUndefined();
+    expect(views.spacers.install).not.toHaveBeenCalled();
   });
 
   it('clears file views while deriving title context from the unchanged active file', async () => {
@@ -3386,28 +3500,22 @@ describe('stable review runtime boundaries', () => {
       expect(fake.quickDiffBaseline()).toBe(baseline);
       expect(runtime.renderedComparisonCount).toBe(1);
 
-      const approveLenses = fake.codeLenses().filter(
-        (lens) => lens.command?.command === 'codexExtensionHelper.approveHunk',
-      );
-      expect(approveLenses).toHaveLength(2);
-      await fake.commands.get('codexExtensionHelper.approveHunk')!(
-        ...approveLenses[0].command!.arguments!,
-      );
+      expect(fake.codeLenses()).toHaveLength(4);
+      expect(fake.activeEditorInsets()).toHaveLength(2);
+      const firstAccept = fake.codeLenses()[0].command!;
+      await fake.executeCommand(firstAccept.command, ...(firstAccept.arguments ?? []));
       await settleRuntime();
 
       expect(render).toHaveBeenCalledTimes(2);
       expect(fake.editor.setDecorations).toHaveBeenCalledTimes(9);
-      expect(fake.currentText()).toBe('ONE\nkeep\n\nTWO\n');
+      expect(fake.currentText()).toBe('ONE\nkeep\nTWO\n');
       expect(fake.quickDiffBaseline()).toBe('ONE\nkeep\ntwo\n');
 
       fake.workspace.applyEdit.mockClear();
-      const rejectLens = fake.codeLenses().find(
-        (lens) => lens.command?.command === 'codexExtensionHelper.rejectHunk',
-      );
-      expect(rejectLens).toBeDefined();
-      await fake.commands.get('codexExtensionHelper.rejectHunk')!(
-        ...rejectLens!.command!.arguments!,
-      );
+      expect(fake.codeLenses()).toHaveLength(2);
+      expect(fake.activeEditorInsets()).toHaveLength(1);
+      const remainingReject = fake.codeLenses()[1].command!;
+      await fake.executeCommand(remainingReject.command, ...(remainingReject.arguments ?? []));
       expect(runtime.comparisonCount).toBe(1);
       expect(fake.quickDiffBaseline()).toBe('ONE\nkeep\ntwo\n');
       await settleRuntime();
@@ -3424,7 +3532,7 @@ describe('stable review runtime boundaries', () => {
     }
   });
 
-  it('keeps a review save fenced across spacer install and removal versions', async () => {
+  it('keeps an active review across saves after review and user edits', async () => {
     vi.useFakeTimers();
     try {
       const baseline = 'one\nkeep\ntwo\n';
@@ -3450,12 +3558,10 @@ describe('stable review runtime boundaries', () => {
       fake.setText(modified);
       await runtime.simulateExternalChange(fake.uri as never, baseline, modified);
       await settleRuntime();
-      const rejectLenses = fake.codeLenses().filter(
-        (lens) => lens.command?.command === 'codexExtensionHelper.rejectHunk',
-      );
-      await fake.commands.get('codexExtensionHelper.rejectHunk')!(
-        ...rejectLenses[0].command!.arguments!,
-      );
+      expect(fake.codeLenses()).toHaveLength(4);
+      expect(fake.activeEditorInsets()).toHaveLength(2);
+      const firstReject = fake.codeLenses()[1].command!;
+      await fake.executeCommand(firstReject.command, ...(firstReject.arguments ?? []));
       await settleRuntime();
       expect(internals.reviewEditSaves.get(fake.uri.toString())).toEqual({
         version: fake.document.version,
@@ -3479,10 +3585,8 @@ describe('stable review runtime boundaries', () => {
       fake.writeFile('real user edit\n');
       fake.callbacks.get('documentSave')!(fake.document);
       await settleRuntime();
-      expect(gateCandidate).toHaveBeenCalledWith(expect.objectContaining({
-        kind: 'present',
-        text: 'real user edit\n',
-      }));
+      expect(gateCandidate).not.toHaveBeenCalled();
+      expect(runtime.comparisonCount).toBe(1);
 
       gateCandidate.mockRestore();
       runtime.dispose();
@@ -3491,7 +3595,7 @@ describe('stable review runtime boundaries', () => {
     }
   });
 
-  it('reinstalls remaining deleted rows after a partial rejection', async () => {
+  it('rerenders remaining editor insets after a partial rejection', async () => {
     vi.useFakeTimers();
     try {
       const baseline = 'one\nkeep\ntwo\nkeep again\nthree\n';
@@ -3512,19 +3616,15 @@ describe('stable review runtime boundaries', () => {
       await runtime.simulateExternalChange(fake.uri as never, baseline, modified);
       await settleRuntime();
 
-      const rejectLenses = fake.codeLenses().filter(
-        (lens) => lens.command?.command === 'codexExtensionHelper.rejectHunk',
-      );
-      expect(rejectLenses).toHaveLength(3);
-      await fake.commands.get('codexExtensionHelper.rejectHunk')!(
-        ...rejectLenses[0].command!.arguments!,
-      );
+      expect(fake.codeLenses()).toHaveLength(6);
+      expect(fake.activeEditorInsets()).toHaveLength(3);
+      const firstReject = fake.codeLenses()[1].command!;
+      await fake.executeCommand(firstReject.command, ...(firstReject.arguments ?? []));
       await settleRuntime();
 
-      expect(fake.currentText()).toBe('one\nkeep\n\nTWO\nkeep again\n\nTHREE\n');
-      expect(fake.codeLenses().filter(
-        (lens) => lens.command?.command === 'codexExtensionHelper.rejectHunk',
-      )).toHaveLength(2);
+      expect(fake.currentText()).toBe('one\nkeep\nTWO\nkeep again\nTHREE\n');
+      expect(fake.codeLenses()).toHaveLength(4);
+      expect(fake.activeEditorInsets()).toHaveLength(2);
 
       runtime.dispose();
     } finally {
@@ -3568,7 +3668,7 @@ describe('stable review runtime boundaries', () => {
     }
   });
 
-  it('clears the real presentation once for save and delete', async () => {
+  it('keeps the real presentation on save and clears it on delete', async () => {
     vi.useFakeTimers();
     try {
       const { ExtensionRuntime } = await import('../../src/extension');
@@ -3593,7 +3693,8 @@ describe('stable review runtime boundaries', () => {
       const saved = await setup();
       saved.fake.callbacks.get('documentSave')!(saved.fake.document);
       await settleRuntime();
-      expect(saved.clear).toHaveBeenCalledTimes(1);
+      expect(saved.clear).not.toHaveBeenCalled();
+      expect(saved.runtime.comparisonCount).toBe(1);
       saved.clear.mockRestore();
       saved.runtime.dispose();
 

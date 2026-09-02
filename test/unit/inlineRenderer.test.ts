@@ -53,6 +53,16 @@ function tabGroup(viewColumn: number, input: unknown) {
   };
 }
 
+function withEditorInsets<T>(api: T): T {
+  const window = (api as { window: Record<string, unknown> }).window;
+  window.createWebviewTextEditorInset ??= () => ({
+    webview: { html: '' },
+    dispose: vi.fn(),
+  });
+  window.showWarningMessage ??= vi.fn();
+  return api;
+}
+
 function hunk(overrides: Partial<ChangeHunk> = {}): ChangeHunk {
   return {
     kind: 'deletion',
@@ -102,7 +112,7 @@ function deletedRenderingFixture(key: string, lineCount = 1) {
   return {
     decorationTypes,
     editor,
-    renderer: new InlineRenderer(api as never, { appendLine: vi.fn() }),
+    renderer: new InlineRenderer(withEditorInsets(api) as never, { appendLine: vi.fn() }),
   };
 }
 
@@ -119,14 +129,13 @@ describe('inline renderer helpers', () => {
     expect(html).toContain('a &amp; b');
   });
 
-  it('uses a nonce-free strict CSP without enabling scripts', () => {
+  it('renders deleted lines without embedding a second set of review controls', () => {
     const html = buildDeletedLinesHtml(['old'], 0);
 
-    expect(html).toContain(
-      `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">`,
-    );
-    expect(html).not.toMatch(/<script\b/i);
-    expect(html).not.toContain('nonce=');
+    expect(html).toContain('<span class="code">old</span>');
+    expect(html).not.toContain('class="actions"');
+    expect(html).not.toContain('<button');
+    expect(html).not.toContain('<script');
   });
 
   it('preserves tabs and uses the editor tab-size setting', () => {
@@ -137,11 +146,12 @@ describe('inline renderer helpers', () => {
     expect(html).toContain('tab-size: var(--vscode-editor-tabSize, 4)');
   });
 
-  it('labels deleted lines with one-based original line numbers', () => {
+  it('renders deleted lines without a line-number gutter', () => {
     const html = buildDeletedLinesHtml(['first', 'second'], 4);
 
-    expect(html).toContain('>5</span>');
-    expect(html).toContain('>6</span>');
+    expect(html).not.toContain('class="gutter"');
+    expect(html).toContain('<span class="code">first</span>');
+    expect(html).toContain('<span class="code">second</span>');
   });
 
   it('places original lines before a first-line replacement', () => {
@@ -168,6 +178,79 @@ describe('inline renderer helpers', () => {
     }), 3)).toEqual({ anchorLine: 2, height: 2 });
   });
 
+  it('renders deleted lines in an editor inset without changing document text', async () => {
+    const key = 'file:///inset.ts';
+    const editor = {
+      viewColumn: 1,
+      document: fakeDocument(key, 3),
+      setDecorations: vi.fn(),
+    };
+    const inset = { webview: { html: '' }, dispose: vi.fn() };
+    const createInset = vi.fn(() => inset);
+    const api = {
+      window: {
+        visibleTextEditors: [editor],
+        tabGroups: { all: [tabGroup(1, new FakeTabInputText(fakeUri(key)))] },
+        createTextEditorDecorationType: () => ({ dispose: vi.fn() }),
+        createWebviewTextEditorInset: createInset,
+        showWarningMessage: vi.fn(),
+      },
+      Range: FakeRange,
+      ThemeColor: class {},
+      DecorationRangeBehavior: { ClosedClosed: 0 },
+      OverviewRulerLane: { Full: 7 },
+      TabInputText: FakeTabInputText,
+    };
+    const renderer = new InlineRenderer(withEditorInsets(api) as never, { appendLine: vi.fn() });
+
+    await renderer.render(key, [hunk({
+      originalEnd: 2,
+      originalLines: ['first old line', 'second old line'],
+    })]);
+
+    expect(createInset).toHaveBeenCalledWith(editor, -1, 2);
+    expect(inset.webview.html).toContain('first old line');
+    expect(inset.webview.html).toContain('second old line');
+    expect(editor.document.lineCount).toBe(3);
+  });
+
+  it('warns once and disables rendering when editor insets are unavailable', async () => {
+    const key = 'file:///unsupported.ts';
+    const editor = {
+      viewColumn: 1,
+      document: fakeDocument(key),
+      setDecorations: vi.fn(),
+    };
+    const showWarningMessage = vi.fn();
+    const sessionState = { renderingDisabled: false, warningShown: false };
+    const api = {
+      window: {
+        visibleTextEditors: [editor],
+        tabGroups: { all: [tabGroup(1, new FakeTabInputText(fakeUri(key)))] },
+        createTextEditorDecorationType: () => ({ dispose: vi.fn() }),
+        showWarningMessage,
+      },
+      Range: FakeRange,
+      ThemeColor: class {},
+      DecorationRangeBehavior: { ClosedClosed: 0 },
+      OverviewRulerLane: { Full: 7 },
+      TabInputText: FakeTabInputText,
+    };
+    const renderer = new InlineRenderer(
+      api as never,
+      { appendLine: vi.fn() },
+      (uri) => uri.toString(),
+      sessionState,
+    );
+
+    await renderer.render(key, [hunk()]);
+    await renderer.render(key, [hunk()]);
+
+    expect(sessionState.renderingDisabled).toBe(true);
+    expect(showWarningMessage).toHaveBeenCalledTimes(1);
+    expect(renderedStatus(renderer, key)).toBe(false);
+  });
+
   it('reports rendering only after editor resources are successfully installed', async () => {
     const key = 'file:///test.ts';
     const editor = {
@@ -187,7 +270,7 @@ describe('inline renderer helpers', () => {
       OverviewRulerLane: { Full: 7 },
       TabInputText: FakeTabInputText,
     };
-    const renderer = new InlineRenderer(api as never, { appendLine: vi.fn() });
+    const renderer = new InlineRenderer(withEditorInsets(api) as never, { appendLine: vi.fn() });
 
     expect(renderedStatus(renderer, key)).toBe(false);
     await renderer.render(key, [hunk()]);
@@ -221,7 +304,7 @@ describe('inline renderer helpers', () => {
       TabInputText: FakeTabInputText,
     };
     const output = { appendLine: vi.fn() };
-    const renderer = new InlineRenderer(api as never, output);
+    const renderer = new InlineRenderer(withEditorInsets(api) as never, output);
 
     await renderer.render('file:///test.ts', [hunk({
       kind: 'modification',
@@ -266,7 +349,7 @@ describe('inline renderer helpers', () => {
       OverviewRulerLane: { Full: 7 },
       TabInputText: FakeTabInputText,
     };
-    const renderer = new InlineRenderer(api as never, { appendLine: vi.fn() });
+    const renderer = new InlineRenderer(withEditorInsets(api) as never, { appendLine: vi.fn() });
 
     await renderer.render(key, [hunk({
       kind: 'modification',
@@ -383,7 +466,7 @@ describe('inline renderer helpers', () => {
       OverviewRulerLane: { Full: 7 },
       TabInputText: FakeTabInputText,
     };
-    const renderer = new InlineRenderer(api as never, { appendLine: vi.fn() });
+    const renderer = new InlineRenderer(withEditorInsets(api) as never, { appendLine: vi.fn() });
 
     await renderer.render(key, [hunk()]);
 
@@ -411,7 +494,7 @@ describe('inline renderer helpers', () => {
       OverviewRulerLane: { Full: 7 },
       TabInputText: FakeTabInputText,
     };
-    const renderer = new InlineRenderer(api as never, { appendLine: vi.fn() });
+    const renderer = new InlineRenderer(withEditorInsets(api) as never, { appendLine: vi.fn() });
 
     const changed = hunk({
       kind: 'addition',
@@ -467,7 +550,7 @@ describe('inline renderer helpers', () => {
       TabInputText: FakeTabInputText,
     };
     const output = { appendLine: vi.fn() };
-    const renderer = new InlineRenderer(api as never, output);
+    const renderer = new InlineRenderer(withEditorInsets(api) as never, output);
 
     await renderer.render(key, [hunk({
       kind: 'addition',
@@ -521,7 +604,7 @@ describe('inline renderer helpers', () => {
       TabInputText: FakeTabInputText,
     };
     const output = { appendLine: vi.fn() };
-    const renderer = new InlineRenderer(api as never, output);
+    const renderer = new InlineRenderer(withEditorInsets(api) as never, output);
 
     await expect(renderer.render(key, [hunk({
       kind: 'addition',
@@ -560,7 +643,7 @@ describe('inline renderer helpers', () => {
       TabInputText: FakeTabInputText,
     };
     const output = { appendLine: vi.fn() };
-    const renderer = new InlineRenderer(api as never, output);
+    const renderer = new InlineRenderer(withEditorInsets(api) as never, output);
 
     await expect(renderer.render(key, [hunk()])).resolves.toBeUndefined();
 
@@ -591,7 +674,7 @@ describe('inline renderer helpers', () => {
       TabInputText: FakeTabInputText,
     };
     const output = { appendLine: vi.fn() };
-    const renderer = new InlineRenderer(api as never, output);
+    const renderer = new InlineRenderer(withEditorInsets(api) as never, output);
 
     await renderer.render(key, [hunk({
       kind: 'addition',

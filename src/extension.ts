@@ -577,27 +577,16 @@ export async function synchronizeReviewViews({
         views.renderer.clear(key);
         views.deletedLines.clear(key);
       } else {
-        const presentation = await views.spacers?.install({
-          key,
-          canonicalText: state.currentText,
-          hunks: state.hunks,
-        });
         if (!isCurrent()) {
-          if (
-            presentation !== undefined
-            && views.spacers?.presentation(key) === presentation
-          ) {
-            await views.spacers.clear(key);
-          }
           return;
         }
-        pending.push(views.renderer.render(key, state.hunks, presentation));
+        pending.push(views.renderer.render(key, state.hunks));
         views.deletedLines.update({
           key,
           sourceRevision: state.sourceRevision,
           currentText: state.currentText,
           hunks: state.hunks,
-          actionLines: presentation?.plan.hunks.map((hunk) => hunk.actionLine),
+          actionLines: undefined,
         });
       }
       if (resource === undefined) {
@@ -1046,6 +1035,12 @@ export class ExtensionRuntime implements vscode.Disposable {
       return;
     }
 
+    if (this.snapshots.get(key)?.comparisonActive) {
+      void this.run('DocumentEditProofInvalidation', () => this.gate.invalidate(key));
+      this.processReviewDocumentEdit(key, event.document.uri, event.document.getText());
+      return;
+    }
+
     this.processUnknownDocumentEdit(key, event.document.uri, event.document.getText());
   }
 
@@ -1139,6 +1134,13 @@ export class ExtensionRuntime implements vscode.Disposable {
     this.trackedUris.set(key, document.uri);
     const reviewSave = this.reviewEditSaves.get(key);
     this.reviewEditSaves.delete(key);
+    if (this.snapshots.get(key)?.comparisonActive) {
+      void this.run('DocumentSaveReviewRefresh', async () => {
+        await this.coordinator.documentEdit(key, text);
+        this.syncComparison(key);
+      });
+      return;
+    }
     if (
       reviewSave !== undefined
       && reviewSave.version === document.version
@@ -1527,14 +1529,16 @@ export class ExtensionRuntime implements vscode.Disposable {
 
 export class ExtensionController implements vscode.Disposable {
   private readonly subscriptions: vscode.Disposable[] = [];
-  private readonly rendererSessionState = createInlineRendererSessionState();
   private runtime: ExtensionRuntime | undefined;
   private settings = normalizeSettings({ enabled: false });
   private disposed = false;
   private refreshTail: Promise<void> = Promise.resolve();
   private shutdownPromise: Promise<void> | undefined;
 
-  constructor(private output: vscode.OutputChannel | undefined) {}
+  constructor(
+    private output: vscode.OutputChannel | undefined,
+    private readonly rendererSessionState: InlineRendererSessionState = createInlineRendererSessionState(),
+  ) {}
 
   get comparisonCount(): number {
     return this.runtime?.comparisonCount ?? 0;
@@ -1646,6 +1650,40 @@ export class ExtensionController implements vscode.Disposable {
 
 let activeController: ExtensionController | undefined;
 
+const ENABLE_EDITOR_INSETS_ACTION = '명령 실행';
+const ENABLE_EDITOR_INSETS_COMMAND = 'code . --enable-proposed-api=local.codex-extension-helper';
+
+export async function offerEditorInsetsLaunch(
+  rendererSessionState: InlineRendererSessionState = createInlineRendererSessionState(),
+): Promise<void> {
+  try {
+    if (typeof vscode.window.createWebviewTextEditorInset === 'function') {
+      return;
+    }
+  } catch {
+    // Stable can throw while reading a proposed API that was not enabled at launch.
+  }
+
+  rendererSessionState.renderingDisabled = true;
+  rendererSessionState.warningShown = true;
+  const action = await vscode.window.showWarningMessage(
+    'Codex Changes가 문서를 dirty 상태로 만들지 않고 삭제 행을 표시하려면 '
+      + 'VS Code를 editorInsets 제안 API와 함께 다시 실행해야 합니다.',
+    { modal: true },
+    ENABLE_EDITOR_INSETS_ACTION,
+  );
+  if (action !== ENABLE_EDITOR_INSETS_ACTION) {
+    return;
+  }
+
+  const terminal = vscode.window.createTerminal({
+    name: 'Enable Codex Changes editor insets',
+    cwd: vscode.workspace.workspaceFolders?.[0]?.uri,
+  });
+  terminal.show(true);
+  terminal.sendText(ENABLE_EDITOR_INSETS_COMMAND, true);
+}
+
 export const testDiagnostics: TestDiagnostics = Object.freeze({
   get comparisonCount(): number {
     return activeController?.comparisonCount ?? 0;
@@ -1660,7 +1698,8 @@ export const testDiagnostics: TestDiagnostics = Object.freeze({
 
 export function activate(context: vscode.ExtensionContext): TestExtensionApi | undefined {
   const output = vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
-  const controller = new ExtensionController(output);
+  const rendererSessionState = createInlineRendererSessionState();
+  const controller = new ExtensionController(output, rendererSessionState);
   activeController = controller;
   context.subscriptions.push(controller);
   context.subscriptions.push(vscode.commands.registerCommand(
@@ -1746,6 +1785,7 @@ export function activate(context: vscode.ExtensionContext): TestExtensionApi | u
   if (process.env.CODEX_EXTENSION_HELPER_TEST !== '1') {
     void codexDropPatchController.offerInstallIfNeeded();
   }
+  void offerEditorInsetsLaunch(rendererSessionState);
   controller.start();
 
   return process.env.CODEX_EXTENSION_HELPER_TEST === '1'

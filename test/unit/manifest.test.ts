@@ -2,9 +2,9 @@ import { describe, expect, it } from 'vitest';
 import manifest from '../../package.json';
 
 describe('extension manifest', () => {
-  it('targets Stable without a proposed API', () => {
-    expect(manifest.engines.vscode).toBe('^1.101.1');
-    expect(manifest).not.toHaveProperty('enabledApiProposals');
+  it('targets Stable 1.135 with the editor inset proposal enabled', () => {
+    expect(manifest.engines.vscode).toBe('^1.135.0');
+    expect(manifest.enabledApiProposals).toEqual(['editorInsets']);
     expect(manifest.activationEvents).toContain('onStartupFinished');
   });
 
@@ -48,6 +48,19 @@ describe('extension manifest', () => {
       'codexExtensionHelper.installProvenanceBridge',
       'codexExtensionHelper.removeProvenanceBridge',
       'codexExtensionHelper.showProvenanceBridgeStatus',
+    ]);
+  });
+
+  it('uses Accept terminology for every visible approval command', () => {
+    const acceptanceTitles = manifest.contributes.commands
+      .filter(({ command }) => command.includes('approve'))
+      .map(({ title }) => title);
+
+    expect(acceptanceTitles).toEqual([
+      'Codex Changes: Accept Change',
+      'Codex Changes: Accept All',
+      'Accept File',
+      'Accept All Files',
     ]);
   });
 
