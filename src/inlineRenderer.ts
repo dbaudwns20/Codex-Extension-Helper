@@ -80,7 +80,8 @@ export function buildDeletedLinesHtml(
   const rows = lines.map((line) => (
     `<div class="line"><span class="code">${escapeHtml(line)}</span></div>`
   )).join('');
-  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';"><style>html, body { margin: 0; padding: 0; color: var(--vscode-editor-foreground); background: var(--vscode-diffEditor-removedTextBackground, rgba(255, 0, 0, 0.2)); font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); }.line { display: flex; min-height: var(--vscode-editor-line-height); white-space: pre; tab-size: var(--vscode-editor-tabSize, 4); }.code { flex: 1; }</style></head><body>${rows}</body></html>`;
+  const rowCount = Math.max(1, lines.length);
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';"><style>html { background: var(--vscode-diffEditor-removedTextBackground, rgba(255, 0, 0, 0.2)); }body { height: 100vh; display: grid; grid-template-rows: repeat(${rowCount}, minmax(0, 1fr)); background: transparent; }body { margin: 0; padding: 0; color: var(--vscode-editor-foreground); font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); }.line { display: flex; align-items: center; white-space: pre; tab-size: var(--vscode-editor-tabSize, 4); }.code { flex: 1; }</style></head><body>${rows}</body></html>`;
 }
 
 export class InlineRenderer implements ComparisonView, vscode.Disposable {

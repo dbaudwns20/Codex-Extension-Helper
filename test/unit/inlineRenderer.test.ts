@@ -152,13 +152,22 @@ describe('inline renderer helpers', () => {
     expect(html).toContain(
       'html { background: var(--vscode-diffEditor-removedTextBackground, rgba(255, 0, 0, 0.2)); }',
     );
-    expect(html).toContain('body { background: transparent; }');
+    expect(html).toMatch(/body \{[^}]*background: transparent;/u);
   });
 
   it('does not size deleted rows with an unavailable webview line-height variable', () => {
     const html = buildDeletedLinesHtml(['old'], 0);
 
     expect(html).not.toContain('--vscode-editor-line-height');
+  });
+
+  it('centers each deleted line within an equal share of the inset height', () => {
+    const html = buildDeletedLinesHtml(['first', 'second'], 0);
+
+    expect(html).toContain(
+      'body { height: 100vh; display: grid; grid-template-rows: repeat(2, minmax(0, 1fr)); background: transparent; }',
+    );
+    expect(html).toContain('align-items: center');
   });
 
   it('renders deleted lines without a line-number gutter', () => {
