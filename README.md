@@ -34,9 +34,12 @@ actions operate on the canonical file content.
 ### Source Control review
 
 The `Codex Changes` Source Control provider appears only while pending changes
-exist and lists every affected file.
+exist and lists every affected file. Paths are shown relative to their workspace
+folder, with a separate provider for each folder in a multi-root workspace.
 
 - Clicking a file opens its full diff.
+- The file-row **Open File** button opens an existing or newly created file
+  directly. Deleted files omit this button and remain available through diff.
 - File-row **Accept File** and **Reject File** actions process that file.
 - Provider-title **Accept All Files** and **Reject All Files** actions process
   every file currently listed.
@@ -125,7 +128,7 @@ From the repository root:
 ```bash
 npm ci
 npm run package
-code --install-extension ./codex-extension-helper-0.0.5.vsix --force
+code --install-extension ./codex-extension-helper-0.0.6.vsix --force
 ```
 
 `npm run package` compiles the extension, runs the unit test suite, and creates

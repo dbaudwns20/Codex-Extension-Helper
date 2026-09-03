@@ -2,6 +2,19 @@
 
 All notable changes to this personal extension are documented in this file.
 
+## 0.0.6 - 2026-09-03
+
+### Added
+
+- `Codex Changes` file rows now provide an **Open File** action for existing
+  and newly created files.
+
+### Changed
+
+- `Codex Changes` paths are now scoped to their workspace folder, including
+  separate providers for folders in multi-root workspaces.
+- Deleted files omit the direct-open action while retaining full-diff review.
+
 ## 0.0.5 - 2026-09-01
 
 ### Changed
