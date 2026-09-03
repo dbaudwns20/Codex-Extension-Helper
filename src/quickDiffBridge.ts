@@ -10,15 +10,20 @@ interface ReviewEntry {
   readonly baseline: vscode.Uri;
   readonly current: vscode.Uri;
   readonly generation: number;
+  readonly lifecycle: 'existing' | 'created' | 'deleted';
   text: string;
+}
+
+interface SourceControlState {
+  readonly sourceControl: vscode.SourceControl;
+  readonly changesGroup: vscode.SourceControlResourceGroup;
 }
 
 export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vscode.Disposable {
   private readonly entries = new Map<string, ReviewEntry>();
   private readonly contents = new Map<string, string>();
   private nextGeneration = 0;
-  private sourceControl: vscode.SourceControl | undefined;
-  private changesGroup: vscode.SourceControlResourceGroup | undefined;
+  private readonly sourceControls = new Map<string, SourceControlState>();
   private registrations: vscode.Disposable[] = [];
   private readonly changeEmitter = new vscode.EventEmitter<vscode.Uri>();
   readonly onDidChange = this.changeEmitter.event;
@@ -45,7 +50,7 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
     if (existing !== undefined && existing.current.toString() !== current.toString()) {
       this.contents.delete(existing.current.toString());
     }
-    const entry = { resource, baseline, current, generation, text: baselineText };
+    const entry = { resource, baseline, current, generation, lifecycle, text: baselineText };
     this.entries.set(key, entry);
     this.contents.set(baseline.toString(), baselineText);
     if (lifecycle === 'deleted') {
@@ -54,7 +59,7 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
     if (changed) {
       this.changeEmitter.fire(baseline);
     }
-    this.ensureSourceControl();
+    this.ensureProviders();
     this.refreshProvider();
   }
 
@@ -72,7 +77,7 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
     this.contents.delete(entry.current.toString());
 
     if (this.entries.size === 0) {
-      this.disposeSourceControl();
+      this.disposeSourceControls();
       this.disposeProviders();
     } else {
       this.refreshProvider();
@@ -95,7 +100,7 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
   }
 
   dispose(): void {
-    this.disposeSourceControl();
+    this.disposeSourceControls();
     this.disposeProviders();
     this.changeEmitter.dispose();
     this.entries.clear();
@@ -121,36 +126,58 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
   }
 
   private refreshProvider(): void {
-    if (this.sourceControl === undefined) {
-      return;
+    const entriesByRoot = new Map<string, {
+      readonly rootUri: vscode.Uri | undefined;
+      readonly entries: ReviewEntry[];
+    }>();
+    for (const entry of this.entries.values()) {
+      const rootUri = vscode.workspace.getWorkspaceFolder(entry.resource)?.uri;
+      const rootKey = rootUri?.toString() ?? '';
+      const bucket = entriesByRoot.get(rootKey) ?? { rootUri, entries: [] };
+      bucket.entries.push(entry);
+      entriesByRoot.set(rootKey, bucket);
     }
-    this.sourceControl.quickDiffProvider = {
-      provideOriginalResource: (uri) => this.entries.get(normalizeUriKey(uri))?.baseline,
-    };
-    if (this.changesGroup !== undefined) {
-      this.changesGroup.resourceStates = [...this.entries.values()]
+
+    for (const [rootKey, bucket] of entriesByRoot) {
+      const state = this.ensureSourceControl(rootKey, bucket.rootUri);
+      state.sourceControl.quickDiffProvider = {
+        provideOriginalResource: (uri) => this.entries.get(normalizeUriKey(uri))?.baseline,
+      };
+      state.changesGroup.resourceStates = bucket.entries
         .sort((left, right) => left.resource.fsPath.localeCompare(right.resource.fsPath))
         .map((entry) => ({
           resourceUri: entry.resource,
-          contextValue: 'codexChange',
+          contextValue: entry.lifecycle === 'deleted' ? 'codexChangeDeleted' : 'codexChange',
           command: {
             command: 'codexExtensionHelper.openDiff',
             title: 'Open Codex Changes',
             arguments: [entry.resource],
           },
         }));
+      state.sourceControl.count = bucket.entries.length;
     }
-    this.sourceControl.count = this.entries.size;
+
+    for (const [rootKey, state] of this.sourceControls) {
+      if (entriesByRoot.has(rootKey)) {
+        continue;
+      }
+      state.changesGroup.resourceStates = [];
+      state.sourceControl.dispose();
+      this.sourceControls.delete(rootKey);
+    }
   }
 
-  private ensureSourceControl(): void {
-    this.ensureProviders();
-    if (this.sourceControl !== undefined) {
-      return;
+  private ensureSourceControl(rootKey: string, rootUri: vscode.Uri | undefined): SourceControlState {
+    const existing = this.sourceControls.get(rootKey);
+    if (existing !== undefined) {
+      return existing;
     }
-    this.sourceControl = vscode.scm.createSourceControl('codexChanges', 'Codex Changes');
-    this.changesGroup = this.sourceControl.createResourceGroup('changes', 'Changes');
-    this.sourceControl.inputBox.visible = false;
+    const sourceControl = vscode.scm.createSourceControl('codexChanges', 'Codex Changes', rootUri);
+    const changesGroup = sourceControl.createResourceGroup('changes', 'Changes');
+    sourceControl.inputBox.visible = false;
+    const state = { sourceControl, changesGroup };
+    this.sourceControls.set(rootKey, state);
+    return state;
   }
 
   private ensureProviders(): void {
@@ -169,12 +196,11 @@ export class QuickDiffBridge implements vscode.TextDocumentContentProvider, vsco
     }
   }
 
-  private disposeSourceControl(): void {
-    if (this.changesGroup !== undefined) {
-      this.changesGroup.resourceStates = [];
+  private disposeSourceControls(): void {
+    for (const state of this.sourceControls.values()) {
+      state.changesGroup.resourceStates = [];
+      state.sourceControl.dispose();
     }
-    this.sourceControl?.dispose();
-    this.sourceControl = undefined;
-    this.changesGroup = undefined;
+    this.sourceControls.clear();
   }
 }

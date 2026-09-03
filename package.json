@@ -26,6 +26,11 @@
         "title": "Codex Changes: Open Full Diff"
       },
       {
+        "command": "codexExtensionHelper.openFile",
+        "title": "Open File",
+        "icon": "$(go-to-file)"
+      },
+      {
         "command": "codexExtensionHelper.approveHunk",
         "title": "Codex Changes: Accept Change"
       },
@@ -104,6 +109,12 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "codexExtensionHelper.openFile",
+          "when": "false"
+        }
+      ],
       "editor/title": [
         {
           "command": "codexExtensionHelper.previousChange",
@@ -128,13 +139,18 @@
       ],
       "scm/resourceState/context": [
         {
-          "command": "codexExtensionHelper.approveFile",
+          "command": "codexExtensionHelper.openFile",
           "when": "scmProvider == codexChanges && scmResourceState == codexChange",
+          "group": "inline@5"
+        },
+        {
+          "command": "codexExtensionHelper.approveFile",
+          "when": "scmProvider == codexChanges && scmResourceState =~ /^(codexChange|codexChangeDeleted)$/",
           "group": "inline@10"
         },
         {
           "command": "codexExtensionHelper.rejectFile",
-          "when": "scmProvider == codexChanges && scmResourceState == codexChange",
+          "when": "scmProvider == codexChanges && scmResourceState =~ /^(codexChange|codexChangeDeleted)$/",
           "group": "inline@11"
         }
       ],

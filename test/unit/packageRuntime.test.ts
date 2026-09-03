@@ -395,7 +395,33 @@ function installRuntimeVscode(initialText = 'before\n') {
     createResourceGroup: vi.fn(() => changesGroup),
     dispose: vi.fn(),
   };
-  const createSourceControl = vi.fn(() => sourceControl);
+  const changesGroups = [changesGroup];
+  const sourceControls = [sourceControl];
+  let firstSourceControl = true;
+  const createSourceControl = vi.fn((
+    _id: string,
+    _label: string,
+    _rootUri?: typeof workspaceUri,
+  ) => {
+    if (firstSourceControl) {
+      firstSourceControl = false;
+      return sourceControl;
+    }
+    const additionalGroup = {
+      resourceStates: [] as typeof changesGroup.resourceStates,
+      dispose: vi.fn(),
+    };
+    const additionalSourceControl = {
+      inputBox: { visible: true },
+      count: 0,
+      quickDiffProvider: undefined as unknown,
+      createResourceGroup: vi.fn(() => additionalGroup),
+      dispose: vi.fn(),
+    };
+    changesGroups.push(additionalGroup);
+    sourceControls.push(additionalSourceControl);
+    return additionalSourceControl;
+  });
   const contentProviders = new Map<string, { provideTextDocumentContent(uri: unknown): string }>();
   let codeLensProvider: { provideCodeLenses(document: unknown): FakeCodeLens[] } | undefined;
   let inlayHintsProvider: {
@@ -639,6 +665,7 @@ function installRuntimeVscode(initialText = 'before\n') {
   return {
     callbacks,
     changesGroup,
+    changesGroups,
     codeLenses() {
       if (inlayHintsProvider !== undefined) {
         return inlayHintsProvider.provideInlayHints(
@@ -735,6 +762,7 @@ function installRuntimeVscode(initialText = 'before\n') {
       });
     },
     sourceControl,
+    sourceControls,
     terminals,
     uri,
     window,
@@ -2019,6 +2047,11 @@ describe('packaged runtime', () => {
       await runtime.simulateExternalChange(fake.uri as never, 'before\n', 'after\n');
       await settleRuntime();
 
+      expect(fake.createSourceControl).toHaveBeenCalledWith(
+        'codexChanges',
+        'Codex Changes',
+        expect.objectContaining({ path: '/workspace' }),
+      );
       expect(fake.changesGroup.resourceStates).toEqual([
         expect.objectContaining({
           resourceUri: fake.uri,
@@ -2045,10 +2078,59 @@ describe('packaged runtime', () => {
         { preview: true },
       );
 
+      await fake.commands.get('codexExtensionHelper.openFile')!(fake.uri);
+      expect(fake.executeCommand).toHaveBeenCalledWith('vscode.open', fake.uri);
+
       fake.callbacks.get('watcherDelete')!(fake.uri);
       await settleRuntime();
 
       expect(fake.changesGroup.resourceStates).toEqual([]);
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps Codex Changes scoped to each workspace folder in a multi-root workspace', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      fake.addWorkspaceFolder('/other');
+      const otherUri = {
+        ...fake.uri,
+        path: '/other/nested/other.ts',
+        fsPath: '/other/nested/other.ts',
+        toString: () => 'file:///other/nested/other.ts',
+      };
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+
+      await runtime.simulateExternalChange(fake.uri as never, 'before\n', 'after\n');
+      await runtime.simulateExternalChange(otherUri as never, 'old\n', 'new\n');
+      await settleRuntime();
+
+      expect(fake.createSourceControl.mock.calls.map(([, , root]) => root?.path)).toEqual([
+        '/workspace',
+        '/other',
+      ]);
+      expect(fake.changesGroups.map((group) => group.resourceStates.map(
+        (state) => state.resourceUri.toString(),
+      ))).toEqual([
+        ['file:///workspace/file.ts'],
+        ['file:///other/nested/other.ts'],
+      ]);
+
+      fake.callbacks.get('watcherDelete')!(fake.uri);
+      await settleRuntime();
+
+      expect(fake.sourceControls[0].dispose).toHaveBeenCalledOnce();
+      expect(fake.sourceControls[1].dispose).not.toHaveBeenCalled();
+      expect(fake.changesGroups[1].resourceStates).toHaveLength(1);
       runtime.dispose();
     } finally {
       vi.useRealTimers();
@@ -2076,7 +2158,10 @@ describe('packaged runtime', () => {
       await settleRuntime();
 
       expect(fake.changesGroup.resourceStates).toEqual([
-        expect.objectContaining({ resourceUri: fake.uri }),
+        expect.objectContaining({
+          resourceUri: fake.uri,
+          contextValue: 'codexChangeDeleted',
+        }),
       ]);
       expect(runtime.comparisonCount).toBe(1);
       expect(runtime.renderedComparisonCount).toBe(0);
@@ -3173,6 +3258,7 @@ describe('stable review runtime boundaries', () => {
     handlers.get('codexExtensionHelper.nextChange')!(uri as never);
     await handlers.get('codexExtensionHelper.approveAll')!(uri as never);
     await handlers.get('codexExtensionHelper.rejectAll')!(uri as never);
+    await handlers.get('codexExtensionHelper.openFile')!(uri as never);
     const secondUri = { toString: () => 'file:///workspace/second.ts' };
     const resourceStates = [{ resourceUri: uri }, { resourceUri: secondUri }];
     await handlers.get('codexExtensionHelper.approveFile')!(resourceStates as never);
@@ -3187,6 +3273,7 @@ describe('stable review runtime boundaries', () => {
       'codexExtensionHelper.nextChange',
       'codexExtensionHelper.approveAll',
       'codexExtensionHelper.rejectAll',
+      'codexExtensionHelper.openFile',
       'codexExtensionHelper.approveFile',
       'codexExtensionHelper.rejectFile',
       'codexExtensionHelper.approveAllFiles',
@@ -3455,6 +3542,7 @@ describe('stable review runtime boundaries', () => {
         'codexExtensionHelper.nextChange',
         'codexExtensionHelper.approveAll',
         'codexExtensionHelper.rejectAll',
+        'codexExtensionHelper.openFile',
         'codexExtensionHelper.approveFile',
         'codexExtensionHelper.rejectFile',
         'codexExtensionHelper.approveAllFiles',

@@ -31,6 +31,7 @@ describe('extension manifest', () => {
   it('contributes every review command alongside the existing full diff command', () => {
     expect(manifest.contributes.commands.map(({ command }) => command)).toEqual([
       'codexExtensionHelper.openDiff',
+      'codexExtensionHelper.openFile',
       'codexExtensionHelper.approveHunk',
       'codexExtensionHelper.rejectHunk',
       'codexExtensionHelper.previousChange',
@@ -165,13 +166,18 @@ describe('extension manifest', () => {
   it('offers file actions and workspace-wide actions in Codex Changes', () => {
     expect(manifest.contributes.menus['scm/resourceState/context']).toEqual([
       {
-        command: 'codexExtensionHelper.approveFile',
+        command: 'codexExtensionHelper.openFile',
         when: 'scmProvider == codexChanges && scmResourceState == codexChange',
+        group: 'inline@5',
+      },
+      {
+        command: 'codexExtensionHelper.approveFile',
+        when: 'scmProvider == codexChanges && scmResourceState =~ /^(codexChange|codexChangeDeleted)$/',
         group: 'inline@10',
       },
       {
         command: 'codexExtensionHelper.rejectFile',
-        when: 'scmProvider == codexChanges && scmResourceState == codexChange',
+        when: 'scmProvider == codexChanges && scmResourceState =~ /^(codexChange|codexChangeDeleted)$/',
         group: 'inline@11',
       },
     ]);
@@ -187,5 +193,9 @@ describe('extension manifest', () => {
         group: 'navigation@11',
       },
     ]);
+    expect(manifest.contributes.menus.commandPalette).toContainEqual({
+      command: 'codexExtensionHelper.openFile',
+      when: 'false',
+    });
   });
 });

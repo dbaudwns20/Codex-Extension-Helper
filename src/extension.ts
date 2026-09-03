@@ -526,6 +526,14 @@ export function registerReviewCommands(
     guarded('RejectAllCommand', (uri?: vscode.Uri) => controller.rejectAll(uri)),
   ));
   ownership.use(registerCommand(
+    'codexExtensionHelper.openFile',
+    guarded('OpenFileCommand', async (value: ResourceCommandArgument) => {
+      for (const uri of resourceUris(value)) {
+        await vscode.commands.executeCommand('vscode.open', uri);
+      }
+    }),
+  ));
+  ownership.use(registerCommand(
     'codexExtensionHelper.approveFile',
     guarded(
       'ApproveFileCommand',
