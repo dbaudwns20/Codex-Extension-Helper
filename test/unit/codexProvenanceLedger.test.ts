@@ -235,6 +235,49 @@ describe('CodexProvenanceLedger', () => {
     expect(transition.provenance.itemIds).toEqual(['item-1', 'item-2']);
   });
 
+  it('recovers an unknown accepted pre-image from the observed final state', () => {
+    const ledger = new CodexProvenanceLedger();
+    ledger.record(completed([update('file.txt', 'old', 'new')]));
+
+    const [transition] = ledger.completedTransitions(
+      () => undefined,
+      () => state('file.txt', true, 'new\n'),
+    );
+
+    expect(transition).toMatchObject({
+      before: { exists: true, text: 'old\n' },
+      after: { exists: true, text: 'new\n' },
+      provenance: { confidence: 'exact' },
+    });
+  });
+
+  it('recovers an unknown pre-image through a sequential patch chain', () => {
+    const ledger = new CodexProvenanceLedger();
+    ledger.record(completed([update('file.txt', 'old', 'new')], 'item-1'));
+    ledger.record(completed([update('file.txt', 'new', 'final')], 'item-2'));
+
+    const [transition] = ledger.completedTransitions(
+      () => undefined,
+      () => state('file.txt', true, 'final\n'),
+    );
+
+    expect(transition).toMatchObject({
+      before: { exists: true, text: 'old\n' },
+      after: { exists: true, text: 'final\n' },
+      provenance: { itemIds: ['item-1', 'item-2'] },
+    });
+  });
+
+  it('fails closed when an observed final state does not match the patch chain', () => {
+    const ledger = new CodexProvenanceLedger();
+    ledger.record(completed([update('file.txt', 'old', 'new')]));
+
+    expect(ledger.completedTransitions(
+      () => undefined,
+      () => state('file.txt', true, 'different\n'),
+    )).toEqual([]);
+  });
+
   it('replays exact add, update, and delete lifecycles', () => {
     const additions = new CodexProvenanceLedger();
     additions.record(completed([add('added.txt', 'one')]));

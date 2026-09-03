@@ -5,7 +5,11 @@ import type {
   CodexFileUpdateChange,
   CodexProvenanceNotification,
 } from './codexProvenanceProtocol';
-import { applyUnifiedFilePatch, sha256Text } from './unifiedFilePatch';
+import {
+  applyUnifiedFilePatch,
+  reverseApplyUnifiedFilePatch,
+  sha256Text,
+} from './unifiedFilePatch';
 
 export interface ProvenanceFileState {
   readonly uri: vscode.Uri;
@@ -30,6 +34,8 @@ export type AcceptedStateResolver = (
   path: string,
 ) => ProvenanceFileState | undefined;
 
+export type ObservedStateResolver = AcceptedStateResolver;
+
 interface ItemRecord {
   readonly key: string;
   readonly threadId: string;
@@ -49,7 +55,8 @@ interface ReadyTransition {
 }
 
 interface NormalizedEvidenceGroup {
-  readonly accepted: ProvenanceFileState;
+  readonly reference: ProvenanceFileState;
+  readonly referenceKind: 'accepted' | 'observed';
   readonly links: { item: ItemRecord; change: CodexFileUpdateChange }[];
   readonly evidence: Set<string>;
   readonly itemKeys: Set<string>;
@@ -166,6 +173,30 @@ function nextState(
   return { uri: current.uri, exists: true, text };
 }
 
+function previousState(
+  current: ProvenanceFileState,
+  change: CodexFileUpdateChange,
+): ProvenanceFileState | undefined {
+  if (change.kind.type === 'update' && change.kind.move_path !== null) return undefined;
+  if (!current.exists && current.text !== '') return undefined;
+
+  if (change.kind.type === 'add') {
+    if (!current.exists) return undefined;
+    const text = reverseApplyUnifiedFilePatch(current.text, change.diff);
+    return text === '' ? { uri: current.uri, exists: false, text: '' } : undefined;
+  }
+
+  if (change.kind.type === 'delete') {
+    if (current.exists) return undefined;
+    const text = reverseApplyUnifiedFilePatch('', change.diff);
+    return text === undefined ? undefined : { uri: current.uri, exists: true, text };
+  }
+
+  if (!current.exists) return undefined;
+  const text = reverseApplyUnifiedFilePatch(current.text, change.diff);
+  return text === undefined ? undefined : { uri: current.uri, exists: true, text };
+}
+
 export class CodexProvenanceLedger {
   private readonly items = new Map<string, ItemRecord>();
   private readonly retiredEvidence = new Map<string, EvidenceTombstone>();
@@ -261,6 +292,7 @@ export class CodexProvenanceLedger {
 
   completedTransitions(
     resolveAcceptedPath: AcceptedStateResolver,
+    resolveObservedPath?: ObservedStateResolver,
   ): readonly ExactCodexTransition[] {
     this.ready.clear();
     this.evidenceByNormalizedKey.clear();
@@ -274,8 +306,10 @@ export class CodexProvenanceLedger {
       for (const change of item.changes) {
         const evidence = evidenceKey(item, change.path);
         const accepted = resolveAcceptedPath(change.path);
-        if (accepted === undefined) continue;
-        const key = accepted.uri.toString();
+        const reference = accepted ?? resolveObservedPath?.(change.path);
+        if (reference === undefined) continue;
+        const referenceKind = accepted === undefined ? 'observed' : 'accepted';
+        const key = reference.uri.toString();
         const currentEvidence = this.evidenceByNormalizedKey.get(key) ?? new Set<string>();
         const currentItemKeys = this.itemKeysByNormalizedKey.get(key) ?? new Set<string>();
         currentEvidence.add(evidence);
@@ -286,14 +320,17 @@ export class CodexProvenanceLedger {
         if (this.isRetiredEvidence(evidence)) continue;
         const existing = groups.get(key);
         const group = existing ?? {
-          accepted,
+          reference,
+          referenceKind,
           links: [],
           evidence: new Set<string>(),
           itemKeys: new Set<string>(),
           acceptedStateConflict: false,
         };
         if (existing !== undefined
-          && (accepted.exists !== existing.accepted.exists || accepted.text !== existing.accepted.text)) {
+          && (referenceKind !== existing.referenceKind
+            || reference.exists !== existing.reference.exists
+            || reference.text !== existing.reference.text)) {
           group.acceptedStateConflict = true;
         }
         group.links.push({ item, change });
@@ -304,15 +341,31 @@ export class CodexProvenanceLedger {
     }
 
     for (const [key, group] of groups) {
-      const { accepted, evidence, links } = group;
+      const { evidence, links, reference, referenceKind } = group;
       const first = links[0].item;
-      if (group.acceptedStateConflict || (!accepted.exists && accepted.text !== '')
+      if (group.acceptedStateConflict || (!reference.exists && reference.text !== '')
         || links.some(({ item }) => item.threadId !== first.threadId || item.turnId !== first.turnId)) {
         this.invalidateGeneration(key, group.itemKeys, evidence);
         continue;
       }
 
-      const before = { uri: accepted.uri, exists: accepted.exists, text: accepted.text };
+      let before: ProvenanceFileState | undefined = {
+        uri: reference.uri,
+        exists: reference.exists,
+        text: reference.text,
+      };
+      if (referenceKind === 'observed') {
+        for (let index = links.length - 1; index >= 0; index -= 1) {
+          const previous = previousState(before, links[index].change);
+          if (previous === undefined) {
+            this.invalidateGeneration(key, group.itemKeys, evidence);
+            before = undefined;
+            break;
+          }
+          before = previous;
+        }
+        if (before === undefined) continue;
+      }
       let current: ProvenanceFileState = before;
       let precedingAfterHash = sha256Text(current.text);
       const itemIds: string[] = [];
@@ -338,9 +391,14 @@ export class CodexProvenanceLedger {
         this.invalidateGeneration(key, group.itemKeys, evidence);
         continue;
       }
+      if (referenceKind === 'observed'
+        && (current.exists !== reference.exists || current.text !== reference.text)) {
+        this.invalidateGeneration(key, group.itemKeys, evidence);
+        continue;
+      }
       const transition: ExactCodexTransition = {
         key,
-        uri: accepted.uri,
+        uri: reference.uri,
         before,
         after: current,
         provenance: {

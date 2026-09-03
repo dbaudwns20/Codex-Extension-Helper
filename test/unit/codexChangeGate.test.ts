@@ -246,17 +246,11 @@ describe('CodexChangeGate', () => {
   );
 
   it.each(['notification-first', 'candidate-first'] as const)(
-    'rejects and never reuses accepted-undefined evidence in %s order',
+    'proves a change without an accepted snapshot in %s order',
     async (order) => {
       const initialCandidate = present('workspace-a.txt', 'new\n');
-      const acceptedState: ProvenanceFileState = {
-        uri: initialCandidate.uri,
-        exists: true,
-        text: 'old\n',
-      };
-      let currentAccepted: ProvenanceFileState | undefined;
       const { gate, proven, unproven } = setup({}, {
-        resolveAcceptedPath: () => currentAccepted,
+        resolveAcceptedPath: () => undefined,
         resolveWorkspacePath: () => initialCandidate.uri,
       });
       const notification = completed([update('file.txt', 'old', 'new')]);
@@ -265,19 +259,12 @@ describe('CodexChangeGate', () => {
       await gate.handleNotification(notification);
       if (order === 'notification-first') await gate.handleCandidate(initialCandidate);
 
-      expect(proven).toEqual([]);
-      expect(unproven).toEqual(order === 'candidate-first' ? [initialCandidate] : []);
-
-      currentAccepted = acceptedState;
-      const laterCandidate = order === 'candidate-first'
-        ? present('workspace-a.txt', 'new\n')
-        : initialCandidate;
-      if (order === 'candidate-first') await gate.handleCandidate(laterCandidate);
-      await gate.handleNotification(notification);
-
-      expect(proven).toEqual([]);
-      expect(unproven.filter((value) => value === initialCandidate)).toHaveLength(1);
-      expect(unproven.filter((value) => value === laterCandidate)).toHaveLength(1);
+      expect(proven).toHaveLength(1);
+      expect(proven[0]).toMatchObject({
+        before: { exists: true, text: 'old\n' },
+        after: { exists: true, text: 'new\n' },
+      });
+      expect(unproven).toEqual([]);
     },
   );
 

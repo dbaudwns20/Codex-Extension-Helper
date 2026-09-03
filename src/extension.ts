@@ -753,11 +753,7 @@ export class ExtensionRuntime implements vscode.Disposable {
           const key = normalizeUriKey(uri);
           if (this.untrackableKeys.has(key)) return undefined;
           const text = snapshots.acceptedText(key);
-          return {
-            uri,
-            exists: text !== undefined,
-            text: text ?? '',
-          };
+          return text === undefined ? undefined : { uri, exists: true, text };
         },
         resolveWorkspacePath: (relativePath) => this.resolveWorkspacePath(relativePath),
         callbacks: {
@@ -1347,6 +1343,9 @@ export class ExtensionRuntime implements vscode.Disposable {
       return;
     }
     this.trackedUris.set(transition.key, transition.uri);
+    if (transition.before.exists && this.snapshots.acceptedText(transition.key) === undefined) {
+      this.coordinator.seed(transition.key, transition.before.text);
+    }
 
     if (
       transition.before.exists === transition.after.exists

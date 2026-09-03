@@ -4,6 +4,7 @@ import {
   CodexProvenanceLedger,
   type AcceptedStateResolver,
   type ExactCodexTransition,
+  type ProvenanceFileState,
 } from './codexProvenanceLedger';
 import {
   parseCodexProvenanceNotification,
@@ -64,8 +65,14 @@ interface RejectedItemTombstone {
   readonly order: number;
 }
 
+interface AwaitingCandidateEvidence {
+  readonly keys: ReadonlySet<string>;
+  readonly expiresAt: number;
+}
+
 interface NotificationKeyResolution {
   readonly relevantKeys: Set<string>;
+  readonly awaitingCandidateKeys: Set<string>;
   readonly resolverAgreementFailed: boolean;
 }
 
@@ -172,6 +179,8 @@ export class CodexChangeGate implements vscode.Disposable {
   private readonly eligibleTransitions = new Map<string, EligibleTransition>();
   private readonly inProgressItemKeys = new Map<string, Set<string>>();
   private readonly rejectedItems = new Map<string, RejectedItemTombstone>();
+  private readonly awaitingCandidateItems = new Map<string, AwaitingCandidateEvidence>();
+  private readonly knownAcceptedKeys = new Set<string>();
   private readonly archivedRejectedItems = new RejectedItemArchive();
   private readonly quarantineMs: number;
   private readonly transitionLifetimeMs: number;
@@ -252,6 +261,7 @@ export class CodexChangeGate implements vscode.Disposable {
         firstError ??= error;
       }
       if (resolution.resolverAgreementFailed || this.isRejectedItem(itemKey)) {
+        this.awaitingCandidateItems.delete(itemKey);
         this.rejectItem(itemKey);
         for (const key of resolution.relevantKeys) {
           this.eligibleTransitions.delete(key);
@@ -283,6 +293,13 @@ export class CodexChangeGate implements vscode.Disposable {
 
       const previouslyEligible = new Set(this.eligibleTransitions.keys());
       this.ledger.record(notification);
+      if (notification.method === 'item/completed'
+        && resolution.awaitingCandidateKeys.size > 0) {
+        this.awaitingCandidateItems.set(itemKey, {
+          keys: resolution.awaitingCandidateKeys,
+          expiresAt: this.now() + this.transitionLifetimeMs,
+        });
+      }
       this.refreshEligibleTransitions(this.now());
 
       for (const key of resolution.relevantKeys) {
@@ -296,6 +313,7 @@ export class CodexChangeGate implements vscode.Disposable {
         }
         if (terminal
           && !this.eligibleTransitions.has(key)
+          && !resolution.awaitingCandidateKeys.has(key)
           && !this.provenCandidateIdentities.get(key)?.itemKeys.has(itemKey)) {
           this.ledger.retireKey(key, [itemKey]);
         }
@@ -356,6 +374,7 @@ export class CodexChangeGate implements vscode.Disposable {
         candidate,
         expiresAt: this.now() + this.quarantineMs,
       });
+      this.refreshEligibleTransitions(this.now());
       try {
         await this.enforceCandidateBound();
       } catch (error) {
@@ -391,12 +410,19 @@ export class CodexChangeGate implements vscode.Disposable {
         retiredItemKeys.add(itemKey);
         this.rejectItem(itemKey);
       }
+      for (const [itemKey, awaiting] of this.awaitingCandidateItems) {
+        if (!awaiting.keys.has(key)) continue;
+        retiredItemKeys.add(itemKey);
+        this.rejectItem(itemKey);
+        this.awaitingCandidateItems.delete(itemKey);
+      }
 
       this.pendingCandidates.delete(key);
       this.shadowCandidates.delete(key);
       this.provenCandidateIdentities.delete(key);
       this.eligibleTransitions.delete(key);
       this.inProgressItemKeys.delete(key);
+      this.knownAcceptedKeys.delete(key);
       this.ledger.retireKey(key, retiredItemKeys);
       this.armTimer();
     });
@@ -413,6 +439,8 @@ export class CodexChangeGate implements vscode.Disposable {
       this.eligibleTransitions.clear();
       this.inProgressItemKeys.clear();
       this.rejectedItems.clear();
+      this.awaitingCandidateItems.clear();
+      this.knownAcceptedKeys.clear();
       this.archivedRejectedItems.clear();
       this.latestRejectedItemOrder = 0;
       this.ledger.clear();
@@ -431,6 +459,8 @@ export class CodexChangeGate implements vscode.Disposable {
       this.eligibleTransitions.clear();
       this.inProgressItemKeys.clear();
       this.rejectedItems.clear();
+      this.awaitingCandidateItems.clear();
+      this.knownAcceptedKeys.clear();
       this.archivedRejectedItems.clear();
       let firstError: unknown;
       for (const { candidate } of pending) {
@@ -454,24 +484,38 @@ export class CodexChangeGate implements vscode.Disposable {
     notification: CodexProvenanceNotification,
   ): NotificationKeyResolution {
     const relevantKeys = new Set<string>();
+    const awaitingCandidateKeys = new Set<string>();
     let resolverAgreementFailed = false;
     for (const change of changesOf(notification)) {
       const workspaceKey = this.options.resolveWorkspacePath(change.path)?.toString();
       const acceptedKey = this.options.resolveAcceptedPath(change.path)?.uri.toString();
       if (workspaceKey !== undefined) relevantKeys.add(workspaceKey);
       if (acceptedKey !== undefined) relevantKeys.add(acceptedKey);
-      if (workspaceKey === undefined || acceptedKey === undefined
-        || workspaceKey !== acceptedKey) {
+      if (workspaceKey !== undefined && acceptedKey === undefined) {
+        if (this.knownAcceptedKeys.has(workspaceKey)) {
+          resolverAgreementFailed = true;
+        } else {
+          awaitingCandidateKeys.add(workspaceKey);
+        }
+      }
+      if (workspaceKey !== undefined && acceptedKey === workspaceKey) {
+        this.knownAcceptedKeys.add(workspaceKey);
+      }
+      if (workspaceKey === undefined
+        || (acceptedKey !== undefined && workspaceKey !== acceptedKey)) {
         resolverAgreementFailed = true;
       }
     }
-    return { relevantKeys, resolverAgreementFailed };
+    return { relevantKeys, awaitingCandidateKeys, resolverAgreementFailed };
   }
 
   private refreshEligibleTransitions(now: number): void {
     const previous = new Map(this.eligibleTransitions);
     const refreshed = new Map<string, EligibleTransition>();
-    for (const transition of this.ledger.completedTransitions(this.options.resolveAcceptedPath)) {
+    for (const transition of this.ledger.completedTransitions(
+      this.options.resolveAcceptedPath,
+      (path) => this.resolveObservedPath(path),
+    )) {
       const rejected = transition.provenance.itemIds.some((itemId) => this.isRejectedItem(
         `${transition.provenance.threadId}\0${transition.provenance.turnId}\0${itemId}`,
       ));
@@ -495,6 +539,16 @@ export class CodexChangeGate implements vscode.Disposable {
       this.eligibleTransitions.delete(oldestKey);
       this.ledger.invalidate(oldestKey);
     }
+  }
+
+  private resolveObservedPath(path: string): ProvenanceFileState | undefined {
+    const uri = this.options.resolveWorkspacePath(path);
+    if (uri === undefined) return undefined;
+    const candidate = this.pendingCandidates.get(uri.toString())?.candidate;
+    if (candidate === undefined) return undefined;
+    return candidate.kind === 'present'
+      ? { uri: candidate.uri, exists: true, text: candidate.text }
+      : { uri: candidate.uri, exists: false, text: '' };
   }
 
   private async match(key: string, definitiveFailure: boolean): Promise<void> {
@@ -522,6 +576,11 @@ export class CodexChangeGate implements vscode.Disposable {
       return;
     }
     await this.options.callbacks.onProven(consumed);
+    for (const itemId of consumed.provenance.itemIds) {
+      this.awaitingCandidateItems.delete(
+        `${consumed.provenance.threadId}\0${consumed.provenance.turnId}\0${itemId}`,
+      );
+    }
     this.provenCandidateIdentities.set(key, {
       identity: candidateIdentity(pending.candidate),
       itemKeys: new Set(consumed.provenance.itemIds.map((itemId) => (
@@ -620,6 +679,15 @@ export class CodexChangeGate implements vscode.Disposable {
     for (const [itemKey, tombstone] of this.rejectedItems) {
       if (tombstone.expiresAt <= now) this.archiveRejectedItem(itemKey);
     }
+    for (const [itemKey, awaiting] of this.awaitingCandidateItems) {
+      if (awaiting.expiresAt > now) continue;
+      this.awaitingCandidateItems.delete(itemKey);
+      this.rejectItem(itemKey);
+      for (const key of awaiting.keys) {
+        this.eligibleTransitions.delete(key);
+        this.ledger.retireKey(key, [itemKey]);
+      }
+    }
     this.ledger.prune(now);
     if (firstError !== undefined) throw firstError;
   }
@@ -633,6 +701,7 @@ export class CodexChangeGate implements vscode.Disposable {
       ...[...this.eligibleTransitions.values()].map(({ expiresAt }) => expiresAt),
       ...[...this.provenCandidateIdentities.values()].map(({ expiresAt }) => expiresAt),
       ...[...this.rejectedItems.values()].map(({ expiresAt }) => expiresAt),
+      ...[...this.awaitingCandidateItems.values()].map(({ expiresAt }) => expiresAt),
     ];
     if (expiries.length === 0) return;
     const delayMs = Math.max(0, Math.min(...expiries) - this.now());

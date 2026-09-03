@@ -1139,6 +1139,42 @@ describe('packaged runtime', () => {
     },
   );
 
+  it('shows an exact Codex change for an existing file that was never opened', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = installRuntimeVscode('before\n');
+      fake.workspace.textDocuments.splice(0);
+      fake.window.activeTextEditor = undefined;
+      fake.window.visibleTextEditors.splice(0);
+      const { ExtensionRuntime } = await import('../../src/extension');
+      const runtime = new ExtensionRuntime({
+        enabled: true,
+        debounceMs: 0,
+        maxFileSizeBytes: 1024,
+        exclude: [],
+      }, fake.output as never, { renderingDisabled: false, warningShown: false });
+      fake.setText('after\n');
+      fake.callbacks.get('watcherChange')!(fake.uri);
+      await vi.advanceTimersByTimeAsync(0);
+      for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+      await sendCodexNotification(fake, completedUpdate('before', 'after'));
+
+      expect(runtime.comparisonCount).toBe(1);
+      expect(fake.changesGroup.resourceStates).toHaveLength(1);
+      expect((runtime as unknown as {
+        coordinator: { state(key: string): FileComparisonState | undefined };
+      }).coordinator.state(fake.uri.toString())).toMatchObject({
+        baselineText: 'before\n',
+        currentText: 'after\n',
+        comparisonActive: true,
+        provenance: { confidence: 'exact' },
+      });
+      runtime.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     'merge result',
     'revert result',

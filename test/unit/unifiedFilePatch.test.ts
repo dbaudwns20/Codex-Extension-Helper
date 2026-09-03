@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { applyUnifiedFilePatch, sha256Text } from '../../src/unifiedFilePatch';
+import {
+  applyUnifiedFilePatch,
+  reverseApplyUnifiedFilePatch,
+  sha256Text,
+} from '../../src/unifiedFilePatch';
 
 describe('applyUnifiedFilePatch', () => {
   it('adds content to an empty file', () => {
@@ -112,6 +116,24 @@ describe('applyUnifiedFilePatch', () => {
     ].join('\n');
 
     expect(applyUnifiedFilePatch('present\n', patch)).toBeUndefined();
+  });
+
+  it('recovers the exact source text by applying a unified patch in reverse', () => {
+    const patch = [
+      '--- a/file.txt', '+++ b/file.txt',
+      '@@ -1,2 +1,2 @@', ' one', '-two', '+three', '',
+    ].join('\n');
+
+    expect(reverseApplyUnifiedFilePatch('one\nthree\n', patch)).toBe('one\ntwo\n');
+  });
+
+  it('rejects reverse application when the result text does not match the patch', () => {
+    const patch = [
+      '--- a/file.txt', '+++ b/file.txt',
+      '@@ -1 +1 @@', '-old', '+new', '',
+    ].join('\n');
+
+    expect(reverseApplyUnifiedFilePatch('different\n', patch)).toBeUndefined();
   });
 });
 
