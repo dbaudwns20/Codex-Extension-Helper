@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
+// These snippets mirror the minified host anchors used by the patch scripts.
 const VSCODE_IMPORT = 'var ht=U(require("vscode"));';
 const ACTIVATION_HEADER = 'async function twt(t){let{subscriptions:e}=t;e.push(K()),K().info("Activating Codex extension");';
 const VSCODE_USAGE = 'ht.commands.executeCommand("setContext",Vxe,!mP(ht.version)),ht.commands.executeCommand("setContext",QSt,i);';
@@ -47,6 +48,7 @@ function run(scriptPath: string, arguments_: string[] = [], environment?: NodeJS
 }
 
 afterEach(async () => {
+  // Keep synthetic extension installations isolated between CLI test cases.
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, {
     recursive: true,
     force: true,

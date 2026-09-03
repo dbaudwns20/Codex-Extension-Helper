@@ -8,6 +8,7 @@ export async function withElectronRunAsNodeDisabled<T>(
   const key = 'ELECTRON_RUN_AS_NODE';
   const hadValue = Object.prototype.hasOwnProperty.call(environment, key);
   const previousValue = environment[key];
+  // VS Code's extension host must start as Electron rather than a Node process.
   delete environment[key];
   try {
     return await operation();
@@ -32,6 +33,7 @@ export async function resolveStableExecutable(
     if (platform !== 'darwin' || path.basename(legacyPath) !== 'Electron') {
       throw error;
     }
+    // Newer macOS VS Code bundles name the executable "Code" instead of "Electron".
     const currentPath = path.join(path.dirname(legacyPath), 'Code');
     await accessPath(currentPath);
     return currentPath;
