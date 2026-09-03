@@ -146,6 +146,21 @@ describe('inline renderer helpers', () => {
     expect(html).toContain('tab-size: var(--vscode-editor-tabSize, 4)');
   });
 
+  it('paints the translucent deleted background only once across the inset', () => {
+    const html = buildDeletedLinesHtml(['old'], 0);
+
+    expect(html).toContain(
+      'html { background: var(--vscode-diffEditor-removedTextBackground, rgba(255, 0, 0, 0.2)); }',
+    );
+    expect(html).toContain('body { background: transparent; }');
+  });
+
+  it('does not size deleted rows with an unavailable webview line-height variable', () => {
+    const html = buildDeletedLinesHtml(['old'], 0);
+
+    expect(html).not.toContain('--vscode-editor-line-height');
+  });
+
   it('renders deleted lines without a line-number gutter', () => {
     const html = buildDeletedLinesHtml(['first', 'second'], 4);
 
